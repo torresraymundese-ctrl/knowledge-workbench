@@ -13,6 +13,7 @@ from knowledge_workbench.labeling import (
     create_labeling_session,
     export_labeling_dataset,
     labeling_session_summary,
+    list_labeling_candidates,
     reject_labeling_session,
     select_expected_evidence,
     submit_labeling_session,
@@ -22,6 +23,65 @@ from knowledge_workbench.models import Classification
 
 
 class LabelingWorkflowTests(unittest.TestCase):
+    def test_candidates_are_paginated_from_current_run_and_show_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("证据一。\n\n证据二。\n\n证据三。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+
+            page = list_labeling_candidates(
+                database, session_id, "case-1", limit=1, offset=1
+            )
+
+            self.assertEqual(page["total"], 3)
+            self.assertEqual(len(page["candidates"]), 1)
+            self.assertEqual(page["candidates"][0]["run_ordinal"], 2)
+            self.assertEqual(page["case"]["classification"], "internal")
+            self.assertEqual(page["candidates"][0]["locator"]["line_start"], 3)
+            selected_id = page["candidates"][0]["id"]
+            select_expected_evidence(
+                database, session_id, "case-1", selected_id, actor="alice"
+            )
+            remaining = list_labeling_candidates(
+                database,
+                session_id,
+                "case-1",
+                limit=20,
+                only_unselected=True,
+            )
+            self.assertEqual(remaining["total"], 2)
+            self.assertNotIn(
+                selected_id, {item["id"] for item in remaining["candidates"]}
+            )
+
+    def test_candidates_refuse_stale_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("原始证据。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            source.write_text("来源已被修改。", encoding="utf-8")
+
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "内容已经变化"):
+                list_labeling_candidates(database, session_id, "case-1")
+
     def test_two_person_workflow_exports_ready_evaluation_dataset(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

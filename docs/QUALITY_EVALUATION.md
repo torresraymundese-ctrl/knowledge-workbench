@@ -48,6 +48,7 @@ Lint 检查 SQLite 外键、只读原始副本及 SHA-256、当前处理运行�
 .\.venv\Scripts\knowledge.exe label create .\workspace\evaluations\nas-pilot-v1.template.json --actor "标注人姓名"
 
 # 使用候选包中的 evidence_id 逐条选择
+.\.venv\Scripts\knowledge.exe label candidates <session_id> nas-pilot-001 --limit 20
 .\.venv\Scripts\knowledge.exe label add-evidence <session_id> nas-pilot-001 <evidence_id> --actor "标注人姓名"
 
 # 查看进度并提交

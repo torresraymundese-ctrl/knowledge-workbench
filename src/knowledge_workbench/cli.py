@@ -26,6 +26,7 @@ from .labeling import (
     create_labeling_session,
     export_labeling_dataset,
     labeling_session_summary,
+    list_labeling_candidates,
     list_labeling_sessions,
     reject_labeling_session,
     remove_expected_evidence,
@@ -298,6 +299,17 @@ def build_parser() -> argparse.ArgumentParser:
     label_reject.add_argument("--note", required=True)
     label_show = label_sub.add_parser("show", help="查看标注集与各用例进度")
     label_show.add_argument("session_id")
+    label_candidates = label_sub.add_parser(
+        "candidates", help="分页查看某个用例的当前候选证据"
+    )
+    label_candidates.add_argument("session_id")
+    label_candidates.add_argument("case_id")
+    label_candidates.add_argument("--limit", type=int, default=20)
+    label_candidates.add_argument("--offset", type=int, default=0)
+    label_candidates.add_argument("--only-unselected", action="store_true")
+    label_candidates.add_argument(
+        "--full", action="store_true", help="显示完整原文；restricted密级始终隐藏"
+    )
     label_export = label_sub.add_parser("export", help="导出已批准评测集")
     label_export.add_argument("session_id")
     label_export.add_argument("output", type=Path)
@@ -1081,6 +1093,44 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             )
             if case["selected_evidence_ids"]:
                 print(f"  evidence: {case['selected_evidence_ids']}")
+    elif command == "candidates":
+        result = list_labeling_candidates(
+            database,
+            args.session_id,
+            args.case_id,
+            limit=args.limit,
+            offset=args.offset,
+            only_unselected=args.only_unselected,
+        )
+        case = result["case"]
+        _print_mapping(
+            {
+                "case_id": case["case_id"],
+                "classification": case["classification"],
+                "source_path": case["source_path"],
+                "total": result["total"],
+                "offset": result["offset"],
+                "returned": len(result["candidates"]),
+                "only_unselected": result["only_unselected"],
+            }
+        )
+        for item in result["candidates"]:
+            marker = "x" if item["selected"] else " "
+            print(
+                f"[{marker}] #{item['run_ordinal']} {item['id']} "
+                f"[{item['status']}]"
+            )
+            print(
+                "  locator: "
+                + json.dumps(item["locator"], ensure_ascii=False, sort_keys=True)
+            )
+            if case["classification"] == "restricted":
+                excerpt = "[restricted 内容不在 CLI 显示，请回原文件核对]"
+            elif args.full or len(item["excerpt"]) <= 240:
+                excerpt = item["excerpt"]
+            else:
+                excerpt = item["excerpt"][:237] + "..."
+            print(f"  excerpt: {excerpt}")
     elif command == "export":
         output = export_labeling_dataset(
             database,

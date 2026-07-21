@@ -455,6 +455,88 @@ def labeling_session_summary(database: Database, session_id: str) -> dict:
     return {"session": dict(session), "cases": [dict(case) for case in cases]}
 
 
+def list_labeling_candidates(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    only_unselected: bool = False,
+) -> dict:
+    if limit < 1 or limit > 200:
+        raise KnowledgeWorkbenchError("候选证据分页大小必须在 1 到 200 之间")
+    if offset < 0:
+        raise KnowledgeWorkbenchError("候选证据分页偏移不能小于 0")
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        case = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? AND case_id = ?",
+            (session_id, case_id),
+        ).fetchone()
+        if not case:
+            raise KnowledgeWorkbenchError(f"标注用例不存在：{case_id}")
+        _ensure_case_source_current(connection, case)
+        selection_filter = "AND lee.evidence_id IS NULL" if only_unselected else ""
+        total = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
+            LEFT JOIN labeling_expected_evidence lee
+              ON lee.case_row_id = ? AND lee.evidence_id = e.id
+            WHERE e.document_version_id = ?
+              AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+              {selection_filter}
+            """,
+            (case["id"], case["document_version_id"]),
+        ).fetchone()[0]
+        rows = connection.execute(
+            f"""
+            SELECT e.id, e.run_ordinal, e.excerpt, e.locator_json, e.status,
+                   pr.id AS processing_run_id, pr.parser_name, pr.parser_version,
+                   CASE WHEN lee.evidence_id IS NULL THEN 0 ELSE 1 END AS selected
+            FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
+            LEFT JOIN labeling_expected_evidence lee
+              ON lee.case_row_id = ? AND lee.evidence_id = e.id
+            WHERE e.document_version_id = ?
+              AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+              {selection_filter}
+            ORDER BY e.run_ordinal, e.id
+            LIMIT ? OFFSET ?
+            """,
+            (case["id"], case["document_version_id"], limit, offset),
+        ).fetchall()
+    return {
+        "session": {
+            "id": session["id"],
+            "status": session["status"],
+            "created_by": session["created_by"],
+        },
+        "case": {
+            "case_id": case["case_id"],
+            "source_path": case["source_path"],
+            "source_sha256": case["source_sha256"],
+            "classification": case["classification"],
+            "document_version_id": case["document_version_id"],
+        },
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "only_unselected": only_unselected,
+        "candidates": [
+            {
+                **dict(row),
+                "locator": json.loads(row["locator_json"]),
+            }
+            for row in rows
+        ],
+    }
+
+
 def list_labeling_sessions(database: Database) -> list[dict]:
     with database.connect() as connection:
         rows = connection.execute(
@@ -541,31 +623,7 @@ def _ensure_session_ready(connection, session) -> None:
         (session["id"],),
     ).fetchall()
     for case in cases:
-        source_path = Path(case["source_path"])
-        if not source_path.is_file() or sha256_file(source_path) != case["source_sha256"]:
-            raise KnowledgeWorkbenchError(
-                f"标注用例 {case['case_id']} 的来源文件内容已经变化"
-            )
-        current = connection.execute(
-            """
-            SELECT 1
-            FROM document_versions dv
-            JOIN documents d
-              ON d.id = dv.document_id AND d.current_version_id = dv.id
-            JOIN processing_runs pr
-              ON pr.document_version_id = dv.id AND pr.is_current = 1
-            WHERE dv.id = ? AND dv.sha256 = ? AND d.classification = ?
-            """,
-            (
-                case["document_version_id"],
-                case["source_sha256"],
-                case["classification"],
-            ),
-        ).fetchone()
-        if not current:
-            raise KnowledgeWorkbenchError(
-                f"标注用例 {case['case_id']} 的来源或处理运行已经过期"
-            )
+        _ensure_case_source_current(connection, case)
         selected = connection.execute(
             """
             SELECT lee.evidence_id
@@ -581,6 +639,34 @@ def _ensure_session_ready(connection, session) -> None:
             )
         for row in selected:
             _ensure_evidence_is_current_for_case(connection, case, row["evidence_id"])
+
+
+def _ensure_case_source_current(connection, case) -> None:
+    source_path = Path(case["source_path"])
+    if not source_path.is_file() or sha256_file(source_path) != case["source_sha256"]:
+        raise KnowledgeWorkbenchError(
+            f"标注用例 {case['case_id']} 的来源文件内容已经变化"
+        )
+    current = connection.execute(
+        """
+        SELECT 1
+        FROM document_versions dv
+        JOIN documents d
+          ON d.id = dv.document_id AND d.current_version_id = dv.id
+        JOIN processing_runs pr
+          ON pr.document_version_id = dv.id AND pr.is_current = 1
+        WHERE dv.id = ? AND dv.sha256 = ? AND d.classification = ?
+        """,
+        (
+            case["document_version_id"],
+            case["source_sha256"],
+            case["classification"],
+        ),
+    ).fetchone()
+    if not current:
+        raise KnowledgeWorkbenchError(
+            f"标注用例 {case['case_id']} 的来源或处理运行已经过期"
+        )
 
 
 def _relative_source_path(source: Path, output_parent: Path) -> str:
