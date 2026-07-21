@@ -118,31 +118,86 @@ def select_expected_evidence(
     *,
     actor: str,
 ) -> None:
+    select_expected_evidence_batch(
+        database,
+        session_id,
+        case_id,
+        [evidence_id],
+        actor=actor,
+    )
+
+
+def select_expected_evidence_batch(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    evidence_ids: list[str],
+    *,
+    actor: str,
+) -> dict:
     actor = _required_actor(actor)
+    unique_ids = list(
+        dict.fromkeys(value.strip() for value in evidence_ids if value.strip())
+    )
+    if not unique_ids:
+        raise KnowledgeWorkbenchError("至少需要提供一条 evidence_id")
+    if len(unique_ids) > 100:
+        raise KnowledgeWorkbenchError("单次最多选择 100 条证据")
     now = utc_now()
     with database.transaction() as connection:
         session, case = _editable_case(connection, session_id, case_id, actor)
-        _ensure_evidence_is_current_for_case(connection, case, evidence_id)
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO labeling_expected_evidence(
-                case_row_id, evidence_id, selected_by, created_at
-            ) VALUES (?, ?, ?, ?)
-            """,
-            (case["id"], evidence_id, actor, now),
-        )
-        connection.execute(
-            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
-            (now, session["id"]),
-        )
-        record_event(
-            connection,
-            "labeling_evidence_selected",
-            "labeling_session",
-            session_id,
-            actor=actor,
-            details={"case_id": case_id, "evidence_id": evidence_id},
-        )
+        for evidence_id in unique_ids:
+            _ensure_evidence_is_current_for_case(connection, case, evidence_id)
+        placeholders = ",".join("?" for _ in unique_ids)
+        existing = {
+            row["evidence_id"]
+            for row in connection.execute(
+                f"""
+                SELECT evidence_id FROM labeling_expected_evidence
+                WHERE case_row_id = ? AND evidence_id IN ({placeholders})
+                """,
+                (case["id"], *unique_ids),
+            ).fetchall()
+        }
+        added = [evidence_id for evidence_id in unique_ids if evidence_id not in existing]
+        if added:
+            connection.executemany(
+                """
+                INSERT INTO labeling_expected_evidence(
+                    case_row_id, evidence_id, selected_by, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (case["id"], evidence_id, actor, now)
+                    for evidence_id in added
+                ],
+            )
+            connection.execute(
+                "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+                (now, session["id"]),
+            )
+            event_type = (
+                "labeling_evidence_selected"
+                if len(added) == 1
+                else "labeling_evidence_batch_selected"
+            )
+            details = {"case_id": case_id, "evidence_ids": added}
+            if len(added) == 1:
+                details["evidence_id"] = added[0]
+            record_event(
+                connection,
+                event_type,
+                "labeling_session",
+                session_id,
+                actor=actor,
+                details=details,
+            )
+    return {
+        "requested_count": len(evidence_ids),
+        "unique_count": len(unique_ids),
+        "added_count": len(added),
+        "already_selected_count": len(existing),
+    }
 
 
 def remove_expected_evidence(

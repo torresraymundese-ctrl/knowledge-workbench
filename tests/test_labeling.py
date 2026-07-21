@@ -16,6 +16,7 @@ from knowledge_workbench.labeling import (
     list_labeling_candidates,
     reject_labeling_session,
     select_expected_evidence,
+    select_expected_evidence_batch,
     submit_labeling_session,
 )
 from knowledge_workbench.linting import lint_workspace
@@ -23,6 +24,67 @@ from knowledge_workbench.models import Classification
 
 
 class LabelingWorkflowTests(unittest.TestCase):
+    def test_batch_selection_is_atomic_deduplicated_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("证据一。\n\n证据二。\n\n证据三。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            candidates = list_labeling_candidates(
+                database, session_id, "case-1", limit=20
+            )["candidates"]
+            first, second = candidates[0]["id"], candidates[1]["id"]
+
+            result = select_expected_evidence_batch(
+                database,
+                session_id,
+                "case-1",
+                [first, second, first],
+                actor="alice",
+            )
+            repeated = select_expected_evidence_batch(
+                database,
+                session_id,
+                "case-1",
+                [first, second],
+                actor="alice",
+            )
+
+            self.assertEqual(result["requested_count"], 3)
+            self.assertEqual(result["unique_count"], 2)
+            self.assertEqual(result["added_count"], 2)
+            self.assertEqual(repeated["added_count"], 0)
+            self.assertEqual(
+                labeling_session_summary(database, session_id)["cases"][0][
+                    "selected_evidence_count"
+                ],
+                2,
+            )
+
+            third = candidates[2]["id"]
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "不属于该用例"):
+                select_expected_evidence_batch(
+                    database,
+                    session_id,
+                    "case-1",
+                    [third, "ev_missing"],
+                    actor="alice",
+                )
+            selected_ids = set(
+                labeling_session_summary(database, session_id)["cases"][0][
+                    "selected_evidence_ids"
+                ].split(",")
+            )
+            self.assertNotIn(third, selected_ids)
+
     def test_candidates_are_paginated_from_current_run_and_show_selection(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

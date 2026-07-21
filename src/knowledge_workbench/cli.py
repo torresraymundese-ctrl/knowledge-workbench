@@ -31,7 +31,7 @@ from .labeling import (
     reject_labeling_session,
     remove_expected_evidence,
     remove_forbidden_substring,
-    select_expected_evidence,
+    select_expected_evidence_batch,
     submit_labeling_session,
 )
 from .models import (
@@ -270,7 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
     label_add = label_sub.add_parser("add-evidence", help="选择当前原子证据")
     label_add.add_argument("session_id")
     label_add.add_argument("case_id")
-    label_add.add_argument("evidence_id")
+    label_add.add_argument("evidence_id", nargs="+")
     label_add.add_argument("--actor", required=True)
     label_remove = label_sub.add_parser("remove-evidence", help="移除已选证据")
     label_remove.add_argument("session_id")
@@ -1033,14 +1033,17 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
         )
         print(f"标注集已创建：{session_id}")
     elif command == "add-evidence":
-        select_expected_evidence(
+        result = select_expected_evidence_batch(
             database,
             args.session_id,
             args.case_id,
             args.evidence_id,
             actor=args.actor,
         )
-        print("必要证据已选择。")
+        print(
+            f"必要证据处理完成：新增 {result['added_count']} 条，"
+            f"已存在 {result['already_selected_count']} 条。"
+        )
     elif command == "remove-evidence":
         remove_expected_evidence(
             database,
