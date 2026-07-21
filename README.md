@@ -24,7 +24,7 @@
 
 ## 本地运行
 
-当前版本只依赖 Python 3.11+。TXT、Markdown 和 CSV 可零依赖解析；PDF、Word、Excel、PowerPoint 需要安装可选依赖。
+当前版本只依赖 Python 3.11+。TXT、Markdown 和 CSV 可零依赖解析；PDF、DOCX、XLSX、PPTX 需要安装可选依赖。旧版二进制 Word `.doc` 仅在 Windows 已安装 Microsoft Word、并显式增加 `--allow-legacy-word-conversion` 时受控导入；默认拒绝转换。
 
 ```powershell
 Set-Location "D:\全新知识库"
@@ -40,6 +40,8 @@ python -m venv .venv --system-site-packages
 Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe init
 .\.venv\Scripts\knowledge.exe ingest .\samples\example.md --classification internal
+.\.venv\Scripts\knowledge.exe ingest .\samples\example.md --classification internal --reprocess
+.\.venv\Scripts\knowledge.exe ingest .\samples\legacy.doc --classification internal --allow-legacy-word-conversion
 .\.venv\Scripts\knowledge.exe evidence list
 .\.venv\Scripts\knowledge.exe page list
 .\.venv\Scripts\knowledge.exe index build --model bge-m3
@@ -48,7 +50,12 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe pipeline .\samples\example.md --mode faithful
 .\.venv\Scripts\knowledge.exe task list
 .\.venv\Scripts\knowledge.exe conflict list --status pending
+.\.venv\Scripts\knowledge.exe conflict-evaluate .\evaluation\conflict-sample.json
+.\.venv\Scripts\knowledge.exe citation-evaluate .\evaluation\citation-support-sample.json
+.\.venv\Scripts\knowledge.exe lint --output .\workspace\evaluations\workspace-lint.json
 .\.venv\Scripts\knowledge.exe evaluate .\evaluation\sample-dataset.json
+.\.venv\Scripts\knowledge.exe labeling-pack .\workspace\evaluations\nas-pilot-v1.template.json --candidates-per-case 20
+.\.venv\Scripts\knowledge.exe label --help
 .\.venv\Scripts\knowledge.exe task enqueue faithful_pipeline --payload-file .\samples\faithful-task.json
 .\.venv\Scripts\knowledge.exe worker run-once --worker local-worker-1
 ```
@@ -63,6 +70,13 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 ```
 
 运行数据默认写入项目下的 `workspace/`，该目录不会提交到 Git。
+
+解析器或证据提取器升级后，使用 `ingest --reprocess` 为同一文件版本创建新的派生运行。该操作不会复制 SHA-256 文件版本，也不会删除旧证据或旧 Wiki 修订；相同解析器版本和提取方法的重复重处理会被跳过。
+重处理会改变当前证据集合；已有向量索引会被识别为过期，必须重新运行 `index build` 后才能继续语义检索。全文检索不受影响。
+
+旧版 `.doc` 转换完全在本机完成：Word 以隐藏、只读、禁用宏的方式打开源文件，在临时目录生成 DOCX，解析完成后删除临时文件。原始 `.doc` 的 SHA-256 和只读副本仍是来源真相；每条证据额外保存转换工具、工具版本和临时 DOCX 的 SHA-256。该开关只授权单次命令，不会改变全局默认策略。
+
+黄金标注使用 SQLite Schema v5 状态机，不直接手改正式 JSON：创建者选择当前证据并提交，另一位审核人批准后才能导出。来源文件、密级、当前版本或当前处理运行发生变化时，提交、批准和导出都会被阻断。非公开评测集只能导出到当前 `workspace/` 内，且不会覆盖已有文件。
 
 ## 资料密级
 

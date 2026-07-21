@@ -13,9 +13,12 @@ def search_evidence(database: Database, query: str, limit: int = 10):
                        bm25(evidence_fts) AS score
                 FROM evidence_fts
                 JOIN evidence e ON e.id = evidence_fts.evidence_id
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
                 JOIN document_versions dv ON dv.id = e.document_version_id
                 JOIN documents d ON d.id = dv.document_id
-                WHERE evidence_fts MATCH ?
+                WHERE d.current_version_id = dv.id
+                  AND evidence_fts MATCH ?
                 ORDER BY score
                 LIMIT ?
                 """,
@@ -32,9 +35,12 @@ def search_evidence(database: Database, query: str, limit: int = 10):
             SELECT e.id, e.status, e.excerpt, e.locator_json,
                    d.original_name, d.classification, 0.0 AS score
             FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
             JOIN document_versions dv ON dv.id = e.document_version_id
             JOIN documents d ON d.id = dv.document_id
-            WHERE e.excerpt LIKE ? ESCAPE '\\'
+            WHERE d.current_version_id = dv.id
+              AND e.excerpt LIKE ? ESCAPE '\\'
             ORDER BY e.created_at DESC
             LIMIT ?
             """,

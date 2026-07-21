@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.0",
+  "name": "内置引用文本支撑合成基线",
+  "cases": [
+    {
+      "case_id": "supported-paraphrase",
+      "conclusion": "正式知识需要绑定原始证据。",
+      "cited_excerpts": ["所有正式知识必须绑定可以回到原始文件的证据。"],
+      "expected_supported": true
+    },
+    {
+      "case_id": "supported-substring",
+      "conclusion": "机密资料禁止调用云端模型。",
+      "cited_excerpts": ["密级为 confidential 的资料禁止调用云端模型，并且必须保留本地审计记录。"],
+      "expected_supported": true
+    },
+    {
+      "case_id": "supported-number",
+      "conclusion": "项目应在30个工作日内完成。",
+      "cited_excerpts": ["合同约定：项目应在30个工作日内完成并提交验收材料。"],
+      "expected_supported": true
+    },
+    {
+      "case_id": "supported-multiple-citations",
+      "conclusion": "内部资料默认在本地处理。",
+      "cited_excerpts": ["公开资料可以使用已授权云服务。", "内部资料默认只允许本地处理。"],
+      "expected_supported": true
+    },
+    {
+      "case_id": "unsupported-unrelated",
+      "conclusion": "系统每天凌晨自动备份到异地机房。",
+      "cited_excerpts": ["所有正式知识必须绑定可以回到原始文件的证据。"],
+      "expected_supported": false
+    },
+    {
+      "case_id": "unsupported-short-common-word",
+      "conclusion": "系统每天凌晨自动备份到异地机房。",
+      "cited_excerpts": ["系统"],
+      "expected_supported": false
+    },
+    {
+      "case_id": "unsupported-different-policy",
+      "conclusion": "客户合同可以不经审批直接签署。",
+      "cited_excerpts": ["员工出差申请应经过部门负责人审批。"],
+      "expected_supported": false
+    },
+    {
+      "case_id": "unsupported-shared-generic-words",
+      "conclusion": "服务器必须每天执行备份。",
+      "cited_excerpts": ["客户合同必须由法务审核。"],
+      "expected_supported": false
+    },
+    {
+      "case_id": "unsupported-opposite-polarity",
+      "conclusion": "内部资料允许发送到云端模型。",
+      "cited_excerpts": ["内部资料禁止发送到云端模型。"],
+      "expected_supported": false
+    },
+    {
+      "case_id": "unsupported-number-change",
+      "conclusion": "项目应在30个工作日内完成。",
+      "cited_excerpts": ["项目应在45个工作日内完成。"],
+      "expected_supported": false
+    },
+    {
+      "case_id": "unsupported-mixed-citations",
+      "conclusion": "内部资料允许发送到云端模型。",
+      "cited_excerpts": ["内部资料允许发送到云端模型。", "内部资料禁止发送到云端模型。"],
+      "expected_supported": false
+    }
+  ]
+}

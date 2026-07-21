@@ -45,13 +45,30 @@ def transition_evidence(
     now = utc_now()
     with database.transaction() as connection:
         row = connection.execute(
-            "SELECT status FROM evidence WHERE id = ?", (evidence_id,)
+            """
+            SELECT e.status,
+                   pr.is_current AS processing_run_is_current,
+                   (d.current_version_id = dv.id) AS document_version_is_current
+            FROM evidence e
+            LEFT JOIN processing_runs pr ON pr.id = e.processing_run_id
+            JOIN document_versions dv ON dv.id = e.document_version_id
+            JOIN documents d ON d.id = dv.document_id
+            WHERE e.id = ?
+            """,
+            (evidence_id,),
         ).fetchone()
         if not row:
             raise KnowledgeWorkbenchError(f"原子证据不存在：{evidence_id}")
         current = EvidenceStatus(row["status"])
         if current == target:
             return
+        if target in {EvidenceStatus.REVIEWING, EvidenceStatus.VERIFIED} and (
+            not row["processing_run_is_current"]
+            or not row["document_version_is_current"]
+        ):
+            raise InvalidTransitionError(
+                "历史文件版本或已被替代处理运行的证据不能进入审核或正式状态"
+            )
         if target not in EVIDENCE_TRANSITIONS[current]:
             raise InvalidTransitionError(
                 f"证据状态不能从 {current.value} 直接变为 {target.value}"
@@ -74,6 +91,7 @@ def request_revision_review(database: Database, revision_id: str, *, actor: str)
     now = utc_now()
     with database.transaction() as connection:
         revision = _get_revision(connection, revision_id)
+        _ensure_revision_is_current(revision)
         current = RevisionStatus(revision["status"])
         if current is not RevisionStatus.DRAFT:
             raise InvalidTransitionError(
@@ -102,6 +120,7 @@ def publish_revision(
     now = utc_now()
     with database.transaction() as connection:
         revision = _get_revision(connection, revision_id)
+        _ensure_revision_is_current(revision)
         if RevisionStatus(revision["status"]) is not RevisionStatus.REVIEWING:
             raise InvalidTransitionError("只有 reviewing 修订可以发布")
         unverified = connection.execute(
@@ -171,9 +190,28 @@ def publish_revision(
 
 def _get_revision(connection: sqlite3.Connection, revision_id: str) -> sqlite3.Row:
     row = connection.execute(
-        "SELECT * FROM wiki_revisions WHERE id = ?", (revision_id,)
+        """
+        SELECT wr.*,
+               pr.is_current AS processing_run_is_current,
+               (d.current_version_id = dv.id) AS document_version_is_current
+        FROM wiki_revisions wr
+        LEFT JOIN processing_runs pr ON pr.id = wr.processing_run_id
+        LEFT JOIN document_versions dv ON dv.id = pr.document_version_id
+        LEFT JOIN documents d ON d.id = dv.document_id
+        WHERE wr.id = ?
+        """,
+        (revision_id,),
     ).fetchone()
     if not row:
         raise KnowledgeWorkbenchError(f"Wiki 修订不存在：{revision_id}")
     return row
 
+
+def _ensure_revision_is_current(revision: sqlite3.Row) -> None:
+    if (
+        not revision["processing_run_is_current"]
+        or not revision["document_version_is_current"]
+    ):
+        raise InvalidTransitionError(
+            "历史文件版本或已被替代处理运行的 Wiki 修订不能提交审核或发布"
+        )

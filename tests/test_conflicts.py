@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from knowledge_workbench.config import WorkspacePaths
+from knowledge_workbench.conflicts import _candidate_pairs, _classify_conflict
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification, EvidenceStatus
 from knowledge_workbench.review import (
@@ -13,6 +14,53 @@ from knowledge_workbench.review import (
 
 
 class ConflictQueueTests(unittest.TestCase):
+    def test_candidate_blocking_stays_near_linear_and_keeps_moved_matches(self):
+        older = [
+            {"id": f"old-{index}", "run_ordinal": index, "excerpt": f"规则{index}金额100万元。"}
+            for index in range(1, 101)
+        ]
+        newer = [
+            {"id": f"new-{index}", "run_ordinal": index, "excerpt": f"规则{index}金额120万元。"}
+            for index in range(1, 101)
+        ]
+        older.append(
+            {"id": "old-moved", "run_ordinal": 101, "excerpt": "内部资料允许发送到云端。"}
+        )
+        newer.append(
+            {"id": "new-moved", "run_ordinal": 1_000, "excerpt": "内部资料禁止发送到云端。"}
+        )
+
+        pairs = list(_candidate_pairs(older, newer))
+        pair_ids = {(old["id"], new["id"]) for old, new in pairs}
+
+        self.assertLess(len(pairs), 800)
+        self.assertIn(("old-moved", "new-moved"), pair_ids)
+
+    def test_business_value_change_is_classified_as_potential_conflict(self):
+        result = _classify_conflict(
+            "合同金额为100万元，付款条件保持不变。",
+            "合同金额为120万元，付款条件保持不变。",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "value_change")
+
+    def test_version_date_and_clause_number_changes_are_not_value_conflicts(self):
+        result = _classify_conflict(
+            "本方案V2.0于2024年1月1日发布，详见第3条。",
+            "本方案V2.1于2024年2月1日发布，详见第4条。",
+        )
+
+        self.assertIsNone(result)
+
+    def test_word_containing_shi_character_is_not_positive_polarity(self):
+        result = _classify_conflict(
+            "处理方式采用本地流程。",
+            "处理方式采用离线流程。",
+        )
+
+        self.assertIsNone(result)
+
     def test_opposite_new_version_is_queued_without_overwriting_verified_revision(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -62,4 +110,3 @@ class ConflictQueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

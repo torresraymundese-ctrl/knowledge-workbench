@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from knowledge_workbench.parsers import parse_document
+from knowledge_workbench.errors import UnsupportedFormatError
+from knowledge_workbench.parsers import legacy_word, parse_document
+from knowledge_workbench.parsers.legacy_word import ConversionMetadata
+from knowledge_workbench.parsers.registry import supported_extensions
 
 
 HAS_DOCUMENT_DEPS = all(
@@ -13,6 +16,60 @@ HAS_DOCUMENT_DEPS = all(
 
 @unittest.skipUnless(HAS_DOCUMENT_DEPS, "document parser extras are not installed")
 class DocumentParserTests(unittest.TestCase):
+    def test_word_conversion_script_disables_macros_alerts_and_personal_information(self):
+        script = legacy_word._WORD_CONVERSION_SCRIPT
+
+        self.assertIn("$word.DisplayAlerts = 0", script)
+        self.assertIn("$word.AutomationSecurity = 3", script)
+        self.assertIn("PSObject.Properties['SendPersonalInformation']", script)
+        self.assertIn("if ($null -ne $sendPersonalInformation)", script)
+        self.assertIn("$word.Options.SendPersonalInformation = $false", script)
+
+    def test_legacy_doc_requires_explicit_conversion_permission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.doc"
+            path.write_bytes(b"legacy word placeholder")
+
+            with self.assertRaisesRegex(
+                UnsupportedFormatError, "allow-legacy-word-conversion"
+            ):
+                parse_document(path)
+
+            self.assertIn(".doc", supported_extensions())
+
+    def test_legacy_doc_conversion_preserves_conversion_provenance(self):
+        from docx import Document
+
+        class FakeWordConverter:
+            def convert(self, source: Path, output: Path) -> ConversionMetadata:
+                self.source = source
+                document = Document()
+                document.add_heading("转换测试", level=1)
+                document.add_paragraph("旧版文件中的可追溯证据。")
+                document.save(output)
+                return ConversionMetadata("fake-word", "1.2.3")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.doc"
+            path.write_bytes(b"legacy word placeholder")
+            converter = FakeWordConverter()
+
+            result = parse_document(
+                path,
+                allow_legacy_word_conversion=True,
+                legacy_doc_converter=converter,
+            )
+
+            self.assertEqual(converter.source, path)
+            self.assertEqual(result.parser_name, "fake-word+python-docx")
+            self.assertEqual(result.parser_version, "1.2.3/docx-2")
+            self.assertEqual(result.units[0].text, "旧版文件中的可追溯证据。")
+            self.assertEqual(result.units[0].locator["source_format"], "doc")
+            self.assertEqual(result.units[0].locator["converted_format"], "docx")
+            self.assertEqual(result.units[0].locator["conversion_tool"], "fake-word")
+            self.assertEqual(result.units[0].locator["conversion_tool_version"], "1.2.3")
+            self.assertEqual(len(result.units[0].locator["converted_sha256"]), 64)
+
     def test_pdf_page_locator(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "sample.pdf"
@@ -33,6 +90,45 @@ class DocumentParserTests(unittest.TestCase):
             result = parse_document(path)
             self.assertEqual(result.units[0].locator["heading_path"], ["审核规则"])
             self.assertEqual(result.units[0].text, "每条证据必须保存原文片段。")
+
+    def test_docx_table_rows_are_preserved_as_traceable_units(self):
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "table.docx"
+            document = Document()
+            table = document.add_table(rows=2, cols=2)
+            table.cell(0, 0).text = "字段"
+            table.cell(0, 1).text = "内容"
+            table.cell(1, 0).text = "项目名称"
+            table.cell(1, 1).text = "知识工作台"
+            document.save(path)
+
+            result = parse_document(path)
+
+            self.assertEqual(len(result.units), 2)
+            self.assertEqual(result.units[1].text, "C1=项目名称 | C2=知识工作台")
+            self.assertEqual(result.units[1].locator["table"], 1)
+            self.assertEqual(result.units[1].locator["row"], 2)
+            self.assertEqual(result.units[1].locator["cell_range"], "R2C1:R2C2")
+
+    def test_docx_filters_toc_entries_and_infers_numbered_heading(self):
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "numbered-heading.docx"
+            document = Document()
+            document.add_paragraph("目录")
+            document.add_paragraph("1. 文档简介\t4")
+            document.add_paragraph("1. 文档简介")
+            document.add_paragraph("本文说明证据提取规则。")
+            document.save(path)
+
+            result = parse_document(path)
+
+            self.assertEqual(len(result.units), 1)
+            self.assertEqual(result.units[0].text, "本文说明证据提取规则。")
+            self.assertEqual(result.units[0].locator["heading_path"], ["1. 文档简介"])
 
     def test_xlsx_sheet_and_cell_range(self):
         from openpyxl import Workbook
@@ -92,4 +188,3 @@ def _write_minimal_pdf(path: Path, text: str) -> None:
         )
     )
     path.write_bytes(output)
-

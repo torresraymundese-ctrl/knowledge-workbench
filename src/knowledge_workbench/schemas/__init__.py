@@ -1,2 +1,1 @@
-"""Versioned JSON Schemas for the two-stage knowledge pipeline."""
-
+"""Versioned JSON Schemas for pipelines and quality evaluation datasets."""

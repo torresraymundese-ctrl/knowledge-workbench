@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledge-workbench.local/schemas/citation-evaluation-v1.json",
+  "title": "Citation textual-support evaluation dataset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name", "cases"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "name": {"type": "string", "minLength": 1},
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "case_id", "conclusion", "cited_excerpts", "expected_supported"
+        ],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "conclusion": {"type": "string", "minLength": 1},
+          "cited_excerpts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "expected_supported": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

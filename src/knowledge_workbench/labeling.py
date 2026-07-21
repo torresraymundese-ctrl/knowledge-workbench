@@ -1,0 +1,597 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from .audit import record_event
+from .config import WorkspacePaths
+from .database import Database
+from .errors import InvalidTransitionError, KnowledgeWorkbenchError
+from .schema_validation import validate_evaluation_dataset
+from .utils import new_id, sha256_file, sha256_text, utc_now
+from .wiki import write_text_atomic
+
+
+def create_labeling_session(
+    database: Database,
+    template_path: Path,
+    *,
+    actor: str,
+    name: str | None = None,
+    minimum_required_per_case: int = 3,
+) -> str:
+    actor = _required_actor(actor)
+    if minimum_required_per_case < 1:
+        raise KnowledgeWorkbenchError("每个用例的最少必要证据数必须至少为 1")
+    template_path = template_path.expanduser().resolve()
+    template = _load_template(template_path)
+    session_id = new_id("labels")
+    now = utc_now()
+    prepared_cases: list[tuple] = []
+    with database.connect() as connection:
+        for case in template["cases"]:
+            source = (template_path.parent / case["source_path"]).resolve()
+            if not source.is_file():
+                raise KnowledgeWorkbenchError(
+                    f"标注用例 {case['case_id']} 的文件不存在：{source}"
+                )
+            digest = sha256_file(source)
+            current = connection.execute(
+                """
+                SELECT dv.id AS document_version_id, d.classification
+                FROM document_versions dv
+                JOIN documents d
+                  ON d.id = dv.document_id AND d.current_version_id = dv.id
+                JOIN processing_runs pr
+                  ON pr.document_version_id = dv.id AND pr.is_current = 1
+                WHERE dv.sha256 = ?
+                """,
+                (digest,),
+            ).fetchone()
+            if not current:
+                raise KnowledgeWorkbenchError(
+                    f"标注用例 {case['case_id']} 尚未导入或没有当前处理运行"
+                )
+            if current["classification"] != case["classification"]:
+                raise KnowledgeWorkbenchError(
+                    f"标注用例 {case['case_id']} 的密级与数据库不一致"
+                )
+            prepared_cases.append(
+                (
+                    new_id("lcase"),
+                    session_id,
+                    case["case_id"],
+                    str(source),
+                    digest,
+                    current["document_version_id"],
+                    case["classification"],
+                    case["max_duplicate_rate"],
+                )
+            )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO labeling_sessions(
+                id, name, template_path, status, minimum_required_per_case,
+                created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                (name or template["name"]).strip(),
+                str(template_path),
+                minimum_required_per_case,
+                actor,
+                now,
+                now,
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO labeling_cases(
+                id, session_id, case_id, source_path, source_sha256,
+                document_version_id, classification, max_duplicate_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            prepared_cases,
+        )
+        record_event(
+            connection,
+            "labeling_session_created",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={
+                "case_count": len(prepared_cases),
+                "minimum_required_per_case": minimum_required_per_case,
+            },
+        )
+    return session_id
+
+
+def select_expected_evidence(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    evidence_id: str,
+    *,
+    actor: str,
+) -> None:
+    actor = _required_actor(actor)
+    now = utc_now()
+    with database.transaction() as connection:
+        session, case = _editable_case(connection, session_id, case_id, actor)
+        _ensure_evidence_is_current_for_case(connection, case, evidence_id)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO labeling_expected_evidence(
+                case_row_id, evidence_id, selected_by, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (case["id"], evidence_id, actor, now),
+        )
+        connection.execute(
+            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+            (now, session["id"]),
+        )
+        record_event(
+            connection,
+            "labeling_evidence_selected",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={"case_id": case_id, "evidence_id": evidence_id},
+        )
+
+
+def remove_expected_evidence(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    evidence_id: str,
+    *,
+    actor: str,
+) -> None:
+    actor = _required_actor(actor)
+    now = utc_now()
+    with database.transaction() as connection:
+        session, case = _editable_case(connection, session_id, case_id, actor)
+        cursor = connection.execute(
+            """
+            DELETE FROM labeling_expected_evidence
+            WHERE case_row_id = ? AND evidence_id = ?
+            """,
+            (case["id"], evidence_id),
+        )
+        if not cursor.rowcount:
+            raise KnowledgeWorkbenchError("该用例没有选择指定证据")
+        connection.execute(
+            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+            (now, session["id"]),
+        )
+        record_event(
+            connection,
+            "labeling_evidence_removed",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={"case_id": case_id, "evidence_id": evidence_id},
+        )
+
+
+def add_forbidden_substring(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    value: str,
+    *,
+    actor: str,
+) -> None:
+    actor = _required_actor(actor)
+    value = value.strip()
+    if not value:
+        raise KnowledgeWorkbenchError("禁止内容不能为空")
+    now = utc_now()
+    with database.transaction() as connection:
+        session, case = _editable_case(connection, session_id, case_id, actor)
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO labeling_forbidden_substrings(
+                id, case_row_id, value, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (new_id("forbid"), case["id"], value, actor, now),
+        )
+        connection.execute(
+            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+            (now, session["id"]),
+        )
+        if cursor.rowcount:
+            record_event(
+                connection,
+                "labeling_forbidden_added",
+                "labeling_session",
+                session_id,
+                actor=actor,
+                details={"case_id": case_id, "value_sha256": sha256_text(value)},
+            )
+
+
+def remove_forbidden_substring(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    value: str,
+    *,
+    actor: str,
+) -> None:
+    actor = _required_actor(actor)
+    value = value.strip()
+    now = utc_now()
+    with database.transaction() as connection:
+        session, case = _editable_case(connection, session_id, case_id, actor)
+        cursor = connection.execute(
+            """
+            DELETE FROM labeling_forbidden_substrings
+            WHERE case_row_id = ? AND value = ?
+            """,
+            (case["id"], value),
+        )
+        if not cursor.rowcount:
+            raise KnowledgeWorkbenchError("该用例没有指定的禁止内容")
+        connection.execute(
+            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+            (now, session["id"]),
+        )
+        record_event(
+            connection,
+            "labeling_forbidden_removed",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={"case_id": case_id, "value_sha256": sha256_text(value)},
+        )
+
+
+def submit_labeling_session(database: Database, session_id: str, *, actor: str) -> None:
+    actor = _required_actor(actor)
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "draft":
+            raise InvalidTransitionError("只有 draft 标注集可以提交复核")
+        if session["created_by"] != actor:
+            raise InvalidTransitionError("只有标注集创建者可以提交复核")
+        _ensure_session_ready(connection, session)
+        connection.execute(
+            """
+            UPDATE labeling_sessions
+            SET status = 'reviewing', submitted_by = ?, approved_by = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (actor, now, session_id),
+        )
+        record_event(
+            connection,
+            "labeling_session_submitted",
+            "labeling_session",
+            session_id,
+            actor=actor,
+        )
+
+
+def approve_labeling_session(database: Database, session_id: str, *, actor: str) -> None:
+    actor = _required_actor(actor)
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "reviewing":
+            raise InvalidTransitionError("只有 reviewing 标注集可以批准")
+        if session["submitted_by"] == actor:
+            raise InvalidTransitionError("批准人必须与提交人不同")
+        _ensure_session_ready(connection, session)
+        connection.execute(
+            """
+            UPDATE labeling_sessions
+            SET status = 'approved', approved_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (actor, now, session_id),
+        )
+        record_event(
+            connection,
+            "labeling_session_approved",
+            "labeling_session",
+            session_id,
+            actor=actor,
+        )
+
+
+def reject_labeling_session(
+    database: Database,
+    session_id: str,
+    *,
+    actor: str,
+    note: str,
+) -> None:
+    actor = _required_actor(actor)
+    note = note.strip()
+    if not note:
+        raise KnowledgeWorkbenchError("驳回标注集必须填写原因")
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "reviewing":
+            raise InvalidTransitionError("只有 reviewing 标注集可以驳回")
+        if session["submitted_by"] == actor:
+            raise InvalidTransitionError("复核人必须与提交人不同")
+        connection.execute(
+            """
+            UPDATE labeling_sessions
+            SET status = 'draft', submitted_by = NULL, approved_by = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, session_id),
+        )
+        record_event(
+            connection,
+            "labeling_session_rejected",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={"note": note},
+        )
+
+
+def export_labeling_dataset(
+    database: Database,
+    paths: WorkspacePaths,
+    session_id: str,
+    output: Path,
+    *,
+    actor: str,
+) -> Path:
+    actor = _required_actor(actor)
+    output = output.expanduser().resolve()
+    if output.exists():
+        raise KnowledgeWorkbenchError(f"导出文件已存在，不允许静默覆盖：{output}")
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "approved":
+            raise InvalidTransitionError("只有 approved 标注集可以导出")
+        _ensure_session_ready(connection, session)
+        cases = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? ORDER BY case_id",
+            (session_id,),
+        ).fetchall()
+        if any(case["classification"] == "restricted" for case in cases):
+            raise KnowledgeWorkbenchError("restricted 标注集暂不允许导出")
+        if any(case["classification"] != "public" for case in cases):
+            try:
+                output.relative_to(paths.root)
+            except ValueError as exc:
+                raise KnowledgeWorkbenchError(
+                    "非公开资料的评测集只能导出到当前 workspace 内"
+                ) from exc
+        dataset_cases = []
+        for case in cases:
+            evidence = connection.execute(
+                """
+                SELECT e.excerpt
+                FROM labeling_expected_evidence lee
+                JOIN evidence e ON e.id = lee.evidence_id
+                WHERE lee.case_row_id = ?
+                ORDER BY e.run_ordinal
+                """,
+                (case["id"],),
+            ).fetchall()
+            forbidden = connection.execute(
+                """
+                SELECT value FROM labeling_forbidden_substrings
+                WHERE case_row_id = ? ORDER BY created_at, id
+                """,
+                (case["id"],),
+            ).fetchall()
+            dataset_cases.append(
+                {
+                    "case_id": case["case_id"],
+                    "source_path": _relative_source_path(
+                        Path(case["source_path"]), output.parent
+                    ),
+                    "classification": case["classification"],
+                    "expected_evidence": [
+                        {"text": row["excerpt"], "required": True} for row in evidence
+                    ],
+                    "forbidden_substrings": [row["value"] for row in forbidden],
+                    "max_duplicate_rate": case["max_duplicate_rate"],
+                }
+            )
+    dataset = {
+        "schema_version": "1.0",
+        "name": session["name"],
+        "cases": dataset_cases,
+    }
+    validate_evaluation_dataset(dataset, require_ready=True)
+    content = json.dumps(dataset, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    write_text_atomic(output, content)
+    try:
+        with database.transaction() as connection:
+            record_event(
+                connection,
+                "labeling_dataset_exported",
+                "labeling_session",
+                session_id,
+                actor=actor,
+                details={
+                    "output_path": str(output),
+                    "content_sha256": sha256_text(content),
+                    "case_count": len(dataset_cases),
+                },
+            )
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    return output
+
+
+def labeling_session_summary(database: Database, session_id: str) -> dict:
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        cases = connection.execute(
+            """
+            SELECT lc.case_id, lc.classification,
+                   COUNT(DISTINCT lee.evidence_id) AS selected_evidence_count,
+                   GROUP_CONCAT(DISTINCT lee.evidence_id) AS selected_evidence_ids,
+                   COUNT(DISTINCT lfs.id) AS forbidden_count
+            FROM labeling_cases lc
+            LEFT JOIN labeling_expected_evidence lee ON lee.case_row_id = lc.id
+            LEFT JOIN labeling_forbidden_substrings lfs ON lfs.case_row_id = lc.id
+            WHERE lc.session_id = ?
+            GROUP BY lc.id ORDER BY lc.case_id
+            """,
+            (session_id,),
+        ).fetchall()
+    return {"session": dict(session), "cases": [dict(case) for case in cases]}
+
+
+def list_labeling_sessions(database: Database) -> list[dict]:
+    with database.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT ls.id, ls.name, ls.status, ls.minimum_required_per_case,
+                   ls.created_by, ls.submitted_by, ls.approved_by, ls.updated_at,
+                   COUNT(DISTINCT lc.id) AS case_count,
+                   COUNT(DISTINCT lee.evidence_id) AS selected_evidence_count
+            FROM labeling_sessions ls
+            LEFT JOIN labeling_cases lc ON lc.session_id = ls.id
+            LEFT JOIN labeling_expected_evidence lee ON lee.case_row_id = lc.id
+            GROUP BY ls.id
+            ORDER BY ls.updated_at DESC, ls.id
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def validate_labeling_session_ready(database: Database, session_id: str) -> None:
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        _ensure_session_ready(connection, session)
+
+
+def _load_template(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise KnowledgeWorkbenchError(f"标注模板不存在：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise KnowledgeWorkbenchError(f"标注模板不是有效 JSON：{exc}") from exc
+    validate_evaluation_dataset(payload)
+    return payload
+
+
+def _get_session(connection, session_id: str):
+    session = connection.execute(
+        "SELECT * FROM labeling_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if not session:
+        raise KnowledgeWorkbenchError(f"标注集不存在：{session_id}")
+    return session
+
+
+def _editable_case(connection, session_id: str, case_id: str, actor: str):
+    session = _get_session(connection, session_id)
+    if session["status"] != "draft":
+        raise InvalidTransitionError("只有 draft 标注集可以修改")
+    if session["created_by"] != actor:
+        raise InvalidTransitionError("只有标注集创建者可以修改")
+    case = connection.execute(
+        "SELECT * FROM labeling_cases WHERE session_id = ? AND case_id = ?",
+        (session_id, case_id),
+    ).fetchone()
+    if not case:
+        raise KnowledgeWorkbenchError(f"标注用例不存在：{case_id}")
+    return session, case
+
+
+def _ensure_evidence_is_current_for_case(connection, case, evidence_id: str) -> None:
+    evidence = connection.execute(
+        """
+        SELECT e.id
+        FROM evidence e
+        JOIN processing_runs pr
+          ON pr.id = e.processing_run_id AND pr.is_current = 1
+        JOIN document_versions dv ON dv.id = e.document_version_id
+        JOIN documents d
+          ON d.id = dv.document_id AND d.current_version_id = dv.id
+        WHERE e.id = ? AND e.document_version_id = ?
+          AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+        """,
+        (evidence_id, case["document_version_id"]),
+    ).fetchone()
+    if not evidence:
+        raise KnowledgeWorkbenchError(
+            f"证据 {evidence_id} 不属于该用例的当前文件版本和当前处理运行"
+        )
+
+
+def _ensure_session_ready(connection, session) -> None:
+    cases = connection.execute(
+        "SELECT * FROM labeling_cases WHERE session_id = ? ORDER BY case_id",
+        (session["id"],),
+    ).fetchall()
+    for case in cases:
+        source_path = Path(case["source_path"])
+        if not source_path.is_file() or sha256_file(source_path) != case["source_sha256"]:
+            raise KnowledgeWorkbenchError(
+                f"标注用例 {case['case_id']} 的来源文件内容已经变化"
+            )
+        current = connection.execute(
+            """
+            SELECT 1
+            FROM document_versions dv
+            JOIN documents d
+              ON d.id = dv.document_id AND d.current_version_id = dv.id
+            JOIN processing_runs pr
+              ON pr.document_version_id = dv.id AND pr.is_current = 1
+            WHERE dv.id = ? AND dv.sha256 = ? AND d.classification = ?
+            """,
+            (
+                case["document_version_id"],
+                case["source_sha256"],
+                case["classification"],
+            ),
+        ).fetchone()
+        if not current:
+            raise KnowledgeWorkbenchError(
+                f"标注用例 {case['case_id']} 的来源或处理运行已经过期"
+            )
+        selected = connection.execute(
+            """
+            SELECT lee.evidence_id
+            FROM labeling_expected_evidence lee
+            WHERE lee.case_row_id = ?
+            """,
+            (case["id"],),
+        ).fetchall()
+        if len(selected) < session["minimum_required_per_case"]:
+            raise KnowledgeWorkbenchError(
+                f"标注用例 {case['case_id']} 只有 {len(selected)} 条必要证据，"
+                f"至少需要 {session['minimum_required_per_case']} 条"
+            )
+        for row in selected:
+            _ensure_evidence_is_current_for_case(connection, case, row["evidence_id"])
+
+
+def _relative_source_path(source: Path, output_parent: Path) -> str:
+    try:
+        return Path(os.path.relpath(source, output_parent)).as_posix()
+    except ValueError:
+        return str(source)
+
+
+def _required_actor(value: str) -> str:
+    actor = value.strip()
+    if not actor:
+        raise KnowledgeWorkbenchError("actor 不能为空")
+    return actor

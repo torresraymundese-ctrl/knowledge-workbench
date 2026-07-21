@@ -8,6 +8,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
 from .errors import KnowledgeWorkbenchError
+from .citation_support import MINIMUM_CITATION_SUPPORT, assess_generation_citations
 from .models import ParsedUnit
 
 
@@ -48,13 +49,95 @@ def validate_wiki_generation(payload: dict, analysis: dict) -> None:
         raise KnowledgeWorkbenchError(
             "阶段二输出引用了阶段一不存在的证据：" + ", ".join(sorted(unknown))
         )
+    citation_assessment = assess_generation_citations(analysis, payload)
+    signal_conflicts = [
+        conclusion
+        for conclusion in citation_assessment["conclusions"]
+        if conclusion["signal_conflict_count"] > 0
+    ]
+    if signal_conflicts:
+        locations = ", ".join(
+            f"page[{item['page_index']}].conclusion[{item['conclusion_index']}]"
+            for item in signal_conflicts
+        )
+        raise KnowledgeWorkbenchError(
+            f"阶段二结论与所引证据存在方向或关键数值不一致：{locations}"
+        )
+    unsupported = [
+        conclusion
+        for conclusion in citation_assessment["conclusions"]
+        if conclusion["support_score"] < MINIMUM_CITATION_SUPPORT
+    ]
+    if unsupported:
+        locations = ", ".join(
+            f"page[{item['page_index']}].conclusion[{item['conclusion_index']}]"
+            for item in unsupported
+        )
+        raise KnowledgeWorkbenchError(
+            f"阶段二结论与所引证据缺乏可验证文本关联：{locations}"
+        )
 
 
-def validate_evaluation_dataset(payload: dict) -> None:
+def validate_evaluation_dataset(payload: dict, *, require_ready: bool = False) -> None:
     _validate(payload, "evaluation-dataset-v1.json")
     case_ids = [case["case_id"] for case in payload["cases"]]
     if len(case_ids) != len(set(case_ids)):
         raise KnowledgeWorkbenchError("评测数据集包含重复 case_id")
+    if not require_ready:
+        return
+    for case in payload["cases"]:
+        required = [
+            item["text"].strip()
+            for item in case["expected_evidence"]
+            if item["required"]
+        ]
+        if not required:
+            raise KnowledgeWorkbenchError(
+                f"评测用例 {case['case_id']} 尚未指定任何必要证据"
+            )
+        labeled_text = [
+            item["text"].strip() for item in case["expected_evidence"]
+        ] + [item.strip() for item in case["forbidden_substrings"]]
+        if any(_looks_like_labeling_placeholder(item) for item in labeled_text):
+            raise KnowledgeWorkbenchError(
+                f"评测用例 {case['case_id']} 仍包含待人工填写的占位内容"
+            )
+        normalized = [" ".join(item.split()).casefold() for item in required]
+        if len(normalized) != len(set(normalized)):
+            raise KnowledgeWorkbenchError(
+                f"评测用例 {case['case_id']} 包含重复的必要证据标注"
+            )
+
+
+def validate_conflict_evaluation_dataset(payload: dict) -> None:
+    _validate(payload, "conflict-evaluation-v1.json")
+    case_ids = [case["case_id"] for case in payload["cases"]]
+    if len(case_ids) != len(set(case_ids)):
+        raise KnowledgeWorkbenchError("冲突评测数据集包含重复 case_id")
+    for case in payload["cases"]:
+        if case["expected_conflict"] and case["expected_type"] is None:
+            raise KnowledgeWorkbenchError(
+                f"冲突评测用例 {case['case_id']} 预期冲突时必须指定 expected_type"
+            )
+        if not case["expected_conflict"] and case["expected_type"] is not None:
+            raise KnowledgeWorkbenchError(
+                f"冲突评测用例 {case['case_id']} 预期非冲突时 expected_type 必须为 null"
+            )
+
+
+def validate_citation_evaluation_dataset(payload: dict) -> None:
+    _validate(payload, "citation-evaluation-v1.json")
+    case_ids = [case["case_id"] for case in payload["cases"]]
+    if len(case_ids) != len(set(case_ids)):
+        raise KnowledgeWorkbenchError("引用支撑评测数据集包含重复 case_id")
+
+
+def _looks_like_labeling_placeholder(value: str) -> bool:
+    normalized = value.strip().casefold()
+    return any(
+        marker in normalized
+        for marker in ("待人工填写", "todo", "tbd", "placeholder")
+    )
 
 
 def _validate(payload: dict, schema_name: str) -> None:

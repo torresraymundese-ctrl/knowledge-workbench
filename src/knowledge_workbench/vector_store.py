@@ -88,10 +88,15 @@ def build_evidence_index(
     with database.connect() as connection:
         rows = connection.execute(
             """
-            SELECT id, excerpt, updated_at
-            FROM evidence
-            WHERE status NOT IN ('archived', 'deprecated')
-            ORDER BY id
+            SELECT e.id, e.excerpt, e.updated_at
+            FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
+            JOIN document_versions dv ON dv.id = e.document_version_id
+            JOIN documents d
+              ON d.id = dv.document_id AND d.current_version_id = dv.id
+            WHERE e.status NOT IN ('archived', 'deprecated')
+            ORDER BY e.id
             """
         ).fetchall()
     if not rows:
@@ -107,9 +112,7 @@ def build_evidence_index(
     vectors = normalize_rows(np.vstack(batches))
     embedding_seconds = time.perf_counter() - embedding_started
 
-    fingerprint = sha256_text(
-        "\n".join(f"{row['id']}:{row['updated_at']}" for row in rows)
-    )
+    fingerprint = _rows_fingerprint(rows)
     write_started = time.perf_counter()
     store.replace(
         ids,
@@ -140,6 +143,23 @@ def semantic_search(
     query: str,
     limit: int,
 ):
+    metadata = store.metadata()
+    with database.connect() as connection:
+        current_rows = connection.execute(
+            """
+            SELECT e.id, e.updated_at
+            FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
+            JOIN document_versions dv ON dv.id = e.document_version_id
+            JOIN documents d
+              ON d.id = dv.document_id AND d.current_version_id = dv.id
+            WHERE e.status NOT IN ('archived', 'deprecated')
+            ORDER BY e.id
+            """
+        ).fetchall()
+    if metadata.get("evidence_fingerprint") != _rows_fingerprint(current_rows):
+        raise KnowledgeWorkbenchError("向量索引已过期，请重新运行 index build")
     query_vector = client.embed([query])[0]
     ranked = store.search(query_vector, limit)
     if not ranked:
@@ -152,9 +172,12 @@ def semantic_search(
             SELECT e.id, e.status, e.excerpt, e.locator_json,
                    d.original_name, d.classification
             FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
             JOIN document_versions dv ON dv.id = e.document_version_id
             JOIN documents d ON d.id = dv.document_id
-            WHERE e.id IN ({placeholders})
+            WHERE d.current_version_id = dv.id
+              AND e.id IN ({placeholders})
             """,
             tuple(evidence_id for evidence_id, _ in ranked),
         ).fetchall()
@@ -163,3 +186,8 @@ def semantic_search(
         key=lambda item: rank_by_id[item[0]["id"]][0],
     )
 
+
+def _rows_fingerprint(rows) -> str:
+    return sha256_text(
+        "\n".join(f"{row['id']}:{row['updated_at']}" for row in rows)
+    )

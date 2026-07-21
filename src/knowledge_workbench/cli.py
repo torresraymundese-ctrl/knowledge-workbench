@@ -17,8 +17,22 @@ import numpy as np
 
 from .config import WorkspacePaths, resolve_workspace
 from .errors import KnowledgeWorkbenchError
-from .evaluation import evaluate_dataset
+from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .ingest import ingest_file, initialize_workspace
+from .linting import lint_workspace
+from .labeling import (
+    add_forbidden_substring,
+    approve_labeling_session,
+    create_labeling_session,
+    export_labeling_dataset,
+    labeling_session_summary,
+    list_labeling_sessions,
+    reject_labeling_session,
+    remove_expected_evidence,
+    remove_forbidden_substring,
+    select_expected_evidence,
+    submit_labeling_session,
+)
 from .models import (
     Classification,
     ConflictStatus,
@@ -26,8 +40,11 @@ from .models import (
     TaskStatus,
 )
 from .conflicts import transition_conflict
+from .conflict_evaluation import evaluate_conflict_dataset
+from .citation_evaluation import evaluate_citation_dataset
 from .model_pipeline import analyze_with_model, generate_wiki_with_model
 from .parsers import parse_document
+from .parsers.legacy_word import find_word_executable
 from .pipeline import faithful_analysis, faithful_wiki_generation
 from .providers import AuditedModelGateway, DeepSeekChatModel
 from .parsers import supported_extensions
@@ -69,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="显示工作区统计")
     subparsers.add_parser("doctor", help="检查本机运行依赖")
     subparsers.add_parser("formats", help="显示支持的文件格式")
+    lint = subparsers.add_parser("lint", help="只读检查来源、Schema、证据镜像和 Wiki 一致性")
+    lint.add_argument("--output", type=Path)
 
     ingest = subparsers.add_parser("ingest", help="导入一个文件并创建原子证据和 Wiki 草稿")
     ingest.add_argument("path", type=Path)
@@ -78,6 +97,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=Classification.INTERNAL.value,
     )
     ingest.add_argument("--actor", default="cli")
+    ingest.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="同一文件版本在解析器或提取器升级后创建新的派生运行",
+    )
+    ingest.add_argument(
+        "--allow-legacy-word-conversion",
+        action="store_true",
+        help="显式允许使用本机 Microsoft Word 将旧版 .doc 临时转换为 DOCX",
+    )
 
     evidence = subparsers.add_parser("evidence", help="列出或审核原子证据")
     evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
@@ -200,10 +229,79 @@ def build_parser() -> argparse.ArgumentParser:
     conflict_set.add_argument("--actor", required=True)
     conflict_set.add_argument("--note")
 
+    conflict_evaluate = subparsers.add_parser(
+        "conflict-evaluate", help="评测冲突检测精确率、召回率和类型准确率"
+    )
+    conflict_evaluate.add_argument("dataset", type=Path)
+    conflict_evaluate.add_argument("--output", type=Path)
+    conflict_evaluate.add_argument("--allow-failures", action="store_true")
+
+    citation_evaluate = subparsers.add_parser(
+        "citation-evaluate", help="评测结论与引用证据的文本支撑精确率和召回率"
+    )
+    citation_evaluate.add_argument("dataset", type=Path)
+    citation_evaluate.add_argument("--output", type=Path)
+    citation_evaluate.add_argument("--allow-failures", action="store_true")
+
     evaluate = subparsers.add_parser("evaluate", help="运行证据保真质量评测并生成 JSON 报告")
     evaluate.add_argument("dataset", type=Path)
     evaluate.add_argument("--output", type=Path)
     evaluate.add_argument("--allow-failures", action="store_true")
+    evaluate.add_argument(
+        "--allow-legacy-word-conversion",
+        action="store_true",
+        help="显式允许使用本机 Microsoft Word 临时转换评测集中的旧版 .doc",
+    )
+    labeling_pack = subparsers.add_parser(
+        "labeling-pack", help="从当前证据生成纯本地人工标注候选包"
+    )
+    labeling_pack.add_argument("dataset", type=Path)
+    labeling_pack.add_argument("--output", type=Path)
+    labeling_pack.add_argument("--candidates-per-case", type=int, default=20)
+    label = subparsers.add_parser("label", help="可审计的人工黄金标注与双人复核")
+    label_sub = label.add_subparsers(dest="label_command", required=True)
+    label_sub.add_parser("list", help="列出标注会话")
+    label_create = label_sub.add_parser("create", help="从模板创建空标注集")
+    label_create.add_argument("template", type=Path)
+    label_create.add_argument("--actor", required=True)
+    label_create.add_argument("--name")
+    label_create.add_argument("--minimum-required-per-case", type=int, default=3)
+    label_add = label_sub.add_parser("add-evidence", help="选择当前原子证据")
+    label_add.add_argument("session_id")
+    label_add.add_argument("case_id")
+    label_add.add_argument("evidence_id")
+    label_add.add_argument("--actor", required=True)
+    label_remove = label_sub.add_parser("remove-evidence", help="移除已选证据")
+    label_remove.add_argument("session_id")
+    label_remove.add_argument("case_id")
+    label_remove.add_argument("evidence_id")
+    label_remove.add_argument("--actor", required=True)
+    label_forbid = label_sub.add_parser("add-forbidden", help="添加禁止生成的内容")
+    label_forbid.add_argument("session_id")
+    label_forbid.add_argument("case_id")
+    label_forbid.add_argument("value")
+    label_forbid.add_argument("--actor", required=True)
+    label_unforbid = label_sub.add_parser("remove-forbidden", help="移除禁止生成的内容")
+    label_unforbid.add_argument("session_id")
+    label_unforbid.add_argument("case_id")
+    label_unforbid.add_argument("value")
+    label_unforbid.add_argument("--actor", required=True)
+    label_submit = label_sub.add_parser("submit", help="提交双人复核")
+    label_submit.add_argument("session_id")
+    label_submit.add_argument("--actor", required=True)
+    label_approve = label_sub.add_parser("approve", help="由另一位审核人批准")
+    label_approve.add_argument("session_id")
+    label_approve.add_argument("--actor", required=True)
+    label_reject = label_sub.add_parser("reject", help="驳回并返回draft")
+    label_reject.add_argument("session_id")
+    label_reject.add_argument("--actor", required=True)
+    label_reject.add_argument("--note", required=True)
+    label_show = label_sub.add_parser("show", help="查看标注集与各用例进度")
+    label_show.add_argument("session_id")
+    label_export = label_sub.add_parser("export", help="导出已批准评测集")
+    label_export.add_argument("session_id")
+    label_export.add_argument("output", type=Path)
+    label_export.add_argument("--actor", required=True)
     return parser
 
 
@@ -223,15 +321,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"数据库：{paths.database}")
         elif args.command == "status":
             _status(database, paths)
+        elif args.command == "lint":
+            _handle_lint(database, paths, args)
         elif args.command == "ingest":
             result = ingest_file(
                 args.path,
                 paths,
                 Classification(args.classification),
                 actor=args.actor,
+                reprocess=args.reprocess,
+                allow_legacy_word_conversion=args.allow_legacy_word_conversion,
             )
             if result.duplicate:
-                print("检测到相同 SHA-256，已跳过重复导入。")
+                if args.reprocess:
+                    print("当前解析器和提取器的派生结果已存在，已跳过重处理。")
+                else:
+                    print("检测到相同 SHA-256，已跳过重复导入。")
+            elif result.reprocessed:
+                print("重处理完成；原始文件版本未重复创建。")
             else:
                 print("导入完成。")
             _print_mapping(
@@ -242,6 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "evidence_count": result.evidence_count,
                     "page_id": result.page_id,
                     "revision_id": result.revision_id,
+                    "processing_run_id": result.processing_run_id,
                     "potential_conflicts": result.conflict_count,
                 }
             )
@@ -265,8 +373,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             _handle_task(database, args)
         elif args.command == "conflict":
             _handle_conflict(database, args)
+        elif args.command == "conflict-evaluate":
+            _handle_conflict_evaluate(paths, args)
+        elif args.command == "citation-evaluate":
+            _handle_citation_evaluate(paths, args)
         elif args.command == "evaluate":
             _handle_evaluate(paths, args)
+        elif args.command == "labeling-pack":
+            _handle_labeling_pack(database, paths, args)
+        elif args.command == "label":
+            _handle_label(database, paths, args)
         elif args.command == "worker":
             _handle_worker(database, paths, args)
         return 0
@@ -281,14 +397,43 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _status(database, paths: WorkspacePaths) -> None:
     with database.connect() as connection:
         counts = {
+            "schema_version": connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+            ).fetchone()[0],
             "documents": connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
             "versions": connection.execute("SELECT COUNT(*) FROM document_versions").fetchone()[0],
+            "processing_runs": connection.execute(
+                "SELECT COUNT(*) FROM processing_runs"
+            ).fetchone()[0],
             "evidence": connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
+            "current_evidence": connection.execute(
+                """
+                SELECT COUNT(*) FROM evidence e
+                JOIN processing_runs pr ON pr.id = e.processing_run_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE pr.is_current = 1 AND d.current_version_id = dv.id
+                """
+            ).fetchone()[0],
             "draft_evidence": connection.execute(
-                "SELECT COUNT(*) FROM evidence WHERE status = 'draft'"
+                """
+                SELECT COUNT(*) FROM evidence e
+                JOIN processing_runs pr ON pr.id = e.processing_run_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE pr.is_current = 1 AND d.current_version_id = dv.id
+                  AND e.status = 'draft'
+                """
             ).fetchone()[0],
             "verified_evidence": connection.execute(
-                "SELECT COUNT(*) FROM evidence WHERE status = 'verified'"
+                """
+                SELECT COUNT(*) FROM evidence e
+                JOIN processing_runs pr ON pr.id = e.processing_run_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE pr.is_current = 1 AND d.current_version_id = dv.id
+                  AND e.status = 'verified'
+                """
             ).fetchone()[0],
             "wiki_pages": connection.execute("SELECT COUNT(*) FROM wiki_pages").fetchone()[0],
             "verified_pages": connection.execute(
@@ -300,9 +445,33 @@ def _status(database, paths: WorkspacePaths) -> None:
             "active_tasks": connection.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status IN ('pending', 'running', 'retrying')"
             ).fetchone()[0],
+            "labeling_sessions": connection.execute(
+                "SELECT COUNT(*) FROM labeling_sessions"
+            ).fetchone()[0],
         }
     print(f"工作区：{paths.root}")
     _print_mapping(counts)
+
+
+def _handle_lint(database, paths: WorkspacePaths, args) -> None:
+    report = lint_workspace(database, paths)
+    if args.output:
+        output = args.output.expanduser().resolve()
+        write_text_atomic(
+            output,
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        print(f"Lint 报告：{output}")
+    _print_mapping(report["summary"])
+    for issue in report["issues"][:50]:
+        print(
+            f"[{issue['severity']}:{issue['code']}] "
+            f"{issue['entity_id']}: {issue['message']}"
+        )
+    if len(report["issues"]) > 50:
+        print(f"另有 {len(report['issues']) - 50} 个问题未在终端展开。")
+    if not report["passed"]:
+        raise KnowledgeWorkbenchError("工作区 Lint 未通过")
 
 
 def _handle_evidence(args, database) -> None:
@@ -319,12 +488,14 @@ def _handle_evidence(args, database) -> None:
     query = """
         SELECT e.id, e.status, e.excerpt, e.locator_json, d.original_name
         FROM evidence e
+        JOIN processing_runs pr ON pr.id = e.processing_run_id AND pr.is_current = 1
         JOIN document_versions dv ON dv.id = e.document_version_id
         JOIN documents d ON d.id = dv.document_id
+        WHERE d.current_version_id = dv.id
     """
     parameters: list[object] = []
     if args.status:
-        query += " WHERE e.status = ?"
+        query += " AND e.status = ?"
         parameters.append(args.status)
     query += " ORDER BY e.created_at DESC, e.ordinal LIMIT ?"
     parameters.append(args.limit)
@@ -745,7 +916,10 @@ def _json_object_input(value: str | None, file_path: Path | None, name: str) -> 
 
 
 def _handle_evaluate(paths: WorkspacePaths, args) -> None:
-    report = evaluate_dataset(args.dataset)
+    report = evaluate_dataset(
+        args.dataset,
+        allow_legacy_word_conversion=args.allow_legacy_word_conversion,
+    )
     output = args.output
     if output is None:
         timestamp = report["evaluated_at"].replace(":", "").replace("+", "-")
@@ -760,6 +934,162 @@ def _handle_evaluate(paths: WorkspacePaths, args) -> None:
     _print_mapping(aggregate)
     if aggregate["pass_rate"] < 1.0 and not args.allow_failures:
         raise KnowledgeWorkbenchError("质量评测未全部通过；报告已保存")
+
+
+def _handle_conflict_evaluate(paths: WorkspacePaths, args) -> None:
+    report = evaluate_conflict_dataset(args.dataset)
+    output = args.output
+    if output is None:
+        timestamp = report["evaluated_at"].replace(":", "").replace("+", "-")
+        output = paths.evaluations / f"conflict-evaluation-{timestamp}.json"
+    output = output.expanduser().resolve()
+    write_text_atomic(
+        output,
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    aggregate = report["aggregate"]
+    print(f"冲突评测报告：{output}")
+    _print_mapping(aggregate)
+    if aggregate["pass_rate"] < 1.0 and not args.allow_failures:
+        raise KnowledgeWorkbenchError("冲突评测未全部通过；报告已保存")
+
+
+def _handle_citation_evaluate(paths: WorkspacePaths, args) -> None:
+    report = evaluate_citation_dataset(args.dataset)
+    output = args.output
+    if output is None:
+        timestamp = report["evaluated_at"].replace(":", "").replace("+", "-")
+        output = paths.evaluations / f"citation-evaluation-{timestamp}.json"
+    output = output.expanduser().resolve()
+    write_text_atomic(
+        output,
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    aggregate = report["aggregate"]
+    print(f"引用支撑评测报告：{output}")
+    _print_mapping(aggregate)
+    if aggregate["pass_rate"] < 1.0 and not args.allow_failures:
+        raise KnowledgeWorkbenchError("引用支撑评测未全部通过；报告已保存")
+
+
+def _handle_labeling_pack(database, paths: WorkspacePaths, args) -> None:
+    pack = build_labeling_candidate_pack(
+        database,
+        args.dataset,
+        candidates_per_case=args.candidates_per_case,
+    )
+    output = args.output
+    if output is None:
+        output = paths.evaluations / f"{args.dataset.stem}.candidates.json"
+    output = output.expanduser().resolve()
+    write_text_atomic(
+        output,
+        json.dumps(pack, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    print(f"标注候选包：{output}")
+    _print_mapping(
+        {
+            "case_count": len(pack["cases"]),
+            "candidate_count": sum(
+                len(case["candidate_evidence"]) for case in pack["cases"]
+            ),
+            "selection_method": pack["selection_method"],
+        }
+    )
+
+
+def _handle_label(database, paths: WorkspacePaths, args) -> None:
+    command = args.label_command
+    if command == "list":
+        sessions = list_labeling_sessions(database)
+        if not sessions:
+            print("暂无标注会话。")
+        for session in sessions:
+            print(
+                f"{session['id']} [{session['status']}] {session['name']} | "
+                f"cases={session['case_count']} "
+                f"selected={session['selected_evidence_count']} "
+                f"creator={session['created_by']}"
+            )
+    elif command == "create":
+        session_id = create_labeling_session(
+            database,
+            args.template,
+            actor=args.actor,
+            name=args.name,
+            minimum_required_per_case=args.minimum_required_per_case,
+        )
+        print(f"标注集已创建：{session_id}")
+    elif command == "add-evidence":
+        select_expected_evidence(
+            database,
+            args.session_id,
+            args.case_id,
+            args.evidence_id,
+            actor=args.actor,
+        )
+        print("必要证据已选择。")
+    elif command == "remove-evidence":
+        remove_expected_evidence(
+            database,
+            args.session_id,
+            args.case_id,
+            args.evidence_id,
+            actor=args.actor,
+        )
+        print("必要证据已移除。")
+    elif command == "add-forbidden":
+        add_forbidden_substring(
+            database,
+            args.session_id,
+            args.case_id,
+            args.value,
+            actor=args.actor,
+        )
+        print("禁止内容已添加。")
+    elif command == "remove-forbidden":
+        remove_forbidden_substring(
+            database,
+            args.session_id,
+            args.case_id,
+            args.value,
+            actor=args.actor,
+        )
+        print("禁止内容已移除。")
+    elif command == "submit":
+        submit_labeling_session(database, args.session_id, actor=args.actor)
+        print("标注集已提交复核。")
+    elif command == "approve":
+        approve_labeling_session(database, args.session_id, actor=args.actor)
+        print("标注集已由第二位审核人批准。")
+    elif command == "reject":
+        reject_labeling_session(
+            database,
+            args.session_id,
+            actor=args.actor,
+            note=args.note,
+        )
+        print("标注集已驳回并返回 draft。")
+    elif command == "show":
+        summary = labeling_session_summary(database, args.session_id)
+        _print_mapping(summary["session"])
+        for case in summary["cases"]:
+            print(
+                f"{case['case_id']} | {case['classification']} | "
+                f"selected={case['selected_evidence_count']} | "
+                f"forbidden={case['forbidden_count']}"
+            )
+            if case["selected_evidence_ids"]:
+                print(f"  evidence: {case['selected_evidence_ids']}")
+    elif command == "export":
+        output = export_labeling_dataset(
+            database,
+            paths,
+            args.session_id,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"正式评测集已导出：{output}")
 
 
 def _handle_worker(database, paths: WorkspacePaths, args) -> None:
@@ -788,6 +1118,8 @@ def _doctor() -> int:
     }
     print(f"Python: {sys.version.split()[0]}")
     print(f"Ollama CLI: {_find_ollama() or '未在 PATH 或可读目录中找到'}")
+    word_path = find_word_executable()
+    print(f"Microsoft Word .doc 转换: {word_path or '不可用'}")
     models = _ollama_models()
     print(f"Ollama API: {'可用（' + ', '.join(models) + '）' if models else '不可用'}")
     for package, purpose in packages.items():

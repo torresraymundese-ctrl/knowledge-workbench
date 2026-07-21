@@ -76,6 +76,8 @@ class IngestResult:
     page_id: str | None
     revision_id: str | None
     conflict_count: int = 0
+    processing_run_id: str | None = None
+    reprocessed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

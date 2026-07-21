@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 SCHEMA = """
@@ -206,6 +206,137 @@ CREATE INDEX idx_wiki_links_target ON wiki_links(target_page_id, created_at);
 """
 
 
+MIGRATION_4 = """
+CREATE TABLE processing_runs (
+    id TEXT PRIMARY KEY,
+    document_version_id TEXT NOT NULL REFERENCES document_versions(id),
+    parser_name TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    extraction_method TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('completed', 'superseded', 'failed')
+    ),
+    is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1)),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(document_version_id, parser_name, parser_version, extraction_method)
+);
+
+ALTER TABLE evidence
+    ADD COLUMN processing_run_id TEXT REFERENCES processing_runs(id);
+ALTER TABLE evidence
+    ADD COLUMN run_ordinal INTEGER;
+ALTER TABLE wiki_revisions
+    ADD COLUMN processing_run_id TEXT REFERENCES processing_runs(id);
+
+INSERT INTO processing_runs(
+    id, document_version_id, parser_name, parser_version,
+    extraction_method, status, is_current, created_at, completed_at
+)
+SELECT 'run_legacy_' || dv.id,
+       dv.id,
+       dv.parser_name,
+       dv.parser_version,
+       COALESCE(
+           (SELECT MIN(e.extraction_method)
+            FROM evidence e
+            WHERE e.document_version_id = dv.id),
+           'legacy-unknown'
+       ),
+       'completed',
+       1,
+       dv.created_at,
+       dv.created_at
+FROM document_versions dv;
+
+UPDATE evidence
+SET processing_run_id = 'run_legacy_' || document_version_id,
+    run_ordinal = ordinal
+WHERE processing_run_id IS NULL;
+
+UPDATE wiki_revisions
+SET processing_run_id = (
+    SELECT e.processing_run_id
+    FROM revision_evidence re
+    JOIN evidence e ON e.id = re.evidence_id
+    WHERE re.revision_id = wiki_revisions.id
+    LIMIT 1
+)
+WHERE processing_run_id IS NULL;
+
+CREATE UNIQUE INDEX idx_processing_runs_current
+    ON processing_runs(document_version_id)
+    WHERE is_current = 1;
+CREATE UNIQUE INDEX idx_evidence_run_ordinal
+    ON evidence(processing_run_id, run_ordinal)
+    WHERE processing_run_id IS NOT NULL;
+CREATE INDEX idx_evidence_processing_run
+    ON evidence(processing_run_id, status);
+CREATE INDEX idx_wiki_revisions_processing_run
+    ON wiki_revisions(processing_run_id);
+"""
+
+
+MIGRATION_5 = """
+CREATE TABLE labeling_sessions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    template_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (
+        status IN ('draft', 'reviewing', 'approved')
+    ),
+    minimum_required_per_case INTEGER NOT NULL DEFAULT 3 CHECK (
+        minimum_required_per_case > 0
+    ),
+    created_by TEXT NOT NULL,
+    submitted_by TEXT,
+    approved_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE labeling_cases (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES labeling_sessions(id) ON DELETE CASCADE,
+    case_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    document_version_id TEXT NOT NULL REFERENCES document_versions(id),
+    classification TEXT NOT NULL CHECK (
+        classification IN ('public', 'internal', 'confidential', 'restricted')
+    ),
+    max_duplicate_rate REAL NOT NULL CHECK (
+        max_duplicate_rate >= 0 AND max_duplicate_rate <= 1
+    ),
+    UNIQUE(session_id, case_id)
+);
+
+CREATE TABLE labeling_expected_evidence (
+    case_row_id TEXT NOT NULL REFERENCES labeling_cases(id) ON DELETE CASCADE,
+    evidence_id TEXT NOT NULL REFERENCES evidence(id),
+    selected_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(case_row_id, evidence_id)
+);
+
+CREATE TABLE labeling_forbidden_substrings (
+    id TEXT PRIMARY KEY,
+    case_row_id TEXT NOT NULL REFERENCES labeling_cases(id) ON DELETE CASCADE,
+    value TEXT NOT NULL CHECK (length(trim(value)) > 0),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(case_row_id, value)
+);
+
+CREATE INDEX idx_labeling_sessions_status
+    ON labeling_sessions(status, updated_at);
+CREATE INDEX idx_labeling_cases_session
+    ON labeling_cases(session_id, case_id);
+CREATE INDEX idx_labeling_expected_evidence
+    ON labeling_expected_evidence(evidence_id);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -254,6 +385,20 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, applied_at),
+                )
+                applied.add(3)
+            if 4 not in applied:
+                connection.executescript(MIGRATION_4)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, applied_at),
+                )
+                applied.add(4)
+            if 5 not in applied:
+                connection.executescript(MIGRATION_5)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, applied_at),
                 )
 
     @contextmanager

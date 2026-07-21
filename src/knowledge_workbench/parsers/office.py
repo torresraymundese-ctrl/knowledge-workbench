@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from knowledge_workbench.errors import MissingDependencyError
@@ -29,8 +30,13 @@ class PdfParser:
 
 class DocxParser:
     name = "python-docx"
-    version = "1"
+    version = "2"
     extensions = frozenset({".docx"})
+
+    _numbered_heading = re.compile(
+        r"^\s*(?P<number>\d+(?:\.\d+)*)(?:[.、]|\s+)\s*(?P<title>\S.*?)\s*$"
+    )
+    _toc_page_suffix = re.compile(r"(?:\t+|\s{2,}|[.．·…]{3,})\s*\d+\s*$")
 
     def parse(self, path: Path) -> ParseResult:
         try:
@@ -46,6 +52,8 @@ class DocxParser:
             text = paragraph.text.strip()
             if not text:
                 continue
+            if text == "目录" or self._looks_like_toc_entry(text):
+                continue
             style_name = paragraph.style.name if paragraph.style else ""
             if style_name.lower().startswith("heading"):
                 try:
@@ -55,10 +63,66 @@ class DocxParser:
                 headings[:] = headings[: level - 1]
                 headings.append(text)
                 continue
+            inferred = self._infer_numbered_heading(text)
+            if inferred is not None:
+                level, heading = inferred
+                headings[:] = headings[: level - 1]
+                headings.append(heading)
+                continue
             units.append(
                 ParsedUnit(text, {"paragraph": number, "heading_path": headings.copy()})
             )
+
+        for table_number, table in enumerate(document.tables, start=1):
+            for row_number, row in enumerate(table.rows, start=1):
+                fragments: list[str] = []
+                seen_cells: set[int] = set()
+                populated_columns: list[int] = []
+                for column_number, cell in enumerate(row.cells, start=1):
+                    cell_key = id(cell._tc)
+                    if cell_key in seen_cells:
+                        continue
+                    seen_cells.add(cell_key)
+                    cell_text = "\n".join(
+                        value
+                        for paragraph in cell.paragraphs
+                        if (value := paragraph.text.strip())
+                    )
+                    if not cell_text:
+                        continue
+                    fragments.append(f"C{column_number}={cell_text}")
+                    populated_columns.append(column_number)
+                if fragments:
+                    units.append(
+                        ParsedUnit(
+                            " | ".join(fragments),
+                            {
+                                "table": table_number,
+                                "row": row_number,
+                                "cell_range": (
+                                    f"R{row_number}C{populated_columns[0]}:"
+                                    f"R{row_number}C{populated_columns[-1]}"
+                                ),
+                                "heading_path": [],
+                            },
+                        )
+                    )
         return ParseResult(self.name, self.version, tuple(units))
+
+    def _looks_like_toc_entry(self, text: str) -> bool:
+        return bool(self._numbered_heading.match(text) and self._toc_page_suffix.search(text))
+
+    def _infer_numbered_heading(self, text: str) -> tuple[int, str] | None:
+        if len(text) > 80 or text.endswith(("。", "！", "？", "；", ".", "!", "?", ";")):
+            return None
+        match = self._numbered_heading.match(text)
+        if match is None:
+            return None
+        title = match.group("title").strip()
+        if not title or title.isdigit():
+            return None
+        level = match.group("number").count(".") + 1
+        return level, text
 
 
 class XlsxParser:
@@ -121,4 +185,3 @@ class PptxParser:
                     ParsedUnit("\n".join(fragments), {"slide": slide_number})
                 )
         return ParseResult(self.name, self.version, tuple(units))
-

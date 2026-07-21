@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "name": "内置冲突检测合成基线",
+  "cases": [
+    {
+      "case_id": "polarity-allow-deny",
+      "older": "内部资料允许发送到云端模型。",
+      "newer": "内部资料禁止发送到云端模型。",
+      "expected_conflict": true,
+      "expected_type": "polarity_change"
+    },
+    {
+      "case_id": "polarity-need-not-need",
+      "older": "提交申请时需要提供审批记录。",
+      "newer": "提交申请时无需提供审批记录。",
+      "expected_conflict": true,
+      "expected_type": "polarity_change"
+    },
+    {
+      "case_id": "value-amount",
+      "older": "合同金额为100万元，其他条件不变。",
+      "newer": "合同金额为120万元，其他条件不变。",
+      "expected_conflict": true,
+      "expected_type": "value_change"
+    },
+    {
+      "case_id": "value-deadline",
+      "older": "项目应在30个工作日内完成。",
+      "newer": "项目应在45个工作日内完成。",
+      "expected_conflict": true,
+      "expected_type": "value_change"
+    },
+    {
+      "case_id": "value-percentage",
+      "older": "服务费比例为5%。",
+      "newer": "服务费比例为8%。",
+      "expected_conflict": true,
+      "expected_type": "value_change"
+    },
+    {
+      "case_id": "metadata-version-date",
+      "older": "本方案V2.0于2024年1月1日发布。",
+      "newer": "本方案V2.1于2024年2月1日发布。",
+      "expected_conflict": false,
+      "expected_type": null
+    },
+    {
+      "case_id": "metadata-clause-reference",
+      "older": "操作步骤详见第3条。",
+      "newer": "操作步骤详见第4条。",
+      "expected_conflict": false,
+      "expected_type": null
+    },
+    {
+      "case_id": "ordinary-wording-change",
+      "older": "处理方式采用本地流程。",
+      "newer": "处理方式采用离线流程。",
+      "expected_conflict": false,
+      "expected_type": null
+    }
+  ]
+}
