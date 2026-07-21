@@ -610,6 +610,82 @@ def list_labeling_sessions(database: Database) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def labeling_session_readiness(database: Database, session_id: str) -> dict:
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        cases = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? ORDER BY case_id",
+            (session_id,),
+        ).fetchall()
+        results = []
+        for case in cases:
+            issues = []
+            try:
+                _ensure_case_source_current(connection, case)
+            except KnowledgeWorkbenchError as exc:
+                issues.append(
+                    {
+                        "code": "source_or_processing_stale",
+                        "message": str(exc),
+                    }
+                )
+            selected = connection.execute(
+                """
+                SELECT evidence_id FROM labeling_expected_evidence
+                WHERE case_row_id = ? ORDER BY created_at, evidence_id
+                """,
+                (case["id"],),
+            ).fetchall()
+            selected_ids = [row["evidence_id"] for row in selected]
+            if len(selected_ids) < session["minimum_required_per_case"]:
+                issues.append(
+                    {
+                        "code": "insufficient_evidence",
+                        "message": (
+                            f"已选择 {len(selected_ids)} 条，至少需要 "
+                            f"{session['minimum_required_per_case']} 条"
+                        ),
+                    }
+                )
+            for evidence_id in selected_ids:
+                try:
+                    _ensure_evidence_is_current_for_case(
+                        connection, case, evidence_id
+                    )
+                except KnowledgeWorkbenchError as exc:
+                    issues.append(
+                        {
+                            "code": "selected_evidence_invalid",
+                            "evidence_id": evidence_id,
+                            "message": str(exc),
+                        }
+                    )
+            results.append(
+                {
+                    "case_id": case["case_id"],
+                    "classification": case["classification"],
+                    "selected_evidence_count": len(selected_ids),
+                    "minimum_required": session["minimum_required_per_case"],
+                    "ready": not issues,
+                    "issues": issues,
+                }
+            )
+    ready = all(case["ready"] for case in results)
+    status = session["status"]
+    return {
+        "session_id": session["id"],
+        "status": status,
+        "ready": ready,
+        "case_count": len(results),
+        "ready_case_count": sum(case["ready"] for case in results),
+        "issue_count": sum(len(case["issues"]) for case in results),
+        "can_submit": ready and status == "draft",
+        "can_approve": ready and status == "reviewing",
+        "can_export": ready and status == "approved",
+        "cases": results,
+    }
+
+
 def validate_labeling_session_ready(database: Database, session_id: str) -> None:
     with database.connect() as connection:
         session = _get_session(connection, session_id)

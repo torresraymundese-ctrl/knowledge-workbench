@@ -13,6 +13,7 @@ from knowledge_workbench.labeling import (
     create_labeling_session,
     export_labeling_dataset,
     labeling_session_summary,
+    labeling_session_readiness,
     list_labeling_candidates,
     reject_labeling_session,
     select_expected_evidence,
@@ -24,6 +25,46 @@ from knowledge_workbench.models import Classification
 
 
 class LabelingWorkflowTests(unittest.TestCase):
+    def test_readiness_reports_all_missing_cases_and_stale_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("可验证证据。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+
+            initial = labeling_session_readiness(database, session_id)
+            self.assertFalse(initial["ready"])
+            self.assertEqual(initial["ready_case_count"], 0)
+            self.assertEqual(
+                {issue["code"] for issue in initial["cases"][0]["issues"]},
+                {"insufficient_evidence"},
+            )
+            evidence_id = list_labeling_candidates(
+                database, session_id, "case-1"
+            )["candidates"][0]["id"]
+            select_expected_evidence(
+                database, session_id, "case-1", evidence_id, actor="alice"
+            )
+            ready = labeling_session_readiness(database, session_id)
+            self.assertTrue(ready["ready"])
+            self.assertTrue(ready["can_submit"])
+
+            source.write_text("来源发生变化。", encoding="utf-8")
+            stale = labeling_session_readiness(database, session_id)
+            self.assertFalse(stale["ready"])
+            self.assertIn(
+                "source_or_processing_stale",
+                {issue["code"] for issue in stale["cases"][0]["issues"]},
+            )
+
     def test_batch_selection_is_atomic_deduplicated_and_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

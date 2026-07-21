@@ -53,6 +53,7 @@ Lint 检查 SQLite 外键、只读原始副本及 SHA-256、当前处理运行�
 
 # 查看进度并提交
 .\.venv\Scripts\knowledge.exe label show <session_id>
+.\.venv\Scripts\knowledge.exe label check <session_id> --strict
 .\.venv\Scripts\knowledge.exe label submit <session_id> --actor "标注人姓名"
 
 # 必须由另一人批准；也可以使用 reject --note 驳回

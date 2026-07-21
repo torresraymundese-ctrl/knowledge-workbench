@@ -26,6 +26,7 @@ from .labeling import (
     create_labeling_session,
     export_labeling_dataset,
     labeling_session_summary,
+    labeling_session_readiness,
     list_labeling_candidates,
     list_labeling_sessions,
     reject_labeling_session,
@@ -299,6 +300,13 @@ def build_parser() -> argparse.ArgumentParser:
     label_reject.add_argument("--note", required=True)
     label_show = label_sub.add_parser("show", help="查看标注集与各用例进度")
     label_show.add_argument("session_id")
+    label_check = label_sub.add_parser(
+        "check", help="汇总检查来源、处理运行和证据选择是否就绪"
+    )
+    label_check.add_argument("session_id")
+    label_check.add_argument(
+        "--strict", action="store_true", help="未就绪时返回非零退出码"
+    )
     label_candidates = label_sub.add_parser(
         "candidates", help="分页查看某个用例的当前候选证据"
     )
@@ -1096,6 +1104,33 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             )
             if case["selected_evidence_ids"]:
                 print(f"  evidence: {case['selected_evidence_ids']}")
+    elif command == "check":
+        readiness = labeling_session_readiness(database, args.session_id)
+        _print_mapping(
+            {
+                "session_id": readiness["session_id"],
+                "status": readiness["status"],
+                "ready": readiness["ready"],
+                "ready_cases": (
+                    f"{readiness['ready_case_count']}/{readiness['case_count']}"
+                ),
+                "issue_count": readiness["issue_count"],
+                "can_submit": readiness["can_submit"],
+                "can_approve": readiness["can_approve"],
+                "can_export": readiness["can_export"],
+            }
+        )
+        for case in readiness["cases"]:
+            marker = "ok" if case["ready"] else "blocked"
+            print(
+                f"[{marker}] {case['case_id']} | "
+                f"selected={case['selected_evidence_count']}/"
+                f"{case['minimum_required']}"
+            )
+            for issue in case["issues"]:
+                print(f"  - {issue['code']}: {issue['message']}")
+        if args.strict and not readiness["ready"]:
+            raise KnowledgeWorkbenchError("标注集尚未达到当前状态的完整性要求")
     elif command == "candidates":
         result = list_labeling_candidates(
             database,
