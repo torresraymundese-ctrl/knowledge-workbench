@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-workbench"
+version = "0.1.0"
+description = "Evidence-first local knowledge compiler and review workflow"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [{name = "Knowledge Workbench Team"}]
+dependencies = ["jsonschema>=4.23,<5"]
+
+[project.optional-dependencies]
+documents = [
+  "openpyxl>=3.1,<4",
+  "pypdf>=5,<7",
+  "python-docx>=1.1,<2",
+  "python-pptx>=1.0,<2",
+]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+knowledge = "knowledge_workbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+knowledge_workbench = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

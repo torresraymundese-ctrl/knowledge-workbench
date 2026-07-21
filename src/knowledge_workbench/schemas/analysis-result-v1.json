@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledge-workbench.local/schemas/analysis-result-v1.json",
+  "title": "Stage 1 document analysis result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "provenance", "evidence"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_version_id", "sha256", "classification"],
+      "properties": {
+        "document_version_id": {"type": "string", "pattern": "^ver_[a-f0-9]+$"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "classification": {
+          "enum": ["public", "internal", "confidential", "restricted"]
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "provider", "model", "prompt_version"],
+      "properties": {
+        "mode": {"enum": ["faithful", "model_assisted"]},
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": ["string", "null"]},
+        "prompt_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/evidenceItem"}
+    }
+  },
+  "$defs": {
+    "evidenceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id", "excerpt", "locator", "evidence_type",
+        "entities", "concepts", "projects", "applicability", "potential_conflicts"
+      ],
+      "properties": {
+        "candidate_id": {"type": "string", "pattern": "^E[0-9]{4,}$"},
+        "excerpt": {"type": "string", "minLength": 1},
+        "locator": {"type": "object"},
+        "evidence_type": {
+          "enum": ["fact", "definition", "decision", "requirement", "metric", "other"]
+        },
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "type": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "concepts": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "projects": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "applicability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope", "valid_from", "valid_to"],
+          "properties": {
+            "scope": {"type": ["string", "null"]},
+            "valid_from": {"type": ["string", "null"], "format": "date"},
+            "valid_to": {"type": ["string", "null"], "format": "date"}
+          }
+        },
+        "potential_conflicts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target_evidence_id", "reason"],
+            "properties": {
+              "target_evidence_id": {"type": ["string", "null"]},
+              "reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+}
