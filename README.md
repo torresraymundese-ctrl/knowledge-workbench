@@ -82,7 +82,7 @@ $Reviewer = "reviewer-01"
 .\.venv\Scripts\knowledge.exe worker run --worker local-worker-1 --stop-when-idle
 ```
 
-DeepSeek 是可选增强。只有配置 `DEEPSEEK_API_KEY` 后才能显式运行 `--mode deepseek`；`internal` 资料还必须增加 `--allow-internal-cloud-once`。`confidential` 和 `restricted` 资料始终禁止云调用。阶段二使用 `wiki-generation-v2-extractive` 抽取式提示词：结论必须逐字等于一条所引证据，禁止改写、多证据合成及原文范围外推断；无法逐字表达的整理需求进入 `human_tasks`，现有方向词、关键数字和文本支撑校验继续作为硬防线。真实 `samples/example.md` 第二轮调用已通过两阶段校验，但单一样例结果不代表企业资料整体质量。项目禁止使用 `qwen2.5:7b-instruct`。
+DeepSeek 是可选增强。只有配置 `DEEPSEEK_API_KEY` 后才能显式运行 `--mode deepseek`；`internal` 资料还必须增加 `--allow-internal-cloud-once`。`confidential` 和 `restricted` 资料始终禁止云调用。阶段一 `analysis-v2-local-locators` 只让模型选择逐字证据和补充语义字段，来源定位由本地 faithful 提取器按 excerpt 强制回填，模型返回的定位不会成为事实来源；阶段二使用 `wiki-generation-v2-extractive` 抽取式提示词，结论必须逐字等于一条所引证据，禁止改写、多证据合成及原文范围外推断。无法逐字表达的整理需求进入 `human_tasks`，现有方向词、关键数字和文本支撑校验继续作为硬防线。真实短 Markdown 与34单元表格 DOCX 已完成调用验证，但不能代表企业资料整体质量。项目禁止使用 `qwen2.5:7b-instruct`。
 
 不安装项目也可以运行：
 

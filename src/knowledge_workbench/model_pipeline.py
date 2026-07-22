@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 from .errors import KnowledgeWorkbenchError
-from .models import Classification, ParseResult
+from .extraction import FaithfulEvidenceExtractor
+from .models import Classification, EvidenceCandidate, ParseResult
 from .providers import AuditedModelGateway
 from .schema_validation import load_schema, validate_analysis, validate_wiki_generation
 
@@ -25,7 +27,10 @@ def analyze_with_model(
     ]
     prompt = (
         "从解析单元提取原子证据。excerpt 必须逐字来自某个 text；不要生成结论。"
+        "locator 统一填写空对象 {}，不要猜测或删改来源定位；系统会在本地按 excerpt "
+        "从 parsed_units 回填 locator 和全部 locators。"
         "只返回一个 JSON 对象，包含 evidence 数组，数组元素必须符合所给 Schema 的 $defs.evidenceItem。\n"
+        "prompt_version=analysis-v2-local-locators\n"
         f"evidence_item_schema={json.dumps(schema['$defs']['evidenceItem'], ensure_ascii=False)}\n"
         f"parsed_units={json.dumps(units, ensure_ascii=False)}"
     )
@@ -36,6 +41,10 @@ def analyze_with_model(
         allow_internal_cloud_once=allow_internal_cloud_once,
     )
     model_output = _json_object(content)
+    source_candidates = FaithfulEvidenceExtractor().extract(parsed)
+    evidence = _with_source_locators(
+        model_output.get("evidence"), source_candidates
+    )
     payload = {
         "schema_version": "1.0",
         "source": {
@@ -47,12 +56,51 @@ def analyze_with_model(
             "mode": "model_assisted",
             "provider": type(gateway.provider).__name__,
             "model": gateway.provider.name,
-            "prompt_version": "analysis-v1",
+            "prompt_version": "analysis-v2-local-locators",
         },
-        "evidence": model_output.get("evidence"),
+        "evidence": evidence,
     }
     validate_analysis(payload, parsed.units)
     return payload
+
+
+def _with_source_locators(
+    evidence: object, source_candidates: tuple[EvidenceCandidate, ...]
+) -> object:
+    if not isinstance(evidence, list):
+        return evidence
+    hydrated = []
+    for raw_item in evidence:
+        if not isinstance(raw_item, dict):
+            hydrated.append(raw_item)
+            continue
+        item = deepcopy(raw_item)
+        excerpt = item.get("excerpt")
+        if not isinstance(excerpt, str) or not excerpt:
+            hydrated.append(item)
+            continue
+        locators = []
+        seen = set()
+        for candidate in source_candidates:
+            if excerpt not in candidate.excerpt:
+                continue
+            for source_locator in candidate.locators:
+                locator = deepcopy(source_locator)
+                canonical = json.dumps(
+                    locator,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                locators.append(locator)
+        if locators:
+            item["locator"] = locators[0]
+            item["locators"] = locators
+        hydrated.append(item)
+    return hydrated
 
 
 def generate_wiki_with_model(

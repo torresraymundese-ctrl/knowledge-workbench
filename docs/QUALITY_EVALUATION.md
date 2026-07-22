@@ -145,7 +145,7 @@ if ($Ordinals.Count -lt 3) { throw "请先核对原文并填写至少3个候选�
 
 随后使用 internal 单次授权验证表格型 `总体进度计划.docx`。该文件解析为34个单元、共1600字符，其中33个来自表格。DeepSeek 阶段一输出34条互不重复证据，与 faithful 的证据正文集合完全一致，字符覆盖1600/1600；阶段二生成34条结论，每条只引用一条逐字匹配证据，引用覆盖34/34，最低和平均支撑分数均为1.0，低支撑和方向/数值冲突均为0。分析模型把27条标为 fact、6条标为 requirement、1条标为 definition，并保留全部33个表格定位。
 
-本轮仍暴露定位和语义元数据缺口：DeepSeek 输出没有 faithful 的 `segment`、`unit` 和 `locators[]` 多定位字段，concepts 仅7/34非空，projects 仅1/34非空；faithful 则完整保留这些定位但不产生概念、项目或证据类型语义。当前结论是抽取式阶段二已在短 Markdown 和中等表格 DOCX 上稳定通过，阶段一的定位字段保真仍需在提示词或受控后处理层补强，且尚未覆盖超长文档、跨页表格和跨段冲突。
+本轮仍暴露定位和语义元数据缺口：DeepSeek 输出没有 faithful 的 `segment`、`unit` 和 `locators[]` 多定位字段，concepts 仅7/34非空，projects 仅1/34非空；faithful 则完整保留这些定位但不产生概念、项目或证据类型语义。阶段一随后升级为 `analysis-v2-local-locators`：忽略模型定位，使用本地 `FaithfulEvidenceExtractor` 按逐字 excerpt 覆盖首定位并投影全部去重位置。旧34条证据离线重放已恢复33/33表格定位，以及34/34 `segment`、`unit` 和 `locators[]`，伪造定位与同正文多位置均有回归测试；真实 API 复验尚待单次授权。当前抽取式阶段二已在短 Markdown 和中等表格 DOCX 上稳定通过，但尚未覆盖超长文档、跨页表格和跨段冲突。
 
 引用支撑算法本身使用独立的人工标签数据集评测：
 

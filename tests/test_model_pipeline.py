@@ -83,7 +83,15 @@ class ModelPipelineTests(unittest.TestCase):
                 actor="tester",
             )
         self.assertEqual(output["pages"][0]["conclusions"][0]["evidence_ids"], ["E0001"])
+        expected_locator = {"line_start": 1, "unit": 1, "segment": 1}
+        self.assertEqual(analysis["evidence"][0]["locator"], expected_locator)
+        self.assertEqual(analysis["evidence"][0]["locators"], [expected_locator])
+        self.assertEqual(
+            analysis["provenance"]["prompt_version"],
+            "analysis-v2-local-locators",
+        )
         self.assertEqual(len(model.calls), 2)
+        self.assertIn("系统会在本地", model.calls[0])
         generation_prompt = model.calls[1]
         self.assertIn("逐字完全相同", generation_prompt)
         self.assertIn("禁止把多条证据综合成新结论", generation_prompt)
@@ -118,6 +126,49 @@ class ModelPipelineTests(unittest.TestCase):
                     classification=Classification.PUBLIC,
                     actor="tester",
                 )
+
+    def test_model_locator_is_replaced_with_all_matching_source_locators(self):
+        excerpt = "同一要求在表格中重复出现。"
+        evidence = {
+            "candidate_id": "E0001",
+            "excerpt": excerpt,
+            "locator": {"invented": True},
+            "evidence_type": "requirement",
+            "entities": [],
+            "concepts": [],
+            "projects": [],
+            "applicability": {"scope": None, "valid_from": None, "valid_to": None},
+            "potential_conflicts": [],
+        }
+        model = ResponseQueueModel(
+            [json.dumps({"evidence": [evidence]}, ensure_ascii=False)]
+        )
+        source_locators = (
+            {"table_index": 1, "row_start": 2, "segment": 1, "unit": 1},
+            {"table_index": 1, "row_start": 8, "segment": 1, "unit": 2},
+        )
+        parsed = ParseResult(
+            "test",
+            "1",
+            tuple(ParsedUnit(excerpt, locator) for locator in source_locators),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            database = initialize_workspace(
+                WorkspacePaths(Path(temporary) / "workspace")
+            )
+            analysis = analyze_with_model(
+                AuditedModelGateway(database, model),
+                parsed,
+                document_version_id="ver_abcdef",
+                source_sha256="d" * 64,
+                classification=Classification.PUBLIC,
+                actor="tester",
+            )
+
+        item = analysis["evidence"][0]
+        self.assertEqual(item["locator"], source_locators[0])
+        self.assertEqual(item["locators"], list(source_locators))
+        self.assertNotIn("invented", json.dumps(item["locators"]))
 
 
 if __name__ == "__main__":
