@@ -72,6 +72,7 @@ from .utils import sha256_file
 from .wiki import write_text_atomic
 from .wiki_links import add_wiki_link, remove_wiki_link
 from .worker import run_once
+from .webapp import serve_web
 from .embeddings import OllamaEmbeddingClient
 from .vector_store import (
     NumpyFlatVectorStore,
@@ -186,6 +187,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit = subparsers.add_parser("audit", help="查看最近的审计事件")
     audit.add_argument("--limit", type=int, default=30)
+
+    web = subparsers.add_parser("web", help="启动仅限本机访问的只读 Web 工作台")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
 
     pipeline = subparsers.add_parser("pipeline", help="运行并校验两阶段分析与 Wiki JSON 输出")
     pipeline.add_argument("path", type=Path)
@@ -458,6 +463,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _benchmark(database, paths, args)
         elif args.command == "audit":
             _show_audit(database, args.limit)
+        elif args.command == "web":
+            serve_web(database, paths, host=args.host, port=args.port)
         elif args.command == "pipeline":
             _handle_pipeline(database, paths, args)
         elif args.command == "task":

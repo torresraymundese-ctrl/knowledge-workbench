@@ -2,7 +2,7 @@
 
 一个证据优先、可审核、可追溯的本地知识编译系统。项目借鉴 LLM Wiki 的持续维护理念，但采用独立实现，不复制 GPL 项目代码。
 
-当前里程碑只实现命令行闭环：
+当前里程碑已完成命令行闭环，并提供仅限本机访问的只读 Web 工作台：
 
 ```text
 原始文件（只读副本）
@@ -102,3 +102,13 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 ## 项目状态
 
 第一条命令行知识链路、全文检索、可选 BGE-M3 语义检索、审核状态机、任务工作器、双向链接和质量评测已经可运行。详细边界见 [第一阶段架构](docs/ARCHITECTURE.md)、[性能基线](docs/PERFORMANCE_BASELINE.md)、[质量评测](docs/QUALITY_EVALUATION.md) 和 [下一里程碑](docs/NEXT_MILESTONE.md)。
+
+## 本地 Web 工作台
+
+启动首个只读里程碑：
+
+```powershell
+.\.venv\Scripts\knowledge.exe --workspace workspace web
+```
+
+然后打开 `http://127.0.0.1:8765/`。当前页面提供工作区总览、当前资料、审核队列、质量评测和脱敏审计动态。服务只允许绑定 `127.0.0.1` 或 `localhost`，不提供写接口，不暴露来源路径、评测集路径、审计详情或证据原文；`restricted` 资料名称和定位也会隐藏。状态流转仍通过既有业务服务和 CLI 完成。

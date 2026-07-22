@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>知识工作台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="/" aria-label="知识工作台首页">
+        <span class="brand-mark">知</span>
+        <span><strong>知识工作台</strong><small>Evidence-first</small></span>
+      </a>
+      <nav>
+        <a class="nav-item active" href="#overview"><span>总览</span><kbd>1</kbd></a>
+        <a class="nav-item" href="#documents"><span>资料</span><kbd>2</kbd></a>
+        <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
+        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>4</kbd></a>
+        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>5</kbd></a>
+      </nav>
+      <div class="local-lock">
+        <span class="status-dot" aria-hidden="true"></span>
+        <div><strong>本机只读</strong><small>仅监听 127.0.0.1</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LOCAL KNOWLEDGE OPERATIONS</p>
+          <h1>证据、审核与知识质量，一处掌握</h1>
+        </div>
+        <div class="top-actions">
+          <span id="sync-state" class="sync-state"><span></span>正在读取</span>
+          <button id="refresh" type="button">刷新数据</button>
+        </div>
+      </header>
+
+      <section id="overview" aria-labelledby="overview-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">OVERVIEW</p><h2 id="overview-title">工作区总览</h2></div>
+          <p id="overview-note" class="muted">读取 SQLite 当前版本与当前处理运行</p>
+        </div>
+        <div id="metrics" class="metric-grid" aria-live="polite"></div>
+        <div class="insight-grid">
+          <article class="panel status-panel">
+            <div class="panel-heading"><h3>证据状态分布</h3><span>当前证据</span></div>
+            <div id="evidence-status" class="status-list"></div>
+          </article>
+          <article class="panel attention-panel">
+            <div class="panel-heading"><h3>需要关注</h3><span>实时汇总</span></div>
+            <div id="attention" class="attention-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="documents" aria-labelledby="documents-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">DOCUMENTS</p><h2 id="documents-title">当前资料</h2></div>
+          <span id="document-count" class="count-pill">—</span>
+        </div>
+        <div class="panel table-panel">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>资料</th><th>密级</th><th>解析器</th><th>证据</th><th>审核</th><th>Wiki</th></tr></thead>
+              <tbody id="documents-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="reviews" aria-labelledby="reviews-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">REVIEW QUEUE</p><h2 id="reviews-title">审核队列</h2></div>
+          <p class="muted">首版只读，不在页面内执行状态变更</p>
+        </div>
+        <div id="review-columns" class="review-grid"></div>
+      </section>
+
+      <section id="quality" aria-labelledby="quality-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">QUALITY</p><h2 id="quality-title">最近评测</h2></div>
+          <span class="count-pill">本地报告</span>
+        </div>
+        <div id="evaluations" class="evaluation-grid"></div>
+      </section>
+
+      <section id="activity" aria-labelledby="activity-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">AUDIT</p><h2 id="activity-title">最近动态</h2></div>
+          <p class="muted">详情内容与文件路径不在 Web 暴露</p>
+        </div>
+        <div class="panel"><ol id="activity-list" class="timeline"></ol></div>
+      </section>
+
+      <footer>知识工作台 · 本地只读里程碑 · SQLite 为状态唯一真相</footer>
+    </main>
+  </div>
+  <div id="error-banner" class="error-banner" role="alert" hidden></div>
+</body>
+</html>

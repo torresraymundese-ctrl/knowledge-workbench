@@ -28,7 +28,7 @@ knowledge = "knowledge_workbench.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-knowledge_workbench = ["schemas/*.json"]
+knowledge_workbench = ["schemas/*.json", "web_assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
