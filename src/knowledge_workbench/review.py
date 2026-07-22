@@ -110,6 +110,41 @@ def request_revision_review(database: Database, revision_id: str, *, actor: str)
         )
 
 
+def reject_revision(
+    database: Database,
+    revision_id: str,
+    *,
+    actor: str,
+    note: str,
+) -> None:
+    note = note.strip()
+    if not note:
+        raise KnowledgeWorkbenchError("驳回 Wiki 修订必须填写复核意见")
+    if len(note) > 2000:
+        raise KnowledgeWorkbenchError("Wiki 修订复核意见不能超过 2000 个字符")
+    now = utc_now()
+    with database.transaction() as connection:
+        revision = _get_revision(connection, revision_id)
+        _ensure_revision_is_current(revision)
+        current = RevisionStatus(revision["status"])
+        if current is not RevisionStatus.REVIEWING:
+            raise InvalidTransitionError(
+                f"只有 reviewing 修订可以驳回，当前为 {current.value}"
+            )
+        connection.execute(
+            "UPDATE wiki_revisions SET status = 'rejected', updated_at = ? WHERE id = ?",
+            (now, revision_id),
+        )
+        record_event(
+            connection,
+            "wiki_revision_rejected",
+            "wiki_revision",
+            revision_id,
+            actor=actor,
+            details={"note": note},
+        )
+
+
 def publish_revision(
     database: Database,
     paths: WorkspacePaths,

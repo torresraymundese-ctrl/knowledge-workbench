@@ -21,7 +21,7 @@
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { margin: 0; color: var(--ink); background: var(--canvas); }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 
 .shell { min-height: 100vh; display: grid; grid-template-columns: 244px minmax(0, 1fr); }
 .sidebar { position: sticky; top: 0; height: 100vh; padding: 28px 20px; background: var(--navy); color: #eef4f7; display: flex; flex-direction: column; }
@@ -149,6 +149,8 @@ dialog::backdrop { background: rgba(15,28,40,.48); backdrop-filter: blur(2px); }
 .revision-evidence-summary { margin-top: 8px; color: var(--green); font-size: 11px; font-weight: 650; }
 .dialog-notice { margin: 14px 0 0; border-left: 3px solid var(--amber); padding: 9px 11px; color: #735a19; background: #fff8e7; font-size: 10px; line-height: 1.6; }
 .revision-preview { max-height: 360px; overflow: auto; margin: 16px 0 0; border: 1px solid var(--line); border-radius: 10px; padding: 14px; white-space: pre-wrap; overflow-wrap: anywhere; color: #263440; background: #f7f9f9; font-family: Consolas, "SFMono-Regular", monospace; font-size: 10px; line-height: 1.65; }
+.revision-review-note { width: 100%; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; color: var(--ink); background: #fff; outline: none; }
+.revision-review-note:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(22,126,102,.1); }
 .dialog-shell blockquote { max-height: 300px; overflow: auto; margin: 18px 0; border-left: 3px solid var(--green); padding: 14px 16px; white-space: pre-wrap; color: #263440; background: #f7f9f9; font-size: 13px; line-height: 1.75; }
 .locator-row { display: grid; grid-template-columns: 72px 1fr; gap: 10px; align-items: start; font-size: 11px; }
 .locator-row code { overflow-wrap: anywhere; color: var(--muted); }

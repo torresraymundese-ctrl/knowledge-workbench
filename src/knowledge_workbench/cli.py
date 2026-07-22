@@ -58,7 +58,12 @@ from .parsers.legacy_word import find_word_executable
 from .pipeline import faithful_analysis, faithful_wiki_generation
 from .providers import AuditedModelGateway, DeepSeekChatModel
 from .parsers import supported_extensions
-from .review import publish_revision, request_revision_review, transition_evidence
+from .review import (
+    publish_revision,
+    reject_revision,
+    request_revision_review,
+    transition_evidence,
+)
 from .search import search_evidence
 from .tasks import (
     claim_next_task,
@@ -138,6 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     page_publish = page_sub.add_parser("publish", help="发布审核通过的 Wiki 修订")
     page_publish.add_argument("revision_id")
     page_publish.add_argument("--actor", required=True)
+    page_reject = page_sub.add_parser("reject", help="驳回 reviewing Wiki 修订")
+    page_reject.add_argument("revision_id")
+    page_reject.add_argument("--note", required=True, help="必填复核意见")
+    page_reject.add_argument("--actor", required=True)
     page_link_add = page_sub.add_parser("link-add", help="向 draft 修订添加 Obsidian 知识链接")
     page_link_add.add_argument("source_revision_id")
     page_link_add.add_argument("target_page_id")
@@ -621,6 +630,15 @@ def _handle_page(args, database, paths: WorkspacePaths) -> None:
             database, paths, args.revision_id, actor=args.actor
         )
         print(f"修订已发布：{output}")
+        return
+    if args.page_command == "reject":
+        reject_revision(
+            database,
+            args.revision_id,
+            actor=args.actor,
+            note=args.note,
+        )
+        print(f"修订 {args.revision_id} 已驳回")
         return
     if args.page_command == "link-add":
         link_id = add_wiki_link(

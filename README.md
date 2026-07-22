@@ -44,6 +44,7 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe ingest .\samples\legacy.doc --classification internal --allow-legacy-word-conversion
 .\.venv\Scripts\knowledge.exe evidence list
 .\.venv\Scripts\knowledge.exe page list
+.\.venv\Scripts\knowledge.exe page reject rev_复制实际修订ID --note "复核意见" --actor reviewer-01
 .\.venv\Scripts\knowledge.exe index build --model bge-m3
 .\.venv\Scripts\knowledge.exe semantic-search "哪些资料不能发送到云端"
 .\.venv\Scripts\knowledge.exe benchmark --mode fts --iterations 50
@@ -111,6 +112,6 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 .\.venv\Scripts\knowledge.exe --workspace workspace web
 ```
 
-然后打开 `http://127.0.0.1:8765/`。当前页面提供工作区总览、当前资料、审核队列、质量评测、脱敏审计动态，以及受控的证据审核、冲突处理和 Wiki 草稿提交复核。审核队列支持按状态、密级和安全元数据搜索，并对证据、冲突和 Wiki 修订分别分页；`restricted` 资料不能通过原文件名或页面标题搜索。非受限 Wiki 修订可在显式打开后查看元数据、引用证据状态和受限长度的 Markdown 预览；只有内容哈希与数据库一致的当前 `draft` 修订才能提交为 `reviewing`。服务只允许绑定 `127.0.0.1` 或 `localhost`，不暴露来源路径、评测集路径或审计详情；列表接口不批量返回证据原文，只有明确打开非 `restricted` 证据时才返回单条详情，`restricted` 名称、定位、原文和 Web 写操作始终被阻断。
+然后打开 `http://127.0.0.1:8765/`。当前页面提供工作区总览、当前资料、审核队列、质量评测、脱敏审计动态，以及受控的证据审核、冲突处理和 Wiki 草稿提交复核。审核队列支持按状态、密级和安全元数据搜索，并对证据、冲突和 Wiki 修订分别分页；`restricted` 资料不能通过原文件名或页面标题搜索。非受限 Wiki 修订可在显式打开后查看元数据、引用证据状态和受限长度的 Markdown 预览；只有内容哈希与数据库一致的当前 `draft` 修订才能提交为 `reviewing`。`reviewing` 修订可填写必需复核意见后驳回为不可变的 `rejected`，旧正式修订继续生效。服务只允许绑定 `127.0.0.1` 或 `localhost`，不暴露来源路径、评测集路径或审计详情；列表接口不批量返回证据原文，只有明确打开非 `restricted` 证据时才返回单条详情，`restricted` 名称、定位、原文和 Web 写操作始终被阻断。
 
 Web 写操作必须填写 `actor`，使用进程级 CSRF 令牌、同源与 Host 校验，并继续调用既有证据、冲突和 Wiki 修订状态机写入审计日志。Web 层不直接执行状态 SQL，也不修改 Markdown。Wiki 正式发布和其他高影响写操作尚未开放。

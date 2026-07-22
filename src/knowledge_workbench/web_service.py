@@ -9,7 +9,7 @@ from .conflicts import transition_conflict
 from .database import Database
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
-from .review import request_revision_review, transition_evidence
+from .review import reject_revision, request_revision_review, transition_evidence
 from .utils import sha256_text
 
 
@@ -679,6 +679,49 @@ class WorkbenchActionService:
         self, revision_id: str, *, actor: str
     ) -> dict[str, Any]:
         actor = _required_actor(actor)
+        row = self._current_revision_for_web(revision_id)
+        if row["classification"] == "restricted":
+            raise PermissionError("restricted Wiki 修订只能通过 CLI 提交复核")
+        _read_revision_content(
+            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
+        )
+        request_revision_review(self.database, revision_id, actor=actor)
+        return {
+            "entity_type": "wiki_revision",
+            "entity_id": revision_id,
+            "status": "reviewing",
+            "actor": actor,
+        }
+
+    def reject_revision_review(
+        self,
+        revision_id: str,
+        *,
+        actor: str,
+        note: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        note = _required_review_note(note)
+        row = self._current_revision_for_web(revision_id)
+        if row["classification"] == "restricted":
+            raise PermissionError("restricted Wiki 修订只能通过 CLI 复核")
+        _read_revision_content(
+            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
+        )
+        reject_revision(
+            self.database,
+            revision_id,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "wiki_revision",
+            "entity_id": revision_id,
+            "status": "rejected",
+            "actor": actor,
+        }
+
+    def _current_revision_for_web(self, revision_id: str):
         with self.database.connect() as connection:
             row = connection.execute(
                 """
@@ -695,18 +738,7 @@ class WorkbenchActionService:
             ).fetchone()
         if not row:
             raise KnowledgeWorkbenchError(f"当前 Wiki 修订不存在：{revision_id}")
-        if row["classification"] == "restricted":
-            raise PermissionError("restricted Wiki 修订只能通过 CLI 提交复核")
-        _read_revision_content(
-            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
-        )
-        request_revision_review(self.database, revision_id, actor=actor)
-        return {
-            "entity_type": "wiki_revision",
-            "entity_id": revision_id,
-            "status": "reviewing",
-            "actor": actor,
-        }
+        return row
 
     def _current_evidence_classification(self, evidence_id: str) -> str:
         with self.database.connect() as connection:
@@ -810,6 +842,15 @@ def _required_actor(value: str) -> str:
     if len(actor) > 80:
         raise ValueError("actor 不能超过 80 个字符")
     return actor
+
+
+def _required_review_note(value: str) -> str:
+    note = value.strip()
+    if not note:
+        raise ValueError("驳回 Wiki 修订必须填写复核意见")
+    if len(note) > 2000:
+        raise ValueError("Wiki 修订复核意见不能超过 2000 个字符")
+    return note
 
 
 def _optional_note(value: str | None) -> str | None:

@@ -4,6 +4,7 @@ const statusLabels = {
   draft: "草稿",
   reviewing: "审核中",
   verified: "已验证",
+  rejected: "已驳回",
   conflicted: "有冲突",
   pending: "待处理",
   deprecated: "已弃用",
@@ -15,6 +16,7 @@ const eventLabels = {
   document_reprocessed: "资料已重处理",
   evidence_status_changed: "证据状态已变更",
   wiki_revision_submitted: "Wiki 修订已提交",
+  wiki_revision_rejected: "Wiki 修订已驳回",
   wiki_revision_published: "Wiki 修订已发布",
   potential_conflict_queued: "发现潜在冲突",
   conflict_status_changed: "冲突状态已变更",
@@ -267,6 +269,26 @@ async function submitRevisionReview(revisionId) {
   }
 }
 
+async function rejectRevisionReview(revisionId, noteInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const note = noteInput.value.trim();
+  if (!note) {
+    showBanner("驳回 Wiki 修订必须填写复核意见");
+    noteInput.focus();
+    return;
+  }
+  if (!window.confirm(`确认驳回 Wiki 修订？该决定和复核意见将以 ${actor} 写入审计日志。`)) return;
+  try {
+    await postTransition(`/api/v1/wiki-revisions/${encodeURIComponent(revisionId)}/reject`, { actor, note });
+    document.querySelector("#revision-dialog").close();
+    await loadDashboard();
+    showBanner(`Wiki 修订已驳回，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "Wiki 修订驳回失败");
+  }
+}
+
 async function openRevision(revisionId) {
   try {
     const response = await fetch(`/api/v1/wiki-revisions/${encodeURIComponent(revisionId)}`, { headers: { Accept: "application/json" } });
@@ -284,7 +306,7 @@ async function openRevision(revisionId) {
       notice.textContent = `页面内容共 ${formatNumber(detail.content_length)} 个字符，Web 仅显示前 ${formatNumber(detail.content_preview.length)} 个字符；提交前请在 Obsidian 或 CLI 核对全文。`;
       notice.hidden = false;
     } else if (detail.status === "reviewing") {
-      notice.textContent = "该修订正在复核；正式发布尚未在 Web 开放。";
+      notice.textContent = "该修订正在复核；可填写复核意见并驳回，正式发布尚未在 Web 开放。";
       notice.hidden = false;
     } else {
       notice.hidden = true;
@@ -294,6 +316,15 @@ async function openRevision(revisionId) {
     actions.replaceChildren();
     if (detail.can_submit_review) {
       actions.append(button("提交复核", "primary", () => submitRevisionReview(detail.revision_id)));
+    } else if (detail.status === "reviewing") {
+      const note = element("textarea", "revision-review-note");
+      note.maxLength = 2000;
+      note.rows = 3;
+      note.placeholder = "复核意见（驳回时必填）";
+      actions.append(
+        note,
+        button("驳回修订", "danger", () => rejectRevisionReview(detail.revision_id, note)),
+      );
     }
     document.querySelector("#revision-dialog").showModal();
   } catch (cause) {

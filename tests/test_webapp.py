@@ -310,6 +310,49 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(revision, "reviewing")
             self.assertEqual(audit["actor"], "reviewer-01")
 
+            reject_route = (
+                f"/api/v1/wiki-revisions/{internal_result.revision_id}/reject"
+            )
+            missing_note = application.handle(
+                "POST",
+                reject_route,
+                body=json.dumps(
+                    {"actor": "reviewer-02", "note": ""}
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(missing_note.status, 400)
+            rejected = application.handle(
+                "POST",
+                reject_route,
+                body=json.dumps(
+                    {"actor": "reviewer-02", "note": "引用范围需要重新核对。"},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(rejected.status, 200)
+            with database.connect() as connection:
+                rejected_status = connection.execute(
+                    "SELECT status FROM wiki_revisions WHERE id = ?",
+                    (internal_result.revision_id,),
+                ).fetchone()[0]
+                rejection_audit = connection.execute(
+                    """
+                    SELECT actor, details_json FROM audit_log
+                    WHERE event_type = 'wiki_revision_rejected'
+                      AND entity_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (internal_result.revision_id,),
+                ).fetchone()
+            self.assertEqual(rejected_status, "rejected")
+            self.assertEqual(rejection_audit["actor"], "reviewer-02")
+            self.assertEqual(
+                json.loads(rejection_audit["details_json"])["note"],
+                "引用范围需要重新核对。",
+            )
+
             restricted_submit = application.handle(
                 "POST",
                 f"/api/v1/wiki-revisions/{restricted_result.revision_id}/submit-review",
@@ -317,6 +360,16 @@ class WorkbenchWebTests(unittest.TestCase):
                 headers=headers,
             )
             self.assertEqual(restricted_submit.status, 403)
+            restricted_reject = application.handle(
+                "POST",
+                f"/api/v1/wiki-revisions/{restricted_result.revision_id}/reject",
+                body=json.dumps(
+                    {"actor": "reviewer-02", "note": "请通过 CLI 核对。"},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(restricted_reject.status, 403)
 
     def test_evaluation_projection_exposes_metrics_without_local_paths(self):
         with tempfile.TemporaryDirectory() as temporary:

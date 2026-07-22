@@ -80,6 +80,7 @@ class WorkbenchWebApplication:
                         "evidence-transition",
                         "conflict-transition",
                         "wiki-revision-submit-review",
+                        "wiki-revision-reject",
                     ],
                 }
                 return self._json(200, payload)
@@ -158,10 +159,18 @@ class WorkbenchWebApplication:
         conflict_id = _route_entity_id(
             path, entity="conflicts", action="transition"
         )
-        revision_id = _route_entity_id(
+        revision_submit_id = _route_entity_id(
             path, entity="wiki-revisions", action="submit-review"
         )
-        if evidence_id is None and conflict_id is None and revision_id is None:
+        revision_reject_id = _route_entity_id(
+            path, entity="wiki-revisions", action="reject"
+        )
+        if (
+            evidence_id is None
+            and conflict_id is None
+            and revision_submit_id is None
+            and revision_reject_id is None
+        ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
         content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
@@ -195,9 +204,15 @@ class WorkbenchWebApplication:
                         else str(payload.get("note"))
                     ),
                 )
-            else:
+            elif revision_submit_id is not None:
                 result = self.action_service.submit_revision_review(
-                    revision_id or "", actor=actor
+                    revision_submit_id, actor=actor
+                )
+            else:
+                result = self.action_service.reject_revision_review(
+                    revision_reject_id or "",
+                    actor=actor,
+                    note=str(payload.get("note", "")),
                 )
             return self._json(200, {"ok": True, "result": result})
         except (UnicodeError, json.JSONDecodeError):
