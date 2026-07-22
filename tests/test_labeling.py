@@ -12,6 +12,7 @@ from knowledge_workbench.labeling import (
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
+    export_labeling_review_pack,
     labeling_session_summary,
     labeling_session_readiness,
     list_labeling_candidates,
@@ -215,6 +216,35 @@ class LabelingWorkflowTests(unittest.TestCase):
             )
             submit_labeling_session(database, session_id, actor="alice")
             with self.assertRaisesRegex(InvalidTransitionError, "必须与提交人不同"):
+                export_labeling_review_pack(
+                    database,
+                    paths,
+                    session_id,
+                    paths.evaluations / "self-review.md",
+                    actor="alice",
+                )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "workspace 内"):
+                export_labeling_review_pack(
+                    database,
+                    paths,
+                    session_id,
+                    root / "outside-review.md",
+                    actor="bob",
+                )
+            review_pack = paths.evaluations / "review.md"
+            export_labeling_review_pack(
+                database, paths, session_id, review_pack, actor="bob"
+            )
+            review_content = review_pack.read_text(encoding="utf-8")
+            self.assertIn(session_id, review_content)
+            self.assertIn(evidence_id, review_content)
+            self.assertIn("必须保留原始证据", review_content)
+            self.assertIn("本文件只用于人工回源复核", review_content)
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "不允许静默覆盖"):
+                export_labeling_review_pack(
+                    database, paths, session_id, review_pack, actor="bob"
+                )
+            with self.assertRaisesRegex(InvalidTransitionError, "必须与提交人不同"):
                 approve_labeling_session(database, session_id, actor="alice")
             approve_labeling_session(database, session_id, actor="bob")
             output = paths.evaluations / "approved-dataset.json"
@@ -240,6 +270,7 @@ class LabelingWorkflowTests(unittest.TestCase):
                     ).fetchall()
                 }
             self.assertIn("labeling_session_submitted", events)
+            self.assertIn("labeling_review_pack_exported", events)
             self.assertIn("labeling_session_approved", events)
             self.assertIn("labeling_dataset_exported", events)
 

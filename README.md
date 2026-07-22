@@ -58,6 +58,7 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe label --help
 .\.venv\Scripts\knowledge.exe label candidates <session_id> <case_id> --limit 20
 .\.venv\Scripts\knowledge.exe label check <session_id> --strict
+.\.venv\Scripts\knowledge.exe label review-pack <session_id> .\workspace\evaluations\review.md --actor <reviewer>
 .\.venv\Scripts\knowledge.exe task enqueue faithful_pipeline --payload-file .\samples\faithful-task.json
 .\.venv\Scripts\knowledge.exe worker run-once --worker local-worker-1
 ```

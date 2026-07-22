@@ -25,6 +25,7 @@ from .labeling import (
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
+    export_labeling_review_pack,
     labeling_session_summary,
     labeling_session_readiness,
     list_labeling_candidates,
@@ -322,6 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
     label_export.add_argument("session_id")
     label_export.add_argument("output", type=Path)
     label_export.add_argument("--actor", required=True)
+    label_review_pack = label_sub.add_parser(
+        "review-pack", help="由不同复核人导出本地Markdown复核包"
+    )
+    label_review_pack.add_argument("session_id")
+    label_review_pack.add_argument("output", type=Path)
+    label_review_pack.add_argument("--actor", required=True)
     return parser
 
 
@@ -1178,6 +1185,15 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             actor=args.actor,
         )
         print(f"正式评测集已导出：{output}")
+    elif command == "review-pack":
+        output = export_labeling_review_pack(
+            database,
+            paths,
+            args.session_id,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"人工复核包已导出：{output}")
 
 
 def _handle_worker(database, paths: WorkspacePaths, args) -> None:

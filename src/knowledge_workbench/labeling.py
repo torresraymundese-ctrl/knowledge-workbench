@@ -399,6 +399,114 @@ def reject_labeling_session(
         )
 
 
+def export_labeling_review_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    session_id: str,
+    output: Path,
+    *,
+    actor: str,
+) -> Path:
+    actor = _required_actor(actor)
+    output = output.expanduser().resolve()
+    if output.suffix.lower() != ".md":
+        raise KnowledgeWorkbenchError("复核包必须使用 .md 文件")
+    if output.exists():
+        raise KnowledgeWorkbenchError(f"复核包已存在，不允许静默覆盖：{output}")
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "reviewing":
+            raise InvalidTransitionError("只有 reviewing 标注集可以生成复核包")
+        if session["submitted_by"] == actor:
+            raise InvalidTransitionError("复核包执行人必须与提交人不同")
+        _ensure_session_ready(connection, session)
+        cases = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? ORDER BY case_id",
+            (session_id,),
+        ).fetchall()
+        _ensure_labeling_output_allowed(paths, cases, output, "复核包")
+        lines = [
+            f"# {session['name']}：复核包",
+            "",
+            f"- 会话ID：`{session_id}`",
+            f"- 提交人：`{session['submitted_by']}`",
+            f"- 复核人：`{actor}`",
+            f"- 生成时间：`{utc_now()}`",
+            "- 说明：本文件只用于人工回源复核，不代表已经批准。",
+            "",
+        ]
+        evidence_count = 0
+        for case in cases:
+            evidence = connection.execute(
+                """
+                SELECT e.id, e.run_ordinal, e.excerpt, e.locator_json, e.status,
+                       lee.selected_by, lee.created_at
+                FROM labeling_expected_evidence lee
+                JOIN evidence e ON e.id = lee.evidence_id
+                WHERE lee.case_row_id = ?
+                ORDER BY e.run_ordinal, e.id
+                """,
+                (case["id"],),
+            ).fetchall()
+            forbidden = connection.execute(
+                """
+                SELECT value FROM labeling_forbidden_substrings
+                WHERE case_row_id = ? ORDER BY created_at, id
+                """,
+                (case["id"],),
+            ).fetchall()
+            evidence_count += len(evidence)
+            lines.extend(
+                [
+                    f"## {case['case_id']}",
+                    "",
+                    f"- 密级：`{case['classification']}`",
+                    f"- 来源：`{_markdown_code(case['source_path'])}`",
+                    f"- 来源SHA-256：`{case['source_sha256']}`",
+                    f"- 文件版本：`{case['document_version_id']}`",
+                    "",
+                ]
+            )
+            for row in evidence:
+                lines.extend(
+                    [
+                        f"### [ ] #{row['run_ordinal']} `{row['id']}`",
+                        "",
+                        f"- 状态：`{row['status']}`",
+                        f"- 定位：`{_markdown_code(row['locator_json'])}`",
+                        f"- 选择人：`{row['selected_by']}`",
+                        "",
+                        *_blockquote(row["excerpt"]),
+                        "",
+                    ]
+                )
+            if forbidden:
+                lines.extend(["### 禁止内容", ""])
+                for row in forbidden:
+                    lines.extend([*_blockquote(row["value"]), ""])
+    content = "\n".join(lines).rstrip() + "\n"
+    write_text_atomic(output, content)
+    try:
+        with database.transaction() as connection:
+            record_event(
+                connection,
+                "labeling_review_pack_exported",
+                "labeling_session",
+                session_id,
+                actor=actor,
+                details={
+                    "output_path": str(output),
+                    "content_sha256": sha256_text(content),
+                    "case_count": len(cases),
+                    "evidence_count": evidence_count,
+                },
+            )
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    return output
+
+
 def export_labeling_dataset(
     database: Database,
     paths: WorkspacePaths,
@@ -420,15 +528,7 @@ def export_labeling_dataset(
             "SELECT * FROM labeling_cases WHERE session_id = ? ORDER BY case_id",
             (session_id,),
         ).fetchall()
-        if any(case["classification"] == "restricted" for case in cases):
-            raise KnowledgeWorkbenchError("restricted 标注集暂不允许导出")
-        if any(case["classification"] != "public" for case in cases):
-            try:
-                output.relative_to(paths.root)
-            except ValueError as exc:
-                raise KnowledgeWorkbenchError(
-                    "非公开资料的评测集只能导出到当前 workspace 内"
-                ) from exc
+        _ensure_labeling_output_allowed(paths, cases, output, "评测集")
         dataset_cases = []
         for case in cases:
             evidence = connection.execute(
@@ -805,6 +905,28 @@ def _relative_source_path(source: Path, output_parent: Path) -> str:
         return Path(os.path.relpath(source, output_parent)).as_posix()
     except ValueError:
         return str(source)
+
+
+def _ensure_labeling_output_allowed(
+    paths: WorkspacePaths, cases, output: Path, output_kind: str
+) -> None:
+    if any(case["classification"] == "restricted" for case in cases):
+        raise KnowledgeWorkbenchError(f"restricted 标注集暂不允许导出{output_kind}")
+    if any(case["classification"] != "public" for case in cases):
+        try:
+            output.relative_to(paths.root)
+        except ValueError as exc:
+            raise KnowledgeWorkbenchError(
+                f"非公开资料的{output_kind}只能导出到当前 workspace 内"
+            ) from exc
+
+
+def _markdown_code(value: str) -> str:
+    return value.replace("`", "'")
+
+
+def _blockquote(value: str) -> list[str]:
+    return [f"> {line}" if line else ">" for line in value.splitlines() or [""]]
 
 
 def _required_actor(value: str) -> str:
