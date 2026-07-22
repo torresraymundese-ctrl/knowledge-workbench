@@ -98,10 +98,12 @@ td { padding: 14px 16px; border-top: 1px solid #edf0f2; font-size: 12px; vertica
 .state.warn { color: var(--amber); font-weight: 650; }
 
 .review-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-.review-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 170px 160px auto; gap: 10px; align-items: end; margin-bottom: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+.review-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 150px minmax(350px, 1.35fr) auto; gap: 10px; align-items: end; margin-bottom: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .review-toolbar label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .review-toolbar input, .review-toolbar select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px; color: var(--ink); background: #fff; outline: none; }
 .review-toolbar input:focus, .review-toolbar select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(22,126,102,.1); }
+.review-status-filters { min-width: 0; margin: 0; border: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.review-status-filters legend { margin-bottom: 5px; padding: 0; color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .review-toolbar-actions { display: flex; gap: 7px; }
 .review-toolbar-actions button { padding: 8px 11px; box-shadow: none; }
 .review-toolbar-actions .primary-filter { border-color: var(--green); color: #fff; background: var(--green); }
@@ -121,6 +123,18 @@ td { padding: 14px 16px; border-top: 1px solid #edf0f2; font-size: 12px; vertica
 .queue-note:focus { border-color: var(--green); }
 .queue-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 9px; }
 .queue-pagination button { padding: 5px 8px; border-radius: 7px; font-size: 9px; box-shadow: none; }
+.rejected-history-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 24px 0 10px; }
+.rejected-history-heading p { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
+.rejected-history { overflow: hidden; }
+.rejected-history-list { display: grid; }
+.rejected-history-card { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(260px, 1.4fr) auto; gap: 16px; align-items: center; padding: 14px 16px; border-bottom: 1px solid #edf0f2; }
+.rejected-history-card:last-child { border-bottom: 0; }
+.rejected-history-card strong, .rejected-history-card small { display: block; }
+.rejected-history-card small { margin-top: 4px; color: var(--muted); font-size: 9px; }
+.rejection-note { margin: 0; color: #594f4f; font-size: 10px; line-height: 1.55; }
+.rejected-history-meta { color: var(--muted); text-align: right; white-space: nowrap; font-size: 9px; }
+.rejected-history-meta span, .rejected-history-meta time { display: block; }
+.rejected-history .queue-pagination { margin: 0; padding: 11px 16px; border-top: 1px solid #edf0f2; background: #fafbfb; }
 .empty { padding: 26px 10px; color: #9ba5ae; text-align: center; font-size: 11px; }
 
 .evaluation-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
@@ -170,6 +184,9 @@ dialog::backdrop { background: rgba(15,28,40,.48); backdrop-filter: blur(2px); }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .review-grid, .evaluation-grid { grid-template-columns: 1fr 1fr; }
   .review-toolbar { grid-template-columns: 1fr 1fr; }
+  .review-status-filters { grid-column: 1 / -1; }
+  .rejected-history-card { grid-template-columns: 1fr 1.4fr; }
+  .rejected-history-meta { grid-column: 1 / -1; text-align: left; }
 }
 @media (max-width: 760px) {
   .shell { display: block; }
@@ -184,7 +201,10 @@ dialog::backdrop { background: rgba(15,28,40,.48); backdrop-filter: blur(2px); }
   .top-actions { width: 100%; justify-content: space-between; }
   .actor-control { align-items: flex-start; flex-direction: column; }
   .review-toolbar { grid-template-columns: 1fr; }
+  .review-status-filters { grid-column: auto; grid-template-columns: 1fr; }
   .metric-grid, .insight-grid, .review-grid, .evaluation-grid { grid-template-columns: 1fr; }
+  .rejected-history-card { grid-template-columns: 1fr; }
+  .rejected-history-meta { grid-column: auto; }
   .timeline li { grid-template-columns: 1fr; gap: 5px; }
   .timeline .actor { text-align: left; }
 }

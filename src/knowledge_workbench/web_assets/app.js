@@ -31,7 +31,12 @@ const reviewKinds = ["evidence", "conflicts", "wiki_revisions"];
 const reviewState = {
   limit: 5,
   offsets: { evidence: 0, conflicts: 0, wiki_revisions: 0 },
-  filters: { query: "", status: "", classification: "" },
+  historyOffset: 0,
+  filters: {
+    query: "",
+    classification: "",
+    statuses: { evidence: "", conflicts: "", wiki_revisions: "" },
+  },
 };
 
 function element(tag, className, text) {
@@ -433,6 +438,49 @@ function renderReviews(queue) {
   columns.replaceChildren(evidenceColumn, conflictColumn, wikiColumn);
 }
 
+function renderRejectedHistory(page) {
+  document.querySelector("#rejected-history-count").textContent = `${page.total} 项`;
+  const root = document.querySelector("#rejected-history");
+  const list = element("div", "rejected-history-list");
+  if (!page.items.length) {
+    list.append(element("div", "empty", "暂无已驳回 Wiki 修订"));
+  } else {
+    page.items.forEach((item) => {
+      const card = element("article", "rejected-history-card");
+      const identity = element("div");
+      identity.append(
+        element("strong", "", item.page_title),
+        element("small", "", `修订 ${item.revision_number} · ${item.classification} · ${item.source_is_current ? "当前来源" : "历史来源"}`),
+      );
+      const note = item.classification === "restricted"
+        ? "复核意见受密级策略保护，请通过 CLI 回源核对。"
+        : item.review_note || "未记录复核意见。";
+      const metadata = element("div", "rejected-history-meta");
+      metadata.append(
+        element("span", "", item.rejected_by || "操作者未知"),
+        element("time", "", formatTime(item.rejected_at)),
+      );
+      card.append(identity, element("p", "rejection-note", note), metadata);
+      list.append(card);
+    });
+  }
+  const pagination = element("div", "queue-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    reviewState.historyOffset = Math.max(0, page.offset - page.limit);
+    await refreshReviewQueues();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    reviewState.historyOffset = page.offset + page.limit;
+    await refreshReviewQueues();
+  });
+  next.disabled = !page.has_next;
+  pagination.append(previous, element("span", "", `第 ${pageNumber}/${pageCount} 页`), next);
+  root.replaceChildren(list, pagination);
+}
+
 async function fetchReviewPage(kind) {
   const parameters = new URLSearchParams({
     kind,
@@ -440,7 +488,7 @@ async function fetchReviewPage(kind) {
     offset: String(reviewState.offsets[kind]),
   });
   if (reviewState.filters.query) parameters.set("q", reviewState.filters.query);
-  if (reviewState.filters.status) parameters.set("status", reviewState.filters.status);
+  if (reviewState.filters.statuses[kind]) parameters.set("status", reviewState.filters.statuses[kind]);
   if (reviewState.filters.classification) parameters.set("classification", reviewState.filters.classification);
   const response = await fetch(`/api/v1/review-queue?${parameters}`, { headers: { Accept: "application/json" } });
   const page = await response.json();
@@ -448,9 +496,26 @@ async function fetchReviewPage(kind) {
   return page;
 }
 
+async function fetchRejectedHistory() {
+  const parameters = new URLSearchParams({
+    limit: String(reviewState.limit),
+    offset: String(reviewState.historyOffset),
+  });
+  if (reviewState.filters.query) parameters.set("q", reviewState.filters.query);
+  if (reviewState.filters.classification) parameters.set("classification", reviewState.filters.classification);
+  const response = await fetch(`/api/v1/wiki-revisions/history?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `已驳回修订历史读取失败（HTTP ${response.status}）`);
+  return page;
+}
+
 async function loadReviewQueues() {
-  const pages = await Promise.all(reviewKinds.map(fetchReviewPage));
+  const [pages, history] = await Promise.all([
+    Promise.all(reviewKinds.map(fetchReviewPage)),
+    fetchRejectedHistory(),
+  ]);
   renderReviews(Object.fromEntries(pages.map((page) => [page.kind, page])));
+  renderRejectedHistory(history);
 }
 
 async function refreshReviewQueues() {
@@ -530,15 +595,25 @@ document.querySelector("#refresh").addEventListener("click", loadDashboard);
 document.querySelector("#review-filters").addEventListener("submit", async (event) => {
   event.preventDefault();
   reviewState.filters.query = document.querySelector("#review-query").value.trim();
-  reviewState.filters.status = document.querySelector("#review-status").value;
   reviewState.filters.classification = document.querySelector("#review-classification").value;
+  reviewState.filters.statuses = {
+    evidence: document.querySelector("#evidence-review-status").value,
+    conflicts: document.querySelector("#conflict-review-status").value,
+    wiki_revisions: document.querySelector("#wiki-review-status").value,
+  };
   reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
+  reviewState.historyOffset = 0;
   await refreshReviewQueues();
 });
 document.querySelector("#clear-review-filters").addEventListener("click", async () => {
   document.querySelector("#review-filters").reset();
-  reviewState.filters = { query: "", status: "", classification: "" };
+  reviewState.filters = {
+    query: "",
+    classification: "",
+    statuses: { evidence: "", conflicts: "", wiki_revisions: "" },
+  };
   reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
+  reviewState.historyOffset = 0;
   await refreshReviewQueues();
 });
 document.querySelector("#close-evidence-dialog").addEventListener("click", () => document.querySelector("#evidence-dialog").close());

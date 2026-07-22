@@ -223,7 +223,7 @@ class WorkbenchReadService:
 
         limit, offset = _pagination(limit, offset)
         kind = _review_kind(kind)
-        status = _review_status(status)
+        status = _review_status(status, kind=kind)
         classification = _classification_filter(classification)
         query = _review_query(query)
         if kind == "evidence":
@@ -263,6 +263,84 @@ class WorkbenchReadService:
             "items": items,
             "filters": {
                 "status": status,
+                "classification": classification,
+                "query": query,
+            },
+        }
+
+    def rejected_revision_history(
+        self,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        classification: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """Return immutable rejected Wiki revision history without page content."""
+
+        limit, offset = _pagination(limit, offset)
+        classification = _classification_filter(classification)
+        query = _review_query(query)
+        where = ["wr.status = 'rejected'"]
+        parameters: list[Any] = []
+        if classification:
+            where.append("d.classification = ?")
+            parameters.append(classification)
+        if query:
+            where.append(
+                """
+                (instr(lower(wr.id), lower(?)) > 0
+                 OR (d.classification <> 'restricted'
+                     AND instr(lower(wp.title), lower(?)) > 0))
+                """
+            )
+            parameters.extend((query, query))
+        predicate = " AND ".join(where)
+        source = f"""
+            FROM wiki_revisions wr
+            JOIN wiki_pages wp ON wp.id = wr.page_id
+            JOIN documents d ON d.id = wp.source_document_id
+            JOIN processing_runs pr ON pr.id = wr.processing_run_id
+            LEFT JOIN audit_log rejection ON rejection.id = (
+                SELECT al.id
+                FROM audit_log al
+                WHERE al.event_type = 'wiki_revision_rejected'
+                  AND al.entity_type = 'wiki_revision'
+                  AND al.entity_id = wr.id
+                ORDER BY al.id DESC
+                LIMIT 1
+            )
+            WHERE {predicate}
+        """
+        with self.database.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) {source}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT wr.id, wr.revision_number, wr.updated_at,
+                       wp.title, d.classification,
+                       CASE WHEN pr.is_current = 1
+                                  AND d.current_version_id = pr.document_version_id
+                            THEN 1 ELSE 0 END AS source_is_current,
+                       rejection.actor AS rejected_by,
+                       rejection.created_at AS rejected_at,
+                       rejection.details_json AS rejection_details_json
+                {source}
+                ORDER BY COALESCE(rejection.created_at, wr.updated_at) DESC, wr.id
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit, offset),
+            ).fetchall()
+        items = [self._rejected_revision_projection(row) for row in rows]
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_previous": offset > 0,
+            "has_next": offset + len(items) < total,
+            "items": items,
+            "filters": {
                 "classification": classification,
                 "query": query,
             },
@@ -606,6 +684,24 @@ class WorkbenchReadService:
             "updated_at": row["updated_at"],
         }
 
+    def _rejected_revision_projection(self, row) -> dict[str, Any]:
+        restricted = row["classification"] == "restricted"
+        return {
+            "revision_id": row["id"],
+            "status": "rejected",
+            "revision_number": row["revision_number"],
+            "page_title": "[受限知识页]" if restricted else row["title"],
+            "classification": row["classification"],
+            "source_is_current": bool(row["source_is_current"]),
+            "rejected_by": row["rejected_by"],
+            "rejected_at": row["rejected_at"] or row["updated_at"],
+            "review_note": (
+                None
+                if restricted
+                else _safe_rejection_note(row["rejection_details_json"])
+            ),
+        }
+
 
 class WorkbenchActionService:
     """Narrow Web adapter that delegates all writes to existing state machines."""
@@ -848,12 +944,17 @@ def _review_kind(value: str) -> str:
     return value
 
 
-def _review_status(value: str | None) -> str | None:
+def _review_status(value: str | None, *, kind: str) -> str | None:
     if value is None or not value.strip():
         return None
     status = value.strip()
-    if status not in {"draft", "reviewing", "conflicted", "pending"}:
-        raise ValueError("审核队列 status 不受支持")
+    allowed = {
+        "evidence": {"draft", "reviewing", "conflicted"},
+        "conflicts": {"pending", "reviewing"},
+        "wiki_revisions": {"draft", "reviewing"},
+    }[kind]
+    if status not in allowed:
+        raise ValueError(f"{kind} 审核队列不支持状态：{status}")
     return status
 
 
@@ -974,6 +1075,19 @@ def _safe_locator(raw: str) -> dict[str, Any]:
         "segment",
     }
     return {key: value for key, value in locator.items() if key in allowed}
+
+
+def _safe_rejection_note(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        details = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(details, dict):
+        return None
+    note = details.get("note")
+    return note if isinstance(note, str) and note.strip() else None
 
 
 def _read_evaluation_summary(path: Path) -> dict[str, Any] | None:

@@ -13,8 +13,9 @@ from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
 from knowledge_workbench.models import EvidenceStatus
-from knowledge_workbench.review import transition_evidence
+from knowledge_workbench.review import reject_revision
 from knowledge_workbench.review import request_revision_review
+from knowledge_workbench.review import transition_evidence
 from knowledge_workbench.web_service import (
     WorkbenchActionService,
     WorkbenchReadService,
@@ -164,6 +165,14 @@ class WorkbenchWebTests(unittest.TestCase):
                 "GET", f"/api/v1/review-queue?kind=evidence&q={'x' * 121}"
             )
             self.assertEqual(oversized_query.status, 400)
+            invalid_wiki_status = application.handle(
+                "GET", "/api/v1/review-queue?kind=wiki_revisions&status=pending"
+            )
+            self.assertEqual(invalid_wiki_status.status, 400)
+            invalid_conflict_status = application.handle(
+                "GET", "/api/v1/review-queue?kind=conflicts&status=conflicted"
+            )
+            self.assertEqual(invalid_conflict_status.status, 400)
 
     def test_review_queue_pages_cover_conflicts_and_current_wiki_revisions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -207,6 +216,91 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(conflicts["total"], 1)
             self.assertEqual(conflicts["items"][0]["status"], "pending")
             self.assertEqual(conflicts["items"][0]["document_name"], "审核策略.md")
+
+    def test_rejected_revision_history_is_read_only_searchable_and_redacted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "内部驳回页面.md"
+            restricted = root / "绝密驳回页面.md"
+            internal.write_text("需要人工修订的内部知识。", encoding="utf-8")
+            restricted.write_text("需要人工修订的受限知识。", encoding="utf-8")
+            internal_result = ingest_file(internal, paths, Classification.INTERNAL)
+            restricted_result = ingest_file(
+                restricted, paths, Classification.RESTRICTED
+            )
+            database = Database(paths.database)
+            request_revision_review(
+                database, internal_result.revision_id, actor="author-01"
+            )
+            reject_revision(
+                database,
+                internal_result.revision_id,
+                actor="reviewer-01",
+                note="请补充适用范围和生效日期。",
+            )
+            request_revision_review(
+                database, restricted_result.revision_id, actor="author-02"
+            )
+            reject_revision(
+                database,
+                restricted_result.revision_id,
+                actor="reviewer-02",
+                note="绝密修改建议不得在 Web 暴露。",
+            )
+            service = WorkbenchReadService(database, paths)
+
+            first_page = service.rejected_revision_history(limit=1, offset=0)
+            second_page = service.rejected_revision_history(limit=1, offset=1)
+            internal_history = service.rejected_revision_history(
+                query="内部驳回页面"
+            )
+            restricted_by_name = service.rejected_revision_history(
+                query="绝密驳回页面"
+            )
+            restricted_history = service.rejected_revision_history(
+                classification="restricted"
+            )
+
+            self.assertEqual(first_page["total"], 2)
+            self.assertTrue(first_page["has_next"])
+            self.assertTrue(second_page["has_previous"])
+            self.assertEqual(internal_history["total"], 1)
+            self.assertEqual(
+                internal_history["items"][0]["review_note"],
+                "请补充适用范围和生效日期。",
+            )
+            self.assertEqual(
+                internal_history["items"][0]["rejected_by"], "reviewer-01"
+            )
+            self.assertTrue(internal_history["items"][0]["source_is_current"])
+            self.assertEqual(restricted_by_name["total"], 0)
+            self.assertEqual(
+                restricted_history["items"][0]["page_title"], "[受限知识页]"
+            )
+            self.assertIsNone(restricted_history["items"][0]["review_note"])
+
+            internal.write_text("新版本内部知识。", encoding="utf-8")
+            ingest_file(internal, paths, Classification.INTERNAL)
+            stale_history = service.rejected_revision_history(query="内部驳回页面")
+            self.assertFalse(stale_history["items"][0]["source_is_current"])
+
+            application = WorkbenchWebApplication(
+                service,
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+            response = application.handle(
+                "GET",
+                "/api/v1/wiki-revisions/history?limit=1&offset=0&classification=restricted",
+            )
+            payload = json.loads(response.body.decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            serialized = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("绝密驳回页面", serialized)
+            self.assertNotIn("绝密修改建议", serialized)
+            self.assertNotIn("details_json", serialized)
+            self.assertNotIn("markdown_path", serialized)
 
     def test_wiki_revision_detail_and_submit_review_are_controlled(self):
         with tempfile.TemporaryDirectory() as temporary:

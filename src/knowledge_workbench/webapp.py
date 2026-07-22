@@ -115,6 +115,16 @@ class WorkbenchWebApplication:
                         limit=_integer_query(query, "limit", 20)
                     ),
                 )
+            if parsed.path == "/api/v1/wiki-revisions/history":
+                return self._json(
+                    200,
+                    self.read_service.rejected_revision_history(
+                        limit=_integer_query(query, "limit", 5),
+                        offset=_integer_query(query, "offset", 0),
+                        classification=_string_query(query, "classification"),
+                        query=_string_query(query, "q"),
+                    ),
+                )
             if parsed.path == "/api/v1/evaluations":
                 return self._json(
                     200,

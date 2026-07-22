@@ -85,17 +85,7 @@
         <form id="review-filters" class="review-toolbar" role="search">
           <label>
             <span>搜索</span>
-            <input id="review-query" type="search" maxlength="120" placeholder="资料名、证据 ID 或冲突类型">
-          </label>
-          <label>
-            <span>状态</span>
-            <select id="review-status">
-              <option value="">全部待处理状态</option>
-              <option value="draft">草稿</option>
-              <option value="reviewing">审核中</option>
-              <option value="conflicted">有冲突</option>
-              <option value="pending">待处理</option>
-            </select>
+            <input id="review-query" type="search" maxlength="120" placeholder="资料名、Wiki 标题、证据 ID 或冲突类型">
           </label>
           <label>
             <span>密级</span>
@@ -107,12 +97,48 @@
               <option value="restricted">restricted</option>
             </select>
           </label>
+          <fieldset class="review-status-filters">
+            <legend>各队列状态</legend>
+            <label>
+              <span>证据</span>
+              <select id="evidence-review-status">
+                <option value="">全部</option>
+                <option value="draft">草稿</option>
+                <option value="reviewing">审核中</option>
+                <option value="conflicted">有冲突</option>
+              </select>
+            </label>
+            <label>
+              <span>冲突</span>
+              <select id="conflict-review-status">
+                <option value="">全部</option>
+                <option value="pending">待处理</option>
+                <option value="reviewing">审核中</option>
+              </select>
+            </label>
+            <label>
+              <span>Wiki</span>
+              <select id="wiki-review-status">
+                <option value="">全部</option>
+                <option value="draft">草稿</option>
+                <option value="reviewing">审核中</option>
+              </select>
+            </label>
+          </fieldset>
           <div class="review-toolbar-actions">
             <button class="primary-filter" type="submit">查询</button>
             <button id="clear-review-filters" type="button">清除</button>
           </div>
         </form>
         <div id="review-columns" class="review-grid"></div>
+        <div class="rejected-history-heading">
+          <div>
+            <h3>已驳回 Wiki 修订</h3>
+            <p>只读终态历史，不占用审核队列，也不能重新流转</p>
+          </div>
+          <span id="rejected-history-count" class="count-pill">—</span>
+        </div>
+        <div id="rejected-history" class="rejected-history panel"></div>
       </section>
 
       <section id="quality" aria-labelledby="quality-title">
