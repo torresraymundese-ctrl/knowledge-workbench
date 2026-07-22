@@ -33,6 +33,12 @@
 
 评测报告从 `schema_version: 1.1` 起会为重复内容输出匿名诊断：重复文本只保存 SHA-256 短指纹，不把原文复制进诊断字段；同时记录重复组数量、最大组大小、同一定位重复次数和不同定位原文重复次数。`duplicate_rate` 及数据集中的 `max_duplicate_rate` 仍是质量门槛，诊断信息不会自动放宽阈值。`failure_reasons` 会明确列出用例未通过的原因。
 
+真实资料确认存在合理的重复条款时，策略负责人可以审计式调整单个用例阈值。命令要求记录操作者和原因，已批准会话也会保留变更审计；之后必须导出新的评测集文件，不覆盖旧版本：
+
+```powershell
+.\.venv\Scripts\knowledge.exe --workspace workspace label set-duplicate-threshold $SessionId nas-pilot-007 0.10 --actor policy-owner-01 --reason "真实招标资料存在经确认的重复条款"
+```
+
 工作区产物一致性基线使用：
 
 ```powershell

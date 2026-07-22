@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -109,6 +110,66 @@ def create_labeling_session(
             },
         )
     return session_id
+
+
+def set_case_duplicate_threshold(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    value: float,
+    *,
+    actor: str,
+    reason: str,
+) -> dict:
+    actor = _required_actor(actor)
+    reason = reason.strip()
+    if not reason:
+        raise KnowledgeWorkbenchError("调整重复率阈值必须填写原因")
+    if not math.isfinite(value) or value < 0 or value > 1:
+        raise KnowledgeWorkbenchError("重复率阈值必须是 0 到 1 之间的有限数值")
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        case = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? AND case_id = ?",
+            (session_id, case_id),
+        ).fetchone()
+        if not case:
+            raise KnowledgeWorkbenchError(f"标注用例不存在：{case_id}")
+        previous = float(case["max_duplicate_rate"])
+        changed = previous != value
+        if changed:
+            connection.execute(
+                "UPDATE labeling_cases SET max_duplicate_rate = ? WHERE id = ?",
+                (value, case["id"]),
+            )
+            connection.execute(
+                "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+                (now, session_id),
+            )
+            record_event(
+                connection,
+                "labeling_duplicate_threshold_changed",
+                "labeling_case",
+                case["id"],
+                actor=actor,
+                details={
+                    "session_id": session_id,
+                    "case_id": case_id,
+                    "session_status": session["status"],
+                    "previous_max_duplicate_rate": previous,
+                    "max_duplicate_rate": value,
+                    "reason": reason,
+                },
+            )
+    return {
+        "session_id": session_id,
+        "case_id": case_id,
+        "session_status": session["status"],
+        "previous_max_duplicate_rate": previous,
+        "max_duplicate_rate": value,
+        "changed": changed,
+    }
 
 
 def select_expected_evidence(
@@ -1184,7 +1245,7 @@ def labeling_session_summary(database: Database, session_id: str) -> dict:
         session = _get_session(connection, session_id)
         cases = connection.execute(
             """
-            SELECT lc.case_id, lc.classification,
+            SELECT lc.case_id, lc.classification, lc.max_duplicate_rate,
                    COUNT(DISTINCT lee.evidence_id) AS selected_evidence_count,
                    GROUP_CONCAT(DISTINCT lee.evidence_id) AS selected_evidence_ids,
                    COUNT(DISTINCT lfs.id) AS forbidden_count,

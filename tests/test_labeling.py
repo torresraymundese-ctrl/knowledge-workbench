@@ -24,6 +24,7 @@ from knowledge_workbench.labeling import (
     select_expected_evidence,
     select_expected_evidence_batch,
     select_expected_evidence_by_ordinals,
+    set_case_duplicate_threshold,
     submit_labeling_session,
 )
 from knowledge_workbench.linting import lint_workspace
@@ -31,6 +32,76 @@ from knowledge_workbench.models import Classification
 
 
 class LabelingWorkflowTests(unittest.TestCase):
+    def test_duplicate_threshold_change_is_validated_audited_and_exported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("可验证证据。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            with database.connect() as connection:
+                evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE document_version_id = ?",
+                    (result.version_id,),
+                ).fetchone()[0]
+            select_expected_evidence(
+                database, session_id, "case-1", evidence_id, actor="alice"
+            )
+            submit_labeling_session(database, session_id, actor="alice")
+            review_labeling_case(
+                database, session_id, "case-1", "approved", actor="bob"
+            )
+            approve_labeling_session(database, session_id, actor="bob")
+
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "必须填写原因"):
+                set_case_duplicate_threshold(
+                    database,
+                    session_id,
+                    "case-1",
+                    0.1,
+                    actor="policy-owner-01",
+                    reason=" ",
+                )
+            changed = set_case_duplicate_threshold(
+                database,
+                session_id,
+                "case-1",
+                0.1,
+                actor="policy-owner-01",
+                reason="真实资料存在经确认的重复条款",
+            )
+            self.assertTrue(changed["changed"])
+            self.assertEqual(changed["session_status"], "approved")
+            summary = labeling_session_summary(database, session_id)
+            self.assertEqual(summary["cases"][0]["max_duplicate_rate"], 0.1)
+            with database.connect() as connection:
+                audit = connection.execute(
+                    """
+                    SELECT actor, details_json FROM audit_log
+                    WHERE event_type = 'labeling_duplicate_threshold_changed'
+                    """
+                ).fetchone()
+            self.assertEqual(audit["actor"], "policy-owner-01")
+            self.assertEqual(json.loads(audit["details_json"])["reason"], "真实资料存在经确认的重复条款")
+
+            exported = paths.evaluations / "adjusted.json"
+            export_labeling_dataset(
+                database,
+                paths,
+                session_id,
+                exported,
+                actor="policy-owner-01",
+            )
+            dataset = json.loads(exported.read_text(encoding="utf-8"))
+            self.assertEqual(dataset["cases"][0]["max_duplicate_rate"], 0.1)
+
     def test_readiness_reports_all_missing_cases_and_stale_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

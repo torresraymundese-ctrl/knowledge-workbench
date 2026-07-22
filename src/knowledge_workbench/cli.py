@@ -40,6 +40,7 @@ from .labeling import (
     remove_forbidden_substring,
     select_expected_evidence_batch,
     select_expected_evidence_by_ordinals,
+    set_case_duplicate_threshold,
     submit_labeling_session,
 )
 from .models import (
@@ -352,6 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
     label_candidates.add_argument(
         "--full", action="store_true", help="显示完整原文；restricted密级始终隐藏"
     )
+    label_set_duplicate_threshold = label_sub.add_parser(
+        "set-duplicate-threshold", help="审计式调整单个评测用例的最大重复率"
+    )
+    label_set_duplicate_threshold.add_argument("session_id")
+    label_set_duplicate_threshold.add_argument("case_id")
+    label_set_duplicate_threshold.add_argument("value", type=float)
+    label_set_duplicate_threshold.add_argument("--actor", required=True)
+    label_set_duplicate_threshold.add_argument("--reason", required=True)
     label_export = label_sub.add_parser("export", help="导出已批准评测集")
     label_export.add_argument("session_id")
     label_export.add_argument("output", type=Path)
@@ -1293,6 +1302,16 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             actor=args.actor,
         )
         print(f"正式评测集已导出：{output}")
+    elif command == "set-duplicate-threshold":
+        result = set_case_duplicate_threshold(
+            database,
+            args.session_id,
+            args.case_id,
+            args.value,
+            actor=args.actor,
+            reason=args.reason,
+        )
+        _print_mapping(result)
     elif command == "review-pack":
         output = export_labeling_review_pack(
             database,
