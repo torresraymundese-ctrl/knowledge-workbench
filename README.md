@@ -54,6 +54,11 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe pipeline .\samples\example.md --mode faithful
 .\.venv\Scripts\knowledge.exe task list
 .\.venv\Scripts\knowledge.exe conflict list --status pending
+.\.venv\Scripts\knowledge.exe conflict candidate-pack --actor pack-builder
+# 在 workspace/evaluations 中填写每个候选的 label，且暂不填写 review
+.\.venv\Scripts\knowledge.exe conflict submit-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor annotator-01
+# 由另一人填写 review 后固化；标注人与复核人必须不同
+.\.venv\Scripts\knowledge.exe conflict finalize-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json .\workspace\evaluations\cross-document-conflict-v1.json --name "真实跨文档冲突基线" --reviewer reviewer-01
 .\.venv\Scripts\knowledge.exe conflict-evaluate .\evaluation\conflict-sample.json
 .\.venv\Scripts\knowledge.exe citation-evaluate .\evaluation\citation-support-sample.json
 .\.venv\Scripts\knowledge.exe lint --output .\workspace\evaluations\workspace-lint.json
@@ -92,6 +97,8 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 重处理会改变当前证据集合；已有向量索引会被识别为过期，必须重新运行 `index build` 后才能继续语义检索。全文检索不受影响。
 
 SQLite Schema v8 支持一条证据正文对应多个来源定位。`faithful-schema-v2-multilocator` 只合并同一文件版本、同一处理运行内逐字相同的正文；跨文档、跨版本或仅大小写/空白近似的内容不会合并。首定位继续保存在兼容字段 `evidence.locator_json`，全部有序定位保存在 `evidence_locations`，并同步写入分析 JSON、JSONL 镜像、Wiki 草稿、标注候选和 Web 详情。历史证据 ID、审核状态和引用不会由迁移改写；需要使用新策略时显式运行 `ingest --reprocess`，旧处理运行仍完整保留。
+
+跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
 
 旧版 `.doc` 转换完全在本机完成：Word 以隐藏、只读、禁用宏的方式打开源文件，在临时目录生成 DOCX，解析完成后删除临时文件。原始 `.doc` 的 SHA-256 和只读副本仍是来源真相；每条证据额外保存转换工具、工具版本和临时 DOCX 的 SHA-256。该开关只授权单次命令，不会改变全局默认策略。
 

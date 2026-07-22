@@ -141,6 +141,29 @@ def validate_conflict_evaluation_dataset(payload: dict) -> None:
             )
 
 
+def validate_conflict_candidate_pack(payload: dict) -> None:
+    _validate(payload, "conflict-candidate-pack-v1.json")
+    candidate_ids = [item["candidate_id"] for item in payload["candidates"]]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise KnowledgeWorkbenchError("跨文档冲突候选包包含重复 candidate_id")
+    for candidate in payload["candidates"]:
+        if candidate["left"]["document_id"] == candidate["right"]["document_id"]:
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate['candidate_id']} 不是跨文档证据对"
+            )
+        predicted_conflict = candidate["predicted_conflict"]
+        predicted_type = candidate["predicted_type"]
+        if predicted_conflict != (predicted_type is not None):
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate['candidate_id']} 的预测结果与类型不一致"
+            )
+        review = candidate["review"]
+        if review["decision"] == "rejected" and not (review["note"] or "").strip():
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate['candidate_id']} 复核驳回时必须填写原因"
+            )
+
+
 def validate_citation_evaluation_dataset(payload: dict) -> None:
     _validate(payload, "citation-evaluation-v1.json")
     case_ids = [case["case_id"] for case in payload["cases"]]

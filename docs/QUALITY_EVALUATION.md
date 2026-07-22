@@ -109,6 +109,21 @@ if ($Ordinals.Count -lt 3) { throw "请先核对原文并填写至少3个候选�
 
 报告默认写入 `workspace/evaluations/`。任一用例不通过时命令返回失败状态，适合后续加入 CI；调试数据集时可增加 `--allow-failures` 只生成报告。
 
+### 跨文档真实候选标注
+
+系统可以从当前文件版本和当前处理运行召回跨文档相似证据对，但候选不等于真实冲突，也不会进入业务冲突队列：
+
+```powershell
+.\.venv\Scripts\knowledge.exe conflict candidate-pack --actor pack-builder --limit 500
+# 标注人填写每项 label.expected_conflict、label.expected_type 和说明；review 保持为空
+.\.venv\Scripts\knowledge.exe conflict submit-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor annotator-01
+# 另一位复核人逐项填写 review.decision=approved 或 rejected；驳回必须填写原因
+.\.venv\Scripts\knowledge.exe conflict finalize-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json .\workspace\evaluations\cross-document-conflict-v1.json --name "真实跨文档冲突基线" --reviewer reviewer-01
+.\.venv\Scripts\knowledge.exe conflict-evaluate .\workspace\evaluations\cross-document-conflict-v1.json
+```
+
+候选生成排除 `restricted` 以及已弃用、归档证据，只输出证据 ID、文档安全元数据、原文和定位到当前 `workspace/evaluations/`，不允许覆盖文件。`submit-pack` 要求标签完整且复核字段为空，并将标签摘要和标注人写入审计；此后改动标签会使摘要失配。提交与固化都会重查候选仍属于数据库当前文件版本和当前处理运行，原文、密级、文档元数据及全部定位必须一致。`finalize-pack` 还要求所有复核决定通过、复核人与已审计标注人不同、候选来源身份未变化且候选包未被 `--limit` 截断。固化后的数据集沿用现有冲突评测 Schema，报告仍不复制原文。
+
 ## 当前指标
 
 - 必要证据覆盖率：黄金证据片段中成功找到的比例。

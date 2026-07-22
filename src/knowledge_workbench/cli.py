@@ -53,6 +53,11 @@ from .models import (
     TaskStatus,
 )
 from .conflicts import transition_conflict
+from .conflict_candidates import (
+    create_cross_document_candidate_pack,
+    finalize_cross_document_candidate_pack,
+    submit_cross_document_candidate_annotations,
+)
 from .conflict_evaluation import evaluate_conflict_dataset
 from .citation_evaluation import evaluate_citation_dataset
 from .model_pipeline import analyze_with_model, generate_wiki_with_model
@@ -280,6 +285,25 @@ def build_parser() -> argparse.ArgumentParser:
     conflict_set.add_argument("status", choices=[value.value for value in ConflictStatus])
     conflict_set.add_argument("--actor", required=True)
     conflict_set.add_argument("--note")
+    conflict_pack = conflict_sub.add_parser(
+        "candidate-pack", help="生成当前证据的跨文档冲突人工标注候选包"
+    )
+    conflict_pack.add_argument("--output", type=Path)
+    conflict_pack.add_argument("--actor", required=True)
+    conflict_pack.add_argument("--limit", type=int, default=200)
+    conflict_pack.add_argument("--minimum-similarity", type=float, default=0.55)
+    conflict_submit = conflict_sub.add_parser(
+        "submit-pack", help="提交候选包中的人工冲突标签并写入审计"
+    )
+    conflict_submit.add_argument("pack", type=Path)
+    conflict_submit.add_argument("--actor", required=True)
+    conflict_finalize = conflict_sub.add_parser(
+        "finalize-pack", help="将已标注且复核通过的候选包固化为评测数据集"
+    )
+    conflict_finalize.add_argument("pack", type=Path)
+    conflict_finalize.add_argument("output", type=Path)
+    conflict_finalize.add_argument("--name", required=True)
+    conflict_finalize.add_argument("--reviewer", required=True)
 
     conflict_evaluate = subparsers.add_parser(
         "conflict-evaluate", help="评测冲突检测精确率、召回率和类型准确率"
@@ -497,7 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "task":
             _handle_task(database, args)
         elif args.command == "conflict":
-            _handle_conflict(database, args)
+            _handle_conflict(database, paths, args)
         elif args.command == "conflict-evaluate":
             _handle_conflict_evaluate(paths, args)
         elif args.command == "citation-evaluate":
@@ -1035,7 +1059,48 @@ def _handle_task(database, args) -> None:
             print(f"  error={row['last_error']}")
 
 
-def _handle_conflict(database, args) -> None:
+def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
+    if args.conflict_command == "candidate-pack":
+        output = args.output
+        if output is None:
+            output = paths.evaluations / (
+                "cross-document-conflict-candidates-"
+                + time.strftime("%Y%m%d-%H%M%S")
+                + ".json"
+            )
+        pack = create_cross_document_candidate_pack(
+            database,
+            paths,
+            output,
+            actor=args.actor,
+            limit=args.limit,
+            minimum_similarity=args.minimum_similarity,
+        )
+        print(f"跨文档冲突候选包：{output.expanduser().resolve()}")
+        _print_mapping(pack["statistics"])
+        return
+    if args.conflict_command == "submit-pack":
+        result = submit_cross_document_candidate_annotations(
+            database,
+            paths,
+            args.pack,
+            actor=args.actor,
+        )
+        print("跨文档冲突标签已提交审计。")
+        _print_mapping(result)
+        return
+    if args.conflict_command == "finalize-pack":
+        dataset = finalize_cross_document_candidate_pack(
+            database,
+            paths,
+            args.pack,
+            args.output,
+            name=args.name,
+            reviewer=args.reviewer,
+        )
+        print(f"跨文档冲突评测数据集：{args.output.expanduser().resolve()}")
+        print(f"case_count: {len(dataset['cases'])}")
+        return
     if args.conflict_command == "set-status":
         transition_conflict(
             database,
