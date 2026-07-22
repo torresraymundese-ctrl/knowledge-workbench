@@ -46,7 +46,7 @@ class ModelPipelineTests(unittest.TestCase):
                 "slug_suggestion": "知识规则",
                 "summary": "证据要求",
                 "conclusions": [{
-                    "text": "正式知识需要原始证据。",
+                    "text": evidence["excerpt"],
                     "evidence_ids": ["E0001"],
                     "confidence": "high",
                     "applicability": None,
@@ -84,6 +84,11 @@ class ModelPipelineTests(unittest.TestCase):
             )
         self.assertEqual(output["pages"][0]["conclusions"][0]["evidence_ids"], ["E0001"])
         self.assertEqual(len(model.calls), 2)
+        generation_prompt = model.calls[1]
+        self.assertIn("逐字完全相同", generation_prompt)
+        self.assertIn("禁止把多条证据综合成新结论", generation_prompt)
+        self.assertIn("禁止推断原文未明确陈述", generation_prompt)
+        self.assertIn("prompt_version=wiki-generation-v2-extractive", generation_prompt)
 
     def test_model_cannot_invent_excerpt(self):
         evidence = {
@@ -117,4 +122,3 @@ class ModelPipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

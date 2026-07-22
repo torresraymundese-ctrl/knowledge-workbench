@@ -66,8 +66,20 @@ def generate_wiki_with_model(
 ) -> dict:
     schema = load_schema("wiki-generation-v1.json")
     prompt = (
-        "根据阶段一分析生成 Wiki 草稿。每条结论和链接必须引用 analysis 中存在的 candidate_id；"
-        "证据不足时放入 human_tasks，不得补写事实。只返回符合 Schema 的 JSON。\n"
+        "根据阶段一分析生成抽取式 Wiki 草稿，执行以下不可放宽的规则：\n"
+        "1. conclusions[].text 必须与某一条所引 evidence excerpt 逐字完全相同，"
+        "包括方向词、数字、限定词和适用范围；不得改写、概括、合并或补充。\n"
+        "2. 每条 conclusion 的 evidence_ids 只能包含那一条逐字匹配的 candidate_id；"
+        "禁止把多条证据综合成新结论。\n"
+        "3. 禁止推断原文未明确陈述的因果、目的、主体、条件、时间、范围、义务、"
+        "许可、禁止、比较或数值关系；不能从标题、上下文或常识补足。\n"
+        "4. 无法用单条 excerpt 逐字表达的内容不得写入 conclusions；如确有整理价值，"
+        "放入 human_tasks，要求人工综合或核验。\n"
+        "5. applicability 默认填写 null；只有原文 excerpt 明确包含适用范围时才可填写，"
+        "且不得扩大原文范围。summary、标题、链接关系也不得陈述原文之外的新事实。\n"
+        "6. 每条结论和链接必须引用 analysis 中存在的 candidate_id；"
+        "只返回符合 Schema 的 JSON，不使用 Markdown。\n"
+        "prompt_version=wiki-generation-v2-extractive\n"
         f"suggested_title={json.dumps(title, ensure_ascii=False)}\n"
         f"schema={json.dumps(schema, ensure_ascii=False)}\n"
         f"analysis={json.dumps(analysis, ensure_ascii=False)}"
@@ -91,4 +103,3 @@ def _json_object(content: str) -> dict:
     if not isinstance(payload, dict):
         raise KnowledgeWorkbenchError("模型返回的 JSON 顶层必须是对象")
     return payload
-
