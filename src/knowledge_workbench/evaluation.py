@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from .database import Database
 from .citation_support import assess_generation_citations
@@ -25,6 +28,13 @@ class CaseMetrics:
     evidence_coverage: float
     traceability_rate: float
     duplicate_rate: float
+    duplicate_excess_count: int
+    duplicate_group_count: int
+    largest_duplicate_group: int
+    exact_location_duplicate_count: int
+    repeated_across_locations_count: int
+    duplicate_groups: tuple[dict[str, Any], ...]
+    failure_reasons: tuple[str, ...]
     forbidden_hits: tuple[str, ...]
     missing_required_evidence: tuple[str, ...]
     conclusion_count: int
@@ -84,12 +94,8 @@ def evaluate_dataset(
             for excerpt in excerpts
             if any(excerpt in unit.text for unit in parsed.units)
         )
-        normalized = [" ".join(excerpt.split()).casefold() for excerpt in excerpts]
-        duplicate_rate = (
-            0.0
-            if not normalized
-            else 1.0 - (len(set(normalized)) / len(normalized))
-        )
+        duplicate_diagnostics = _assess_duplicate_evidence(analysis["evidence"])
+        duplicate_rate = duplicate_diagnostics["duplicate_rate"]
         output_text = json.dumps(
             {"analysis": analysis, "generation": generation},
             ensure_ascii=False,
@@ -100,12 +106,16 @@ def evaluate_dataset(
         )
         coverage = 1.0 if not required else (len(required) - len(missing)) / len(required)
         traceability_rate = 1.0 if not excerpts else traceable / len(excerpts)
-        passed = (
-            coverage == 1.0
-            and traceability_rate == 1.0
-            and duplicate_rate <= case["max_duplicate_rate"]
-            and not forbidden_hits
-        )
+        failure_reasons: list[str] = []
+        if coverage != 1.0:
+            failure_reasons.append("required_evidence_missing")
+        if traceability_rate != 1.0:
+            failure_reasons.append("evidence_not_traceable")
+        if duplicate_rate > case["max_duplicate_rate"]:
+            failure_reasons.append("duplicate_rate_exceeded")
+        if forbidden_hits:
+            failure_reasons.append("forbidden_content_found")
+        passed = not failure_reasons
         results.append(
             CaseMetrics(
                 case_id=case["case_id"],
@@ -115,7 +125,24 @@ def evaluate_dataset(
                 required_evidence_found=len(required) - len(missing),
                 evidence_coverage=round(coverage, 6),
                 traceability_rate=round(traceability_rate, 6),
-                duplicate_rate=round(duplicate_rate, 6),
+                duplicate_rate=duplicate_rate,
+                duplicate_excess_count=duplicate_diagnostics[
+                    "duplicate_excess_count"
+                ],
+                duplicate_group_count=duplicate_diagnostics[
+                    "duplicate_group_count"
+                ],
+                largest_duplicate_group=duplicate_diagnostics[
+                    "largest_duplicate_group"
+                ],
+                exact_location_duplicate_count=duplicate_diagnostics[
+                    "exact_location_duplicate_count"
+                ],
+                repeated_across_locations_count=duplicate_diagnostics[
+                    "repeated_across_locations_count"
+                ],
+                duplicate_groups=duplicate_diagnostics["duplicate_groups"],
+                failure_reasons=tuple(failure_reasons),
                 forbidden_hits=forbidden_hits,
                 missing_required_evidence=tuple(missing),
                 conclusion_count=citation_assessment["conclusion_count"],
@@ -134,7 +161,7 @@ def evaluate_dataset(
     total_found = sum(item.required_evidence_found for item in results)
     total_evidence = sum(item.evidence_count for item in results)
     report = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "dataset_name": dataset["name"],
         "dataset_path": str(dataset_path),
         "evaluated_at": utc_now(),
@@ -150,6 +177,18 @@ def evaluate_dataset(
             "all_evidence_traceable": all(
                 item.traceability_rate == 1.0 for item in results
             ),
+            "duplicate_excess_count": sum(
+                item.duplicate_excess_count for item in results
+            ),
+            "exact_location_duplicate_count": sum(
+                item.exact_location_duplicate_count for item in results
+            ),
+            "repeated_across_locations_count": sum(
+                item.repeated_across_locations_count for item in results
+            ),
+            "cases_exceeding_duplicate_rate": sum(
+                "duplicate_rate_exceeded" in item.failure_reasons for item in results
+            ),
             "conclusion_count": sum(item.conclusion_count for item in results),
             "low_support_conclusion_count": sum(
                 item.low_support_conclusion_count for item in results
@@ -161,6 +200,89 @@ def evaluate_dataset(
         "cases": [asdict(item) for item in results],
     }
     return report
+
+
+def _assess_duplicate_evidence(evidence: list[dict]) -> dict[str, Any]:
+    """Measure repeated content without copying excerpts into the report.
+
+    The legacy duplicate rate remains the quality gate. Diagnostics separate
+    repeated extraction at an identical locator from text that genuinely occurs
+    at several source locations. Only hashes and structural positions are emitted.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in evidence:
+        normalized = " ".join(item["excerpt"].split()).casefold()
+        locator = item.get("locator") or {}
+        grouped[normalized].append(locator)
+
+    duplicate_groups: list[dict[str, Any]] = []
+    duplicate_excess_count = 0
+    exact_location_duplicate_count = 0
+    repeated_across_locations_count = 0
+    largest_duplicate_group = 1 if evidence else 0
+
+    for normalized, locators in grouped.items():
+        occurrence_count = len(locators)
+        if occurrence_count < 2:
+            continue
+        canonical_locators = [
+            json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            for locator in locators
+        ]
+        unique_locator_count = len(set(canonical_locators))
+        group_excess = occurrence_count - 1
+        location_collisions = occurrence_count - unique_locator_count
+        cross_location_repetitions = max(unique_locator_count - 1, 0)
+        duplicate_excess_count += group_excess
+        exact_location_duplicate_count += location_collisions
+        repeated_across_locations_count += cross_location_repetitions
+        largest_duplicate_group = max(largest_duplicate_group, occurrence_count)
+        duplicate_groups.append(
+            {
+                "fingerprint": hashlib.sha256(
+                    normalized.encode("utf-8")
+                ).hexdigest()[:16],
+                "occurrence_count": occurrence_count,
+                "unique_locator_count": unique_locator_count,
+                "exact_location_duplicate_count": location_collisions,
+                "position_samples": tuple(
+                    _safe_position(locator) for locator in locators[:10]
+                ),
+            }
+        )
+
+    duplicate_groups.sort(
+        key=lambda item: (-item["occurrence_count"], item["fingerprint"])
+    )
+    evidence_count = len(evidence)
+    duplicate_rate = (
+        0.0 if evidence_count == 0 else duplicate_excess_count / evidence_count
+    )
+    return {
+        "duplicate_rate": round(duplicate_rate, 6),
+        "duplicate_excess_count": duplicate_excess_count,
+        "duplicate_group_count": len(duplicate_groups),
+        "largest_duplicate_group": largest_duplicate_group,
+        "exact_location_duplicate_count": exact_location_duplicate_count,
+        "repeated_across_locations_count": repeated_across_locations_count,
+        "duplicate_groups": tuple(duplicate_groups[:20]),
+    }
+
+
+def _safe_position(locator: dict[str, Any]) -> dict[str, Any]:
+    safe_keys = (
+        "page",
+        "paragraph",
+        "table",
+        "row",
+        "cell_range",
+        "slide",
+        "line_start",
+        "line_end",
+        "unit",
+        "segment",
+    )
+    return {key: locator[key] for key in safe_keys if key in locator}
 
 
 def build_labeling_candidate_pack(

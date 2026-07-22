@@ -6,7 +6,11 @@ from pathlib import Path
 from knowledge_workbench.errors import KnowledgeWorkbenchError, UnsupportedFormatError
 from knowledge_workbench.config import WorkspacePaths
 from knowledge_workbench.database import Database
-from knowledge_workbench.evaluation import build_labeling_candidate_pack, evaluate_dataset
+from knowledge_workbench.evaluation import (
+    _assess_duplicate_evidence,
+    build_labeling_candidate_pack,
+    evaluate_dataset,
+)
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
 from knowledge_workbench.parsers.legacy_word import ConversionMetadata
@@ -185,7 +189,42 @@ class EvaluationTests(unittest.TestCase):
             report = evaluate_dataset(dataset)
             self.assertEqual(report["aggregate"]["pass_rate"], 1.0)
             self.assertTrue(report["aggregate"]["all_evidence_traceable"])
+            self.assertEqual(report["aggregate"]["duplicate_excess_count"], 0)
+            self.assertEqual(
+                report["aggregate"]["exact_location_duplicate_count"], 0
+            )
+            self.assertEqual(
+                report["aggregate"]["repeated_across_locations_count"], 0
+            )
+            self.assertEqual(
+                report["aggregate"]["cases_exceeding_duplicate_rate"], 0
+            )
             self.assertEqual(report["cases"][0]["duplicate_rate"], 0.0)
+            self.assertEqual(report["cases"][0]["failure_reasons"], ())
+
+    def test_duplicate_diagnostics_separate_locator_collisions_from_source_repetition(self):
+        diagnostics = _assess_duplicate_evidence(
+            [
+                {"excerpt": "同一事实", "locator": {"paragraph": 1}},
+                {"excerpt": " 同一事实 ", "locator": {"paragraph": 1}},
+                {"excerpt": "同一事实", "locator": {"paragraph": 2}},
+                {"excerpt": "另一事实", "locator": {"paragraph": 3}},
+            ]
+        )
+
+        self.assertEqual(diagnostics["duplicate_rate"], 0.5)
+        self.assertEqual(diagnostics["duplicate_excess_count"], 2)
+        self.assertEqual(diagnostics["duplicate_group_count"], 1)
+        self.assertEqual(diagnostics["largest_duplicate_group"], 3)
+        self.assertEqual(diagnostics["exact_location_duplicate_count"], 1)
+        self.assertEqual(diagnostics["repeated_across_locations_count"], 1)
+        group = diagnostics["duplicate_groups"][0]
+        self.assertNotIn("同一事实", json.dumps(group, ensure_ascii=False))
+        self.assertEqual(group["unique_locator_count"], 2)
+        self.assertEqual(
+            group["position_samples"],
+            ({"paragraph": 1}, {"paragraph": 1}, {"paragraph": 2}),
+        )
 
     def test_missing_required_evidence_fails_case_without_hiding_details(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -216,6 +255,10 @@ class EvaluationTests(unittest.TestCase):
             )
             report = evaluate_dataset(dataset)
             self.assertEqual(report["aggregate"]["pass_rate"], 0.0)
+            self.assertEqual(
+                report["cases"][0]["failure_reasons"],
+                ("required_evidence_missing",),
+            )
             self.assertEqual(
                 report["cases"][0]["missing_required_evidence"],
                 ("不存在的必要事实",),
