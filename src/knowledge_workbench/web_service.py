@@ -9,7 +9,11 @@ from .conflicts import transition_conflict
 from .database import Database
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
-from .review import transition_evidence
+from .review import request_revision_review, transition_evidence
+from .utils import sha256_text
+
+
+MAX_WIKI_PREVIEW_CHARACTERS = 50_000
 
 
 class WorkbenchReadService:
@@ -138,7 +142,7 @@ class WorkbenchReadService:
                 JOIN documents d ON d.id = wp.source_document_id
                 JOIN processing_runs pr
                   ON pr.id = wr.processing_run_id AND pr.is_current = 1
-                WHERE wr.status = 'reviewing'
+                WHERE wr.status IN ('draft', 'reviewing')
                   AND d.current_version_id = pr.document_version_id
                 """
             ).fetchone()[0]
@@ -182,7 +186,7 @@ class WorkbenchReadService:
                 JOIN documents d ON d.id = wp.source_document_id
                 JOIN processing_runs pr
                   ON pr.id = wr.processing_run_id AND pr.is_current = 1
-                WHERE wr.status = 'reviewing'
+                WHERE wr.status IN ('draft', 'reviewing')
                   AND d.current_version_id = pr.document_version_id
                 ORDER BY wr.updated_at DESC, wr.id
                 LIMIT ?
@@ -374,7 +378,7 @@ class WorkbenchReadService:
         query: str | None,
     ):
         where = [
-            "wr.status = 'reviewing'",
+            "wr.status IN ('draft', 'reviewing')",
             "d.current_version_id = pr.document_version_id",
         ]
         parameters: list[Any] = []
@@ -445,6 +449,66 @@ class WorkbenchReadService:
             "document_name": row["original_name"],
             "classification": row["classification"],
             "updated_at": row["updated_at"],
+        }
+
+    def revision_detail(self, revision_id: str) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT wr.id, wr.status, wr.revision_number, wr.markdown_path,
+                       wr.content_sha256, wr.generator, wr.created_at, wr.updated_at,
+                       wp.id AS page_id, wp.title, wp.needs_revalidation,
+                       d.classification
+                FROM wiki_revisions wr
+                JOIN wiki_pages wp ON wp.id = wr.page_id
+                JOIN documents d ON d.id = wp.source_document_id
+                JOIN processing_runs pr
+                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
+                WHERE wr.id = ?
+                  AND d.current_version_id = pr.document_version_id
+                """,
+                (revision_id,),
+            ).fetchone()
+            if not row:
+                raise KnowledgeWorkbenchError(f"当前 Wiki 修订不存在：{revision_id}")
+            if row["classification"] == "restricted":
+                raise PermissionError("restricted Wiki 修订不能通过 Web 查看内容")
+            evidence_rows = connection.execute(
+                """
+                SELECT e.status, COUNT(*) AS count
+                FROM revision_evidence re
+                JOIN evidence e ON e.id = re.evidence_id
+                WHERE re.revision_id = ?
+                GROUP BY e.status
+                """,
+                (revision_id,),
+            ).fetchall()
+        content = _read_revision_content(
+            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
+        )
+        preview = content[:MAX_WIKI_PREVIEW_CHARACTERS]
+        evidence_by_status = {
+            evidence_row["status"]: evidence_row["count"]
+            for evidence_row in evidence_rows
+        }
+        return {
+            "revision_id": row["id"],
+            "page_id": row["page_id"],
+            "page_title": row["title"],
+            "status": row["status"],
+            "revision_number": row["revision_number"],
+            "classification": row["classification"],
+            "generator": row["generator"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "needs_revalidation": bool(row["needs_revalidation"]),
+            "evidence_count": sum(evidence_by_status.values()),
+            "evidence_by_status": evidence_by_status,
+            "content_preview": preview,
+            "content_length": len(content),
+            "content_truncated": len(preview) < len(content),
+            "content_integrity": "verified",
+            "can_submit_review": row["status"] == "draft",
         }
 
     def evaluations(self, *, limit: int = 10) -> list[dict[str, Any]]:
@@ -548,8 +612,9 @@ class WorkbenchActionService:
         }
     )
 
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, paths: WorkspacePaths | None = None):
         self.database = database
+        self.paths = paths or WorkspacePaths(database.path.parent)
 
     def transition_evidence(
         self, evidence_id: str, target: str, *, actor: str
@@ -607,6 +672,39 @@ class WorkbenchActionService:
             "entity_type": "conflict",
             "entity_id": conflict_id,
             "status": target_status.value,
+            "actor": actor,
+        }
+
+    def submit_revision_review(
+        self, revision_id: str, *, actor: str
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT wr.markdown_path, wr.content_sha256, d.classification
+                FROM wiki_revisions wr
+                JOIN wiki_pages wp ON wp.id = wr.page_id
+                JOIN documents d ON d.id = wp.source_document_id
+                JOIN processing_runs pr
+                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
+                WHERE wr.id = ?
+                  AND d.current_version_id = pr.document_version_id
+                """,
+                (revision_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(f"当前 Wiki 修订不存在：{revision_id}")
+        if row["classification"] == "restricted":
+            raise PermissionError("restricted Wiki 修订只能通过 CLI 提交复核")
+        _read_revision_content(
+            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
+        )
+        request_revision_review(self.database, revision_id, actor=actor)
+        return {
+            "entity_type": "wiki_revision",
+            "entity_id": revision_id,
+            "status": "reviewing",
             "actor": actor,
         }
 
@@ -681,6 +779,28 @@ def _review_query(value: str | None) -> str | None:
     if len(query) > 120:
         raise ValueError("q 不能超过 120 个字符")
     return query
+
+
+def _read_revision_content(
+    paths: WorkspacePaths, relative_path: str, *, expected_sha256: str
+) -> str:
+    root = paths.root.resolve()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise KnowledgeWorkbenchError("Wiki 修订文件位置无效") from exc
+    if not candidate.is_file():
+        raise KnowledgeWorkbenchError("Wiki 修订文件不存在")
+    try:
+        content = candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise KnowledgeWorkbenchError("Wiki 修订文件无法安全读取") from exc
+    if sha256_text(content) != expected_sha256:
+        raise KnowledgeWorkbenchError(
+            "Wiki 修订文件已被外部修改，请先通过受控流程同步后再提交复核"
+        )
+    return content
 
 
 def _required_actor(value: str) -> str:

@@ -183,8 +183,12 @@ class WorkbenchWebTests(unittest.TestCase):
                     LIMIT 1
                     """
                 ).fetchone()[0]
-            request_revision_review(database, revision_id, actor="reviewer-01")
             service = WorkbenchReadService(database, paths)
+            draft_revisions = service.review_queue_page(
+                kind="wiki_revisions", query="审核策略", status="draft"
+            )
+            self.assertEqual(draft_revisions["total"], 1)
+            request_revision_review(database, revision_id, actor="reviewer-01")
 
             revisions = service.review_queue_page(
                 kind="wiki_revisions", query="审核策略", status="reviewing"
@@ -203,6 +207,116 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(conflicts["total"], 1)
             self.assertEqual(conflicts["items"][0]["status"], "pending")
             self.assertEqual(conflicts["items"][0]["document_name"], "审核策略.md")
+
+    def test_wiki_revision_detail_and_submit_review_are_controlled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "内部知识.md"
+            restricted = root / "受限知识.md"
+            internal.write_text("可进入复核的知识证据。", encoding="utf-8")
+            restricted.write_text("不可通过 Web 复核。", encoding="utf-8")
+            internal_result = ingest_file(internal, paths, Classification.INTERNAL)
+            restricted_result = ingest_file(
+                restricted, paths, Classification.RESTRICTED
+            )
+            database = Database(paths.database)
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+
+            detail = application.handle(
+                "GET", f"/api/v1/wiki-revisions/{internal_result.revision_id}"
+            )
+            detail_payload = json.loads(detail.body.decode("utf-8"))
+            self.assertEqual(detail.status, 200)
+            self.assertEqual(detail_payload["status"], "draft")
+            self.assertTrue(detail_payload["can_submit_review"])
+            self.assertEqual(detail_payload["content_integrity"], "verified")
+            self.assertEqual(detail_payload["evidence_count"], 1)
+            self.assertIn("可进入复核的知识证据", detail_payload["content_preview"])
+            serialized = json.dumps(detail_payload, ensure_ascii=False)
+            self.assertNotIn("markdown_path", serialized)
+            self.assertNotIn("source_path", serialized)
+
+            restricted_detail = application.handle(
+                "GET", f"/api/v1/wiki-revisions/{restricted_result.revision_id}"
+            )
+            self.assertEqual(restricted_detail.status, 403)
+
+            route = (
+                f"/api/v1/wiki-revisions/{internal_result.revision_id}/submit-review"
+            )
+            headers = {
+                "Content-Type": "application/json",
+                "X-Workbench-CSRF": "csrf",
+            }
+            missing_csrf = application.handle(
+                "POST",
+                route,
+                body=json.dumps({"actor": "reviewer-01"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(missing_csrf.status, 403)
+            with database.connect() as connection:
+                markdown_path = connection.execute(
+                    "SELECT markdown_path FROM wiki_revisions WHERE id = ?",
+                    (internal_result.revision_id,),
+                ).fetchone()[0]
+            revision_path = paths.root / markdown_path
+            original_content = revision_path.read_text(encoding="utf-8")
+            revision_path.write_text(
+                original_content + "\n未同步编辑。\n", encoding="utf-8"
+            )
+            hash_mismatch = application.handle(
+                "POST",
+                route,
+                body=json.dumps({"actor": "reviewer-01"}).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(hash_mismatch.status, 409)
+            revision_path.write_text(original_content, encoding="utf-8", newline="\n")
+
+            missing_actor = application.handle(
+                "POST",
+                route,
+                body=json.dumps({"actor": ""}).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(missing_actor.status, 400)
+            submitted = application.handle(
+                "POST",
+                route,
+                body=json.dumps({"actor": "reviewer-01"}).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(submitted.status, 200)
+            with database.connect() as connection:
+                revision = connection.execute(
+                    "SELECT status FROM wiki_revisions WHERE id = ?",
+                    (internal_result.revision_id,),
+                ).fetchone()[0]
+                audit = connection.execute(
+                    """
+                    SELECT actor FROM audit_log
+                    WHERE event_type = 'wiki_revision_submitted'
+                      AND entity_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (internal_result.revision_id,),
+                ).fetchone()
+            self.assertEqual(revision, "reviewing")
+            self.assertEqual(audit["actor"], "reviewer-01")
+
+            restricted_submit = application.handle(
+                "POST",
+                f"/api/v1/wiki-revisions/{restricted_result.revision_id}/submit-review",
+                body=json.dumps({"actor": "reviewer-01"}).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(restricted_submit.status, 403)
 
     def test_evaluation_projection_exposes_metrics_without_local_paths(self):
         with tempfile.TemporaryDirectory() as temporary:

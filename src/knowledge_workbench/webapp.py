@@ -79,6 +79,7 @@ class WorkbenchWebApplication:
                     "write_capabilities": [
                         "evidence-transition",
                         "conflict-transition",
+                        "wiki-revision-submit-review",
                     ],
                 }
                 return self._json(200, payload)
@@ -133,6 +134,13 @@ class WorkbenchWebApplication:
                 return self._json(
                     200, self.read_service.evidence_detail(evidence_id)
                 )
+            revision_id = _route_entity_id(
+                parsed.path, entity="wiki-revisions", action="detail"
+            )
+            if revision_id is not None:
+                return self._json(
+                    200, self.read_service.revision_detail(revision_id)
+                )
         except PermissionError as exc:
             return self._json(403, {"error": str(exc)})
         except KnowledgeWorkbenchError as exc:
@@ -150,7 +158,10 @@ class WorkbenchWebApplication:
         conflict_id = _route_entity_id(
             path, entity="conflicts", action="transition"
         )
-        if evidence_id is None and conflict_id is None:
+        revision_id = _route_entity_id(
+            path, entity="wiki-revisions", action="submit-review"
+        )
+        if evidence_id is None and conflict_id is None and revision_id is None:
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
         content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
@@ -173,7 +184,7 @@ class WorkbenchWebApplication:
                 result = self.action_service.transition_evidence(
                     evidence_id, target, actor=actor
                 )
-            else:
+            elif conflict_id is not None:
                 result = self.action_service.transition_conflict(
                     conflict_id or "",
                     target,
@@ -183,6 +194,10 @@ class WorkbenchWebApplication:
                         if payload.get("note") is None
                         else str(payload.get("note"))
                     ),
+                )
+            else:
+                result = self.action_service.submit_revision_review(
+                    revision_id or "", actor=actor
                 )
             return self._json(200, {"ok": True, "result": result})
         except (UnicodeError, json.JSONDecodeError):
@@ -292,7 +307,7 @@ def build_web_server(
     if port < 0 or port > 65535:
         raise KnowledgeWorkbenchError("Web 端口必须在 0 到 65535 之间")
     service = WorkbenchReadService(database, paths)
-    actions = WorkbenchActionService(database)
+    actions = WorkbenchActionService(database, paths)
     application = WorkbenchWebApplication(service, actions)
     return WorkbenchHTTPServer((host, port), application)
 

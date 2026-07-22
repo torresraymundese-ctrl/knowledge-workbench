@@ -253,6 +253,54 @@ async function transitionConflict(conflictId, target, label, noteInput) {
   }
 }
 
+async function submitRevisionReview(revisionId) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  if (!window.confirm(`确认提交 Wiki 修订复核？该操作将以 ${actor} 写入审计日志，且提交后不能继续修改草稿链接。`)) return;
+  try {
+    await postTransition(`/api/v1/wiki-revisions/${encodeURIComponent(revisionId)}/submit-review`, { actor });
+    document.querySelector("#revision-dialog").close();
+    await loadDashboard();
+    showBanner(`Wiki 修订已提交复核，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "Wiki 修订提交复核失败");
+  }
+}
+
+async function openRevision(revisionId) {
+  try {
+    const response = await fetch(`/api/v1/wiki-revisions/${encodeURIComponent(revisionId)}`, { headers: { Accept: "application/json" } });
+    const detail = await response.json();
+    if (!response.ok) throw new Error(detail.error || "无法读取 Wiki 修订详情");
+    document.querySelector("#revision-dialog-title").textContent = detail.page_title;
+    document.querySelector("#revision-dialog-meta").textContent = `${detail.classification} · 修订 ${detail.revision_number} · ${statusLabels[detail.status] || detail.status} · ${detail.generator}`;
+    const evidenceSummary = Object.entries(detail.evidence_by_status)
+      .map(([status, count]) => `${statusLabels[status] || status} ${count}`)
+      .join("，");
+    document.querySelector("#revision-dialog-evidence").textContent = `引用证据 ${detail.evidence_count} 条${evidenceSummary ? `（${evidenceSummary}）` : ""}`;
+    document.querySelector("#revision-dialog-content").textContent = detail.content_preview;
+    const notice = document.querySelector("#revision-dialog-notice");
+    if (detail.content_truncated) {
+      notice.textContent = `页面内容共 ${formatNumber(detail.content_length)} 个字符，Web 仅显示前 ${formatNumber(detail.content_preview.length)} 个字符；提交前请在 Obsidian 或 CLI 核对全文。`;
+      notice.hidden = false;
+    } else if (detail.status === "reviewing") {
+      notice.textContent = "该修订正在复核；正式发布尚未在 Web 开放。";
+      notice.hidden = false;
+    } else {
+      notice.hidden = true;
+      notice.textContent = "";
+    }
+    const actions = document.querySelector("#revision-dialog-actions");
+    actions.replaceChildren();
+    if (detail.can_submit_review) {
+      actions.append(button("提交复核", "primary", () => submitRevisionReview(detail.revision_id)));
+    }
+    document.querySelector("#revision-dialog").showModal();
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "无法读取 Wiki 修订详情");
+  }
+}
+
 function renderReviews(queue) {
   const columns = document.querySelector("#review-columns");
   const evidenceColumn = queueColumn("原子证据", queue.evidence, (item) => [item.document_name, `${statusLabels[item.status] || item.status} · #${item.ordinal}`]);
@@ -295,6 +343,17 @@ function renderReviews(queue) {
   });
 
   const wikiColumn = queueColumn("Wiki 修订", queue.wiki_revisions, (item) => [item.page_title, `修订 ${item.revision_number} · ${statusLabels[item.status] || item.status}`]);
+  wikiColumn.querySelectorAll(".queue-item").forEach((card, index) => {
+    const item = queue.wiki_revisions.items[index];
+    if (!item) return;
+    const actions = element("div", "queue-actions");
+    if (item.classification === "restricted") {
+      actions.append(element("small", "", "restricted 修订仅允许 CLI 复核"));
+    } else {
+      actions.append(button("查看修订", "primary", () => openRevision(item.revision_id)));
+    }
+    card.append(actions);
+  });
   columns.replaceChildren(evidenceColumn, conflictColumn, wikiColumn);
 }
 
@@ -407,6 +466,7 @@ document.querySelector("#clear-review-filters").addEventListener("click", async 
   await refreshReviewQueues();
 });
 document.querySelector("#close-evidence-dialog").addEventListener("click", () => document.querySelector("#evidence-dialog").close());
+document.querySelector("#close-revision-dialog").addEventListener("click", () => document.querySelector("#revision-dialog").close());
 document.querySelectorAll(".nav-item").forEach((item) => {
   item.addEventListener("click", () => {
     document.querySelectorAll(".nav-item").forEach((entry) => entry.classList.remove("active"));
