@@ -701,7 +701,7 @@ def export_labeling_annotation_pack(
                         "",
                         f"- [{marker}] 选择此证据",
                         f"- 状态：`{row['status']}`",
-                        f"- 定位：`{_markdown_code(row['locator_json'])}`",
+                        f"- 定位：`{_markdown_code(_evidence_locators_json(connection, row['id']))}`",
                         f"- 解析器：`{row['parser_name']}:{row['parser_version']}`",
                         "",
                         *_blockquote(row["excerpt"]),
@@ -987,7 +987,7 @@ def export_labeling_review_pack(
                         f"### #{row['run_ordinal']} `{row['id']}`",
                         "",
                         f"- 状态：`{row['status']}`",
-                        f"- 定位：`{_markdown_code(row['locator_json'])}`",
+                        f"- 定位：`{_markdown_code(_evidence_locators_json(connection, row['id']))}`",
                         f"- 选择人：`{row['selected_by']}`",
                         "",
                         *_blockquote(row["excerpt"]),
@@ -1327,6 +1327,9 @@ def list_labeling_candidates(
             """,
             (case["id"], case["document_version_id"], limit, offset),
         ).fetchall()
+        locators_by_evidence = {
+            row["id"]: _evidence_locators(connection, row["id"]) for row in rows
+        }
     return {
         "session": {
             "id": session["id"],
@@ -1349,6 +1352,8 @@ def list_labeling_candidates(
             {
                 **dict(row),
                 "locator": json.loads(row["locator_json"]),
+                "locators": locators_by_evidence[row["id"]],
+                "location_count": len(locators_by_evidence[row["id"]]),
             }
             for row in rows
         ],
@@ -1791,6 +1796,25 @@ def _ensure_labeling_output_allowed(
             raise KnowledgeWorkbenchError(
                 f"非公开资料的{output_kind}只能导出到当前 workspace/evaluations 内"
             ) from exc
+
+
+def _evidence_locators(connection, evidence_id: str) -> list[dict]:
+    rows = connection.execute(
+        """
+        SELECT locator_json FROM evidence_locations
+        WHERE evidence_id = ? ORDER BY location_ordinal
+        """,
+        (evidence_id,),
+    ).fetchall()
+    return [json.loads(row["locator_json"]) for row in rows]
+
+
+def _evidence_locators_json(connection, evidence_id: str) -> str:
+    return json.dumps(
+        _evidence_locators(connection, evidence_id),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _markdown_code(value: str) -> str:

@@ -25,13 +25,14 @@ def faithful_analysis(
             "mode": "faithful",
             "provider": "deterministic",
             "model": None,
-            "prompt_version": "faithful-v1",
+            "prompt_version": "faithful-v2-multilocator",
         },
         "evidence": [
             {
                 "candidate_id": f"E{index:04d}",
                 "excerpt": candidate.excerpt,
                 "locator": candidate.locator,
+                "locators": list(candidate.locators),
                 "evidence_type": "other",
                 "entities": [],
                 "concepts": [],
@@ -77,4 +78,3 @@ def faithful_wiki_generation(analysis: dict, *, title: str) -> dict:
     }
     validate_wiki_generation(payload, analysis)
     return payload
-

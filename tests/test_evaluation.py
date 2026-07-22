@@ -226,6 +226,25 @@ class EvaluationTests(unittest.TestCase):
             ({"paragraph": 1}, {"paragraph": 1}, {"paragraph": 2}),
         )
 
+    def test_duplicate_diagnostics_report_merged_source_locations(self):
+        diagnostics = _assess_duplicate_evidence(
+            [
+                {
+                    "excerpt": "同一事实",
+                    "locator": {"paragraph": 1},
+                    "locators": [
+                        {"paragraph": 1},
+                        {"paragraph": 2},
+                        {"paragraph": 3},
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(diagnostics["duplicate_rate"], 0.0)
+        self.assertEqual(diagnostics["multi_location_evidence_count"], 1)
+        self.assertEqual(diagnostics["additional_location_count"], 2)
+
     def test_missing_required_evidence_fails_case_without_hiding_details(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

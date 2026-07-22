@@ -519,16 +519,28 @@ class WorkbenchReadService:
                 """,
                 (evidence_id,),
             ).fetchone()
+            location_rows = connection.execute(
+                """
+                SELECT locator_json FROM evidence_locations
+                WHERE evidence_id = ? ORDER BY location_ordinal
+                """,
+                (evidence_id,),
+            ).fetchall()
         if not row:
             raise KnowledgeWorkbenchError(f"当前原子证据不存在：{evidence_id}")
         if row["classification"] == "restricted":
             raise PermissionError("restricted 证据不能通过 Web 查看原文")
+        locators = [_safe_locator(item["locator_json"]) for item in location_rows]
+        if not locators:
+            locators = [_safe_locator(row["locator_json"])]
         return {
             "evidence_id": row["id"],
             "status": row["status"],
             "ordinal": row["run_ordinal"],
             "excerpt": row["excerpt"],
-            "locator": _safe_locator(row["locator_json"]),
+            "locator": locators[0],
+            "locators": locators,
+            "location_count": len(locators),
             "document_name": row["original_name"],
             "classification": row["classification"],
             "updated_at": row["updated_at"],

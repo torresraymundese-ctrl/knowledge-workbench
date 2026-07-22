@@ -20,7 +20,7 @@ from .utils import new_id, sha256_file, sha256_text, slugify, utc_now
 from .wiki import RenderedEvidence, render_draft, write_text_atomic
 
 
-EXTRACTION_METHOD = "faithful-schema-v1"
+EXTRACTION_METHOD = "faithful-schema-v2-multilocator"
 
 
 def initialize_workspace(paths: WorkspacePaths) -> Database:
@@ -121,14 +121,7 @@ def ingest_file(
         source_sha256=digest,
         classification=analysis_classification,
     )
-    candidates = tuple(
-        EvidenceCandidate(
-            excerpt=item["excerpt"],
-            locator=item["locator"],
-            extraction_method=EXTRACTION_METHOD,
-        )
-        for item in analysis["evidence"]
-    )
+    candidates = _candidates_from_analysis(analysis)
     if not candidates:
         raise KnowledgeWorkbenchError(f"文件 {source.name} 未生成任何原子证据")
 
@@ -255,6 +248,7 @@ def ingest_file(
                     "INSERT INTO evidence_fts(excerpt, evidence_id) VALUES (?, ?)",
                     (candidate.excerpt, evidence_id),
                 )
+                _insert_evidence_locations(connection, evidence_id, candidate)
 
             conflict_ids = detect_version_conflicts(
                 connection,
@@ -323,7 +317,7 @@ def ingest_file(
                 INSERT INTO wiki_revisions(
                     id, page_id, revision_number, status, markdown_path,
                     content_sha256, generator, processing_run_id, created_at, updated_at
-                ) VALUES (?, ?, ?, 'draft', ?, ?, 'faithful-draft-v1', ?, ?, ?)
+                ) VALUES (?, ?, ?, 'draft', ?, ?, 'faithful-draft-v2-multilocator', ?, ?, ?)
                 """,
                 (
                     revision_id,
@@ -351,6 +345,7 @@ def ingest_file(
                         "source_sha256": digest,
                         "excerpt": candidate.excerpt,
                         "locator": candidate.locator,
+                        "locators": list(candidate.locators),
                         "extraction_method": candidate.extraction_method,
                         "status": "draft",
                     },
@@ -515,14 +510,7 @@ def _reprocess_existing(
         source_sha256=digest,
         classification=stored_classification,
     )
-    candidates = tuple(
-        EvidenceCandidate(
-            excerpt=item["excerpt"],
-            locator=item["locator"],
-            extraction_method=EXTRACTION_METHOD,
-        )
-        for item in analysis["evidence"]
-    )
+    candidates = _candidates_from_analysis(analysis)
     if not candidates:
         raise KnowledgeWorkbenchError(f"文件 {source.name} 未生成任何原子证据")
 
@@ -610,6 +598,7 @@ def _reprocess_existing(
                     "INSERT INTO evidence_fts(excerpt, evidence_id) VALUES (?, ?)",
                     (candidate.excerpt, evidence_id),
                 )
+                _insert_evidence_locations(connection, evidence_id, candidate)
 
             page = connection.execute(
                 "SELECT * FROM wiki_pages WHERE source_document_id = ?",
@@ -673,7 +662,7 @@ def _reprocess_existing(
                 INSERT INTO wiki_revisions(
                     id, page_id, revision_number, status, markdown_path,
                     content_sha256, generator, processing_run_id, created_at, updated_at
-                ) VALUES (?, ?, ?, 'draft', ?, ?, 'faithful-draft-v1', ?, ?, ?)
+                ) VALUES (?, ?, ?, 'draft', ?, ?, 'faithful-draft-v2-multilocator', ?, ?, ?)
                 """,
                 (
                     revision_id,
@@ -701,6 +690,7 @@ def _reprocess_existing(
                         "source_sha256": digest,
                         "excerpt": candidate.excerpt,
                         "locator": candidate.locator,
+                        "locators": list(candidate.locators),
                         "extraction_method": candidate.extraction_method,
                         "status": "draft",
                     },
@@ -771,6 +761,39 @@ def _reprocess_existing(
         revision_id=revision_id,
         processing_run_id=processing_run_id,
         reprocessed=True,
+    )
+
+
+def _candidates_from_analysis(analysis: dict) -> tuple[EvidenceCandidate, ...]:
+    return tuple(
+        EvidenceCandidate(
+            excerpt=item["excerpt"],
+            locator=item["locator"],
+            locators=tuple(item.get("locators") or (item["locator"],)),
+            extraction_method=EXTRACTION_METHOD,
+        )
+        for item in analysis["evidence"]
+    )
+
+
+def _insert_evidence_locations(
+    connection,
+    evidence_id: str,
+    candidate: EvidenceCandidate,
+) -> None:
+    connection.executemany(
+        """
+        INSERT INTO evidence_locations(evidence_id, location_ordinal, locator_json)
+        VALUES (?, ?, ?)
+        """,
+        (
+            (
+                evidence_id,
+                ordinal,
+                json.dumps(locator, ensure_ascii=False, sort_keys=True),
+            )
+            for ordinal, locator in enumerate(candidate.locators, start=1)
+        ),
     )
 
 

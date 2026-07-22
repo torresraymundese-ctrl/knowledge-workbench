@@ -89,6 +89,23 @@ class WorkspaceLintTests(unittest.TestCase):
                 excerpt = connection.execute("SELECT excerpt FROM evidence").fetchone()[0]
             self.assertEqual(excerpt, "必须保留原始证据。")
 
+    def test_lint_rejects_missing_evidence_locations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("必须保留全部定位。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            with database.transaction() as connection:
+                connection.execute("DELETE FROM evidence_locations")
+
+            report = lint_workspace(database, paths)
+
+            self.assertFalse(report["passed"])
+            codes = {issue["code"] for issue in report["issues"]}
+            self.assertIn("evidence_location_missing", codes)
+
 
 if __name__ == "__main__":
     unittest.main()

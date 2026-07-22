@@ -89,7 +89,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations"
                     ).fetchall()
                 }
-                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7})
+                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8})
                 run = connection.execute(
                     "SELECT * FROM processing_runs WHERE document_version_id = 'ver_1'"
                 ).fetchone()
@@ -104,6 +104,16 @@ class DatabaseMigrationTests(unittest.TestCase):
                     "SELECT processing_run_id FROM wiki_revisions WHERE id = 'rev_1'"
                 ).fetchone()[0]
                 self.assertEqual(revision_run, run["id"])
+                locations = connection.execute(
+                    """
+                    SELECT location_ordinal, locator_json
+                    FROM evidence_locations WHERE evidence_id = 'ev_1'
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [(row["location_ordinal"], row["locator_json"]) for row in locations],
+                    [(1, "{}")],
+                )
                 labeling_tables = {
                     row[0]
                     for row in connection.execute(
@@ -135,6 +145,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM schema_migrations WHERE version = 7"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 8"
                     ).fetchone()[0],
                     1,
                 )

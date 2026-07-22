@@ -33,6 +33,8 @@ class CaseMetrics:
     largest_duplicate_group: int
     exact_location_duplicate_count: int
     repeated_across_locations_count: int
+    multi_location_evidence_count: int
+    additional_location_count: int
     duplicate_groups: tuple[dict[str, Any], ...]
     failure_reasons: tuple[str, ...]
     forbidden_hits: tuple[str, ...]
@@ -141,6 +143,12 @@ def evaluate_dataset(
                 repeated_across_locations_count=duplicate_diagnostics[
                     "repeated_across_locations_count"
                 ],
+                multi_location_evidence_count=duplicate_diagnostics[
+                    "multi_location_evidence_count"
+                ],
+                additional_location_count=duplicate_diagnostics[
+                    "additional_location_count"
+                ],
                 duplicate_groups=duplicate_diagnostics["duplicate_groups"],
                 failure_reasons=tuple(failure_reasons),
                 forbidden_hits=forbidden_hits,
@@ -186,6 +194,12 @@ def evaluate_dataset(
             "repeated_across_locations_count": sum(
                 item.repeated_across_locations_count for item in results
             ),
+            "multi_location_evidence_count": sum(
+                item.multi_location_evidence_count for item in results
+            ),
+            "additional_location_count": sum(
+                item.additional_location_count for item in results
+            ),
             "cases_exceeding_duplicate_rate": sum(
                 "duplicate_rate_exceeded" in item.failure_reasons for item in results
             ),
@@ -210,10 +224,16 @@ def _assess_duplicate_evidence(evidence: list[dict]) -> dict[str, Any]:
     at several source locations. Only hashes and structural positions are emitted.
     """
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    multi_location_evidence_count = 0
+    additional_location_count = 0
     for item in evidence:
         normalized = " ".join(item["excerpt"].split()).casefold()
         locator = item.get("locator") or {}
         grouped[normalized].append(locator)
+        locators = item.get("locators") or [locator]
+        if len(locators) > 1:
+            multi_location_evidence_count += 1
+            additional_location_count += len(locators) - 1
 
     duplicate_groups: list[dict[str, Any]] = []
     duplicate_excess_count = 0
@@ -265,6 +285,8 @@ def _assess_duplicate_evidence(evidence: list[dict]) -> dict[str, Any]:
         "largest_duplicate_group": largest_duplicate_group,
         "exact_location_duplicate_count": exact_location_duplicate_count,
         "repeated_across_locations_count": repeated_across_locations_count,
+        "multi_location_evidence_count": multi_location_evidence_count,
+        "additional_location_count": additional_location_count,
         "duplicate_groups": tuple(duplicate_groups[:20]),
     }
 
@@ -355,6 +377,7 @@ def build_labeling_candidate_pack(
                             "status": row["status"],
                             "excerpt": row["excerpt"],
                             "locator": json.loads(row["locator_json"]),
+                            "locators": _evidence_locators(connection, row["id"]),
                         }
                         for row in selected
                     ],
@@ -370,6 +393,17 @@ def build_labeling_candidate_pack(
         "candidates_per_case": candidates_per_case,
         "cases": cases,
     }
+
+
+def _evidence_locators(connection, evidence_id: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT locator_json FROM evidence_locations
+        WHERE evidence_id = ? ORDER BY location_ordinal
+        """,
+        (evidence_id,),
+    ).fetchall()
+    return [json.loads(row["locator_json"]) for row in rows]
 
 
 def _evenly_spaced(rows, limit: int):

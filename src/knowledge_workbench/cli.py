@@ -626,6 +626,19 @@ def _handle_evidence(args, database) -> None:
     parameters.append(args.limit)
     with database.connect() as connection:
         rows = connection.execute(query, parameters).fetchall()
+        locators_by_evidence = {
+            row["id"]: [
+                json.loads(item["locator_json"])
+                for item in connection.execute(
+                    """
+                    SELECT locator_json FROM evidence_locations
+                    WHERE evidence_id = ? ORDER BY location_ordinal
+                    """,
+                    (row["id"],),
+                ).fetchall()
+            ]
+            for row in rows
+        }
     if not rows:
         print("暂无原子证据。")
         return
@@ -635,7 +648,14 @@ def _handle_evidence(args, database) -> None:
             excerpt = excerpt[:97] + "..."
         print(f"{row['id']}  [{row['status']}]  {row['original_name']}")
         print(f"  {excerpt}")
-        print(f"  locator={row['locator_json']}")
+        print(
+            "  locators="
+            + json.dumps(
+                locators_by_evidence[row["id"]],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
 
 def _handle_page(args, database, paths: WorkspacePaths) -> None:

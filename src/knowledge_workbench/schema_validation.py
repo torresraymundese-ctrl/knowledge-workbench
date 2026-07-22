@@ -29,6 +29,22 @@ def validate_analysis(payload: dict, source_units: Iterable[ParsedUnit] | None =
                 raise KnowledgeWorkbenchError(
                     f"证据 {item['candidate_id']} 的原文片段无法回到解析结果"
                 )
+    for item in payload["evidence"]:
+        locators = item.get("locators")
+        if locators is None:
+            continue
+        if locators[0] != item["locator"]:
+            raise KnowledgeWorkbenchError(
+                f"证据 {item['candidate_id']} 的 locator 必须等于 locators 首项"
+            )
+        canonical = [
+            json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            for locator in locators
+        ]
+        if len(canonical) != len(set(canonical)):
+            raise KnowledgeWorkbenchError(
+                f"证据 {item['candidate_id']} 包含重复定位"
+            )
 
 
 def validate_wiki_generation(payload: dict, analysis: dict) -> None:

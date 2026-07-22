@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,68 @@ from knowledge_workbench.search import search_evidence
 
 
 class IngestTests(unittest.TestCase):
+    def test_duplicate_excerpt_uses_one_evidence_id_with_multiple_locations(self):
+        from knowledge_workbench.database import Database
+        from knowledge_workbench.web_service import WorkbenchReadService
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "duplicate.md"
+            source.write_text("重复规则。\n\n重复规则。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            with database.connect() as connection:
+                evidence = connection.execute(
+                    "SELECT id, locator_json FROM evidence WHERE processing_run_id = ?",
+                    (result.processing_run_id,),
+                ).fetchall()
+                locations = connection.execute(
+                    """
+                    SELECT location_ordinal, locator_json
+                    FROM evidence_locations WHERE evidence_id = ?
+                    ORDER BY location_ordinal
+                    """,
+                    (evidence[0]["id"],),
+                ).fetchall()
+                citation_count = connection.execute(
+                    "SELECT COUNT(*) FROM revision_evidence WHERE revision_id = ?",
+                    (result.revision_id,),
+                ).fetchone()[0]
+
+            self.assertEqual(result.evidence_count, 1)
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(len(locations), 2)
+            parsed_locations = [json.loads(row["locator_json"]) for row in locations]
+            self.assertEqual([item["line_start"] for item in parsed_locations], [1, 3])
+            self.assertEqual(json.loads(evidence[0]["locator_json"]), parsed_locations[0])
+            self.assertEqual(citation_count, 1)
+
+            analysis = json.loads(
+                (paths.analysis / f"{result.processing_run_id}.analysis.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(analysis["evidence"][0]["locators"], parsed_locations)
+            mirror = json.loads(
+                (paths.evidence / f"{result.processing_run_id}.jsonl").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(mirror["locators"], parsed_locations)
+            draft = next(paths.wiki_drafts.glob("*.md")).read_text(encoding="utf-8")
+            self.assertIn("定位（2 处）", draft)
+
+            detail = WorkbenchReadService(database, paths).evidence_detail(
+                evidence[0]["id"]
+            )
+            self.assertEqual(detail["location_count"], 2)
+            self.assertEqual(
+                [item["line_start"] for item in detail["locators"]], [1, 3]
+            )
+            self.assertTrue(all("heading_path" not in item for item in detail["locators"]))
+
     def test_new_version_marks_verified_page_for_revalidation_without_unpublishing_it(self):
         from knowledge_workbench.database import Database
         from knowledge_workbench.review import publish_revision, request_revision_review

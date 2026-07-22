@@ -86,6 +86,21 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
                 """,
                 (run["id"],),
             ).fetchall()
+            location_rows = connection.execute(
+                """
+                SELECT el.evidence_id, el.location_ordinal, el.locator_json
+                FROM evidence_locations el
+                JOIN evidence e ON e.id = el.evidence_id
+                WHERE e.processing_run_id = ?
+                ORDER BY el.evidence_id, el.location_ordinal
+                """,
+                (run["id"],),
+            ).fetchall()
+            locations_by_evidence: dict[str, list] = {}
+            for location_row in location_rows:
+                locations_by_evidence.setdefault(
+                    location_row["evidence_id"], []
+                ).append(location_row)
             checked_evidence += len(evidence)
             revisions = connection.execute(
                 """
@@ -110,6 +125,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
                 document,
                 run,
                 evidence,
+                locations_by_evidence,
                 revisions[0],
                 issues,
             )
@@ -176,6 +192,7 @@ def _check_run_artifacts(
     document,
     run,
     evidence,
+    locations_by_evidence,
     revision,
     issues: list[LintIssue],
 ) -> None:
@@ -206,13 +223,23 @@ def _check_run_artifacts(
             validate_analysis(analysis)
         except KnowledgeWorkbenchError as exc:
             issues.append(LintIssue("analysis_schema", run_id, str(exc)))
-        _check_analysis_database_consistency(analysis, document, evidence, run_id, issues)
+        _check_analysis_database_consistency(
+            analysis,
+            document,
+            evidence,
+            locations_by_evidence,
+            run_id,
+            issues,
+        )
     if generation is not None and analysis is not None:
         try:
             validate_wiki_generation(generation, analysis)
         except KnowledgeWorkbenchError as exc:
             issues.append(LintIssue("wiki_generation_schema", revision["id"], str(exc)))
-    _check_mirror(mirror_path, run_id, evidence, issues)
+    _check_evidence_locations(evidence, locations_by_evidence, issues)
+    _check_mirror(
+        mirror_path, run_id, evidence, locations_by_evidence, issues
+    )
     markdown_path = (paths.root / revision["markdown_path"]).resolve()
     if not markdown_path.is_file():
         issues.append(LintIssue("wiki_markdown_missing", revision["id"], "Wiki Markdown 不存在"))
@@ -250,6 +277,7 @@ def _check_analysis_database_consistency(
     analysis: dict,
     document,
     evidence,
+    locations_by_evidence,
     run_id: str,
     issues: list[LintIssue],
 ) -> None:
@@ -277,7 +305,13 @@ def _check_analysis_database_consistency(
         except json.JSONDecodeError:
             issues.append(LintIssue("database_locator_invalid_json", row["id"], "定位字段不是有效 JSON"))
             continue
-        if item.get("excerpt") != row["excerpt"] or item.get("locator") != locator:
+        locators = _parsed_locations(row["id"], locations_by_evidence, issues)
+        item_locators = item.get("locators") or [item.get("locator")]
+        if (
+            item.get("excerpt") != row["excerpt"]
+            or item.get("locator") != locator
+            or item_locators != locators
+        ):
             issues.append(
                 LintIssue("analysis_evidence_mismatch", row["id"], "分析证据与数据库原文或定位不一致")
             )
@@ -287,6 +321,7 @@ def _check_mirror(
     path: Path,
     run_id: str,
     evidence,
+    locations_by_evidence,
     issues: list[LintIssue],
 ) -> None:
     try:
@@ -308,5 +343,71 @@ def _check_mirror(
         )
         return
     for item, row in zip(mirror, evidence, strict=True):
-        if item.get("id") != row["id"] or item.get("excerpt") != row["excerpt"]:
+        locators = _parsed_locations(row["id"], locations_by_evidence, issues)
+        item_locators = item.get("locators") or [item.get("locator")]
+        if (
+            item.get("id") != row["id"]
+            or item.get("excerpt") != row["excerpt"]
+            or item_locators != locators
+        ):
             issues.append(LintIssue("evidence_mirror_mismatch", row["id"], "JSONL 与数据库证据不一致"))
+
+
+def _check_evidence_locations(evidence, locations_by_evidence, issues) -> None:
+    for row in evidence:
+        location_rows = locations_by_evidence.get(row["id"], [])
+        if not location_rows:
+            issues.append(
+                LintIssue("evidence_location_missing", row["id"], "证据没有来源定位")
+            )
+            continue
+        expected_ordinals = list(range(1, len(location_rows) + 1))
+        ordinals = [item["location_ordinal"] for item in location_rows]
+        if ordinals != expected_ordinals:
+            issues.append(
+                LintIssue(
+                    "evidence_location_ordinal_gap",
+                    row["id"],
+                    "证据定位序号不连续",
+                )
+            )
+        locators = _parsed_locations(row["id"], locations_by_evidence, issues)
+        try:
+            primary = json.loads(row["locator_json"])
+        except json.JSONDecodeError:
+            continue
+        if locators and locators[0] != primary:
+            issues.append(
+                LintIssue(
+                    "evidence_primary_location_mismatch",
+                    row["id"],
+                    "证据首定位与兼容定位字段不一致",
+                )
+            )
+
+
+def _parsed_locations(evidence_id: str, locations_by_evidence, issues) -> list[dict]:
+    output: list[dict] = []
+    for row in locations_by_evidence.get(evidence_id, []):
+        try:
+            locator = json.loads(row["locator_json"])
+        except json.JSONDecodeError:
+            issues.append(
+                LintIssue(
+                    "evidence_location_invalid_json",
+                    evidence_id,
+                    "证据定位不是有效 JSON",
+                )
+            )
+            continue
+        if not isinstance(locator, dict):
+            issues.append(
+                LintIssue(
+                    "evidence_location_not_object",
+                    evidence_id,
+                    "证据定位必须是 JSON 对象",
+                )
+            )
+            continue
+        output.append(locator)
+    return output

@@ -226,7 +226,9 @@ async function openEvidence(evidenceId) {
     document.querySelector("#evidence-dialog-title").textContent = detail.document_name;
     document.querySelector("#evidence-dialog-meta").textContent = `${detail.classification} · #${detail.ordinal} · ${statusLabels[detail.status] || detail.status}`;
     document.querySelector("#evidence-dialog-excerpt").textContent = detail.excerpt;
-    document.querySelector("#evidence-dialog-locator").textContent = JSON.stringify(detail.locator);
+    document.querySelector("#evidence-dialog-locator").textContent = JSON.stringify(
+      detail.locators || [detail.locator]
+    );
     const actions = document.querySelector("#evidence-dialog-actions");
     actions.replaceChildren();
     const definitions = {

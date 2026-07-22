@@ -35,7 +35,7 @@ def render_draft(
         f"classification: {classification}",
         f"source_version: {json.dumps(document_version_id)}",
         f"source_sha256: {json.dumps(source_sha256)}",
-        'generator: "faithful-draft-v1"',
+        'generator: "faithful-draft-v2-multilocator"',
         f"generated_at: {json.dumps(generated_at)}",
         "---",
         "",
@@ -55,13 +55,18 @@ def render_draft(
         "",
     ]
     for item in evidence:
-        locator = json.dumps(item.candidate.locator, ensure_ascii=False, sort_keys=True)
+        locators = json.dumps(
+            list(item.candidate.locators), ensure_ascii=False, sort_keys=True
+        )
+        locator_label = (
+            "定位" if len(item.candidate.locators) == 1 else f"定位（{len(item.candidate.locators)} 处）"
+        )
         quote = item.candidate.excerpt.replace("\n", "\n> ")
         body.extend(
             [
                 f"### {item.id}",
                 "",
-                f"定位：`{locator}`",
+                f"{locator_label}：`{locators}`",
                 "",
                 f"> {quote}",
                 "",
@@ -86,4 +91,3 @@ def write_text_atomic(path: Path, content: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(content, encoding="utf-8", newline="\n")
     temporary.replace(path)
-

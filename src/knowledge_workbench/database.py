@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 SCHEMA = """
@@ -363,6 +363,23 @@ CREATE INDEX idx_tasks_lease_owner
 """
 
 
+MIGRATION_8 = """
+CREATE TABLE evidence_locations (
+    evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+    location_ordinal INTEGER NOT NULL CHECK (location_ordinal > 0),
+    locator_json TEXT NOT NULL,
+    PRIMARY KEY(evidence_id, location_ordinal),
+    UNIQUE(evidence_id, locator_json)
+);
+
+INSERT INTO evidence_locations(evidence_id, location_ordinal, locator_json)
+SELECT id, 1, locator_json FROM evidence;
+
+CREATE INDEX idx_evidence_locations_evidence
+    ON evidence_locations(evidence_id, location_ordinal);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -439,6 +456,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (7, applied_at),
+                )
+                applied.add(7)
+            if 8 not in applied:
+                connection.executescript(MIGRATION_8)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (8, applied_at),
                 )
 
     @contextmanager

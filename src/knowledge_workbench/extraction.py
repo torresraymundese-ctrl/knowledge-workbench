@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from .models import EvidenceCandidate, ParseResult, ParsedUnit
@@ -28,7 +29,7 @@ class FaithfulEvidenceExtractor:
                         extraction_method=self.name,
                     )
                 )
-        return tuple(candidates)
+        return _merge_duplicate_candidates(candidates)
 
     def _segments(self, unit: ParsedUnit) -> tuple[str, ...]:
         paragraphs = [
@@ -70,3 +71,39 @@ class FaithfulEvidenceExtractor:
             chunks.append(current)
         return chunks
 
+
+def _merge_duplicate_candidates(
+    candidates: list[EvidenceCandidate],
+) -> tuple[EvidenceCandidate, ...]:
+    merged: list[EvidenceCandidate] = []
+    indexes: dict[str, int] = {}
+    locator_keys: list[set[str]] = []
+    for candidate in candidates:
+        # Merge only exactly equal extracted text. A locator may be attached to
+        # an evidence row only when the stored excerpt can be found there verbatim.
+        key = candidate.excerpt
+        existing_index = indexes.get(key)
+        if existing_index is None:
+            indexes[key] = len(merged)
+            merged.append(candidate)
+            locator_keys.append({_locator_key(item) for item in candidate.locators})
+            continue
+        existing = merged[existing_index]
+        unique_locators = list(existing.locators)
+        for locator in candidate.locators:
+            locator_key = _locator_key(locator)
+            if locator_key not in locator_keys[existing_index]:
+                locator_keys[existing_index].add(locator_key)
+                unique_locators.append(locator)
+        merged[existing_index] = EvidenceCandidate(
+            excerpt=existing.excerpt,
+            locator=existing.locator,
+            extraction_method=existing.extraction_method,
+            extraction_model=existing.extraction_model,
+            locators=tuple(unique_locators),
+        )
+    return tuple(merged)
+
+
+def _locator_key(locator: dict) -> str:
+    return json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

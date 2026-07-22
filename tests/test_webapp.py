@@ -670,7 +670,13 @@ class WorkbenchWebTests(unittest.TestCase):
             root = Path(temporary)
             paths = WorkspacePaths(root / "workspace")
             source = root / "超长知识.md"
-            source.write_text("超长内容" * 13_000, encoding="utf-8")
+            source.write_text(
+                "\n\n".join(
+                    f"段落 {index:04d}：" + "超长内容" * 250
+                    for index in range(70)
+                ),
+                encoding="utf-8",
+            )
             result = ingest_file(source, paths, Classification.INTERNAL)
             database = Database(paths.database)
             with database.connect() as connection:

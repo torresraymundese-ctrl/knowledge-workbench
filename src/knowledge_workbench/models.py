@@ -64,6 +64,14 @@ class EvidenceCandidate:
     locator: dict[str, Any]
     extraction_method: str
     extraction_model: str | None = None
+    locators: tuple[dict[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        locators = self.locators or (self.locator,)
+        if locators[0] != self.locator:
+            raise ValueError("locator must equal the first item in locators")
+        object.__setattr__(self, "locators", tuple(dict(item) for item in locators))
+        object.__setattr__(self, "locator", dict(self.locator))
 
 
 @dataclass(frozen=True, slots=True)
