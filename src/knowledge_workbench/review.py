@@ -168,16 +168,31 @@ def publish_revision(
             """,
             (revision_id,),
         ).fetchall()
+        evidence_count = connection.execute(
+            "SELECT COUNT(*) FROM revision_evidence WHERE revision_id = ?",
+            (revision_id,),
+        ).fetchone()[0]
+        if evidence_count == 0:
+            raise InvalidTransitionError("发布前必须至少引用一条证据")
         if unverified:
             preview = ", ".join(f"{row['id']}({row['status']})" for row in unverified[:5])
             raise InvalidTransitionError(
                 f"发布前必须审核全部引用证据；尚有 {len(unverified)} 条：{preview}"
             )
 
-        source_path = paths.root / revision["markdown_path"]
+        root = paths.root.resolve()
+        source_path = (root / revision["markdown_path"]).resolve()
+        try:
+            source_path.relative_to(root)
+        except ValueError as exc:
+            raise KnowledgeWorkbenchError("Wiki 修订文件位置无效") from exc
         if not source_path.is_file():
             raise KnowledgeWorkbenchError(f"修订文件不存在：{source_path}")
         content = source_path.read_text(encoding="utf-8")
+        if sha256_text(content) != revision["content_sha256"]:
+            raise KnowledgeWorkbenchError(
+                "Wiki 修订文件已被外部修改，请先通过受控流程同步后再发布"
+            )
         content = content.replace("status: draft", "status: verified", 1)
         target_path = paths.wiki_verified / source_path.name
         write_text_atomic(target_path, content)

@@ -371,6 +371,263 @@ class WorkbenchWebTests(unittest.TestCase):
             )
             self.assertEqual(restricted_reject.status, 403)
 
+    def test_wiki_revision_publish_requires_verified_evidence_and_strong_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "待发布知识.md"
+            restricted = root / "受限待发布知识.md"
+            internal.write_text("正式发布必须经过受控复核。", encoding="utf-8")
+            restricted.write_text("受限内容不得通过 Web 发布。", encoding="utf-8")
+            internal_result = ingest_file(internal, paths, Classification.INTERNAL)
+            restricted_result = ingest_file(
+                restricted, paths, Classification.RESTRICTED
+            )
+            self.assertIsNotNone(internal_result.revision_id)
+            self.assertIsNotNone(restricted_result.revision_id)
+            database = Database(paths.database)
+            with database.connect() as connection:
+                internal_evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (internal_result.processing_run_id,),
+                ).fetchone()[0]
+                restricted_evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (restricted_result.processing_run_id,),
+                ).fetchone()[0]
+            request_revision_review(
+                database, internal_result.revision_id, actor="author-01"
+            )
+            request_revision_review(
+                database, restricted_result.revision_id, actor="author-01"
+            )
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+            route = f"/api/v1/wiki-revisions/{internal_result.revision_id}/publish"
+            phrase = f"发布 {internal_result.revision_id}"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Workbench-CSRF": "csrf",
+            }
+
+            blocked_detail = application.handle(
+                "GET", f"/api/v1/wiki-revisions/{internal_result.revision_id}"
+            )
+            blocked_payload = json.loads(blocked_detail.body.decode("utf-8"))
+            self.assertFalse(blocked_payload["can_publish"])
+            self.assertIn("仍有 1 条引用证据未通过审核", blocked_payload["publish_blockers"])
+            self.assertEqual(blocked_payload["publish_confirmation_phrase"], phrase)
+
+            wrong_confirmation = application.handle(
+                "POST",
+                route,
+                body=json.dumps(
+                    {"actor": "publisher-01", "confirmation": "确认发布"},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(wrong_confirmation.status, 400)
+            unverified_evidence = application.handle(
+                "POST",
+                route,
+                body=json.dumps(
+                    {"actor": "publisher-01", "confirmation": phrase},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(unverified_evidence.status, 409)
+
+            transition_evidence(
+                database,
+                internal_evidence_id,
+                EvidenceStatus.REVIEWING,
+                actor="reviewer-01",
+            )
+            transition_evidence(
+                database,
+                internal_evidence_id,
+                EvidenceStatus.VERIFIED,
+                actor="reviewer-01",
+            )
+            ready_detail = application.handle(
+                "GET", f"/api/v1/wiki-revisions/{internal_result.revision_id}"
+            )
+            ready_payload = json.loads(ready_detail.body.decode("utf-8"))
+            self.assertTrue(ready_payload["can_publish"])
+            self.assertEqual(ready_payload["publish_blockers"], [])
+
+            with database.connect() as connection:
+                original_relative_path = connection.execute(
+                    "SELECT markdown_path FROM wiki_revisions WHERE id = ?",
+                    (internal_result.revision_id,),
+                ).fetchone()[0]
+            original_path = paths.root / original_relative_path
+            original_content = original_path.read_text(encoding="utf-8")
+            original_path.write_text(
+                original_content + "\n未同步发布编辑。\n", encoding="utf-8"
+            )
+            hash_mismatch = application.handle(
+                "POST",
+                route,
+                body=json.dumps(
+                    {"actor": "publisher-01", "confirmation": phrase},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(hash_mismatch.status, 409)
+            original_path.write_text(original_content, encoding="utf-8", newline="\n")
+
+            missing_csrf = application.handle(
+                "POST",
+                route,
+                body=json.dumps(
+                    {"actor": "publisher-01", "confirmation": phrase},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(missing_csrf.status, 403)
+            published = application.handle(
+                "POST",
+                route,
+                body=json.dumps(
+                    {"actor": "publisher-01", "confirmation": phrase},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            published_payload = json.loads(published.body.decode("utf-8"))
+            self.assertEqual(published.status, 200)
+            self.assertEqual(published_payload["result"]["status"], "verified")
+            self.assertNotIn("path", json.dumps(published_payload))
+            with database.connect() as connection:
+                revision = connection.execute(
+                    "SELECT status, markdown_path FROM wiki_revisions WHERE id = ?",
+                    (internal_result.revision_id,),
+                ).fetchone()
+                page = connection.execute(
+                    "SELECT status, current_verified_revision_id FROM wiki_pages WHERE id = ?",
+                    (internal_result.page_id,),
+                ).fetchone()
+                audit = connection.execute(
+                    """
+                    SELECT actor FROM audit_log
+                    WHERE event_type = 'wiki_revision_published' AND entity_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (internal_result.revision_id,),
+                ).fetchone()
+            self.assertEqual(revision["status"], "verified")
+            self.assertEqual(page["status"], "verified")
+            self.assertEqual(
+                page["current_verified_revision_id"], internal_result.revision_id
+            )
+            self.assertEqual(audit["actor"], "publisher-01")
+            self.assertFalse(original_path.exists())
+            verified_path = paths.root / revision["markdown_path"]
+            self.assertTrue(verified_path.is_file())
+            self.assertIn("status: verified", verified_path.read_text(encoding="utf-8"))
+
+            repeated = application.handle(
+                "POST",
+                route,
+                body=json.dumps(
+                    {"actor": "publisher-01", "confirmation": phrase},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(repeated.status, 409)
+
+            transition_evidence(
+                database,
+                restricted_evidence_id,
+                EvidenceStatus.REVIEWING,
+                actor="reviewer-01",
+            )
+            transition_evidence(
+                database,
+                restricted_evidence_id,
+                EvidenceStatus.VERIFIED,
+                actor="reviewer-01",
+            )
+            restricted_publish = application.handle(
+                "POST",
+                f"/api/v1/wiki-revisions/{restricted_result.revision_id}/publish",
+                body=json.dumps(
+                    {
+                        "actor": "publisher-01",
+                        "confirmation": f"发布 {restricted_result.revision_id}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(restricted_publish.status, 403)
+
+    def test_web_publish_blocks_revision_when_preview_does_not_cover_full_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            source = root / "超长知识.md"
+            source.write_text("超长内容" * 13_000, encoding="utf-8")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            with database.connect() as connection:
+                evidence_ids = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT id FROM evidence WHERE processing_run_id = ?",
+                        (result.processing_run_id,),
+                    ).fetchall()
+                ]
+            for evidence_id in evidence_ids:
+                transition_evidence(
+                    database, evidence_id, EvidenceStatus.REVIEWING, actor="reviewer-01"
+                )
+                transition_evidence(
+                    database, evidence_id, EvidenceStatus.VERIFIED, actor="reviewer-01"
+                )
+            request_revision_review(database, result.revision_id, actor="author-01")
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+
+            detail = application.handle(
+                "GET", f"/api/v1/wiki-revisions/{result.revision_id}"
+            )
+            payload = json.loads(detail.body.decode("utf-8"))
+            self.assertTrue(payload["content_truncated"])
+            self.assertFalse(payload["can_publish"])
+            self.assertIn(
+                "Web 预览未覆盖全文，请通过 CLI 核对并发布",
+                payload["publish_blockers"],
+            )
+            blocked = application.handle(
+                "POST",
+                f"/api/v1/wiki-revisions/{result.revision_id}/publish",
+                body=json.dumps(
+                    {
+                        "actor": "publisher-01",
+                        "confirmation": f"发布 {result.revision_id}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                },
+            )
+            self.assertEqual(blocked.status, 409)
+
     def test_evaluation_projection_exposes_metrics_without_local_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = WorkspacePaths(Path(temporary) / "workspace")

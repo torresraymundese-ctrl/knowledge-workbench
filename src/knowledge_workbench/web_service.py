@@ -9,7 +9,12 @@ from .conflicts import transition_conflict
 from .database import Database
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
-from .review import reject_revision, request_revision_review, transition_evidence
+from .review import (
+    publish_revision,
+    reject_revision,
+    request_revision_review,
+    transition_evidence,
+)
 from .utils import sha256_text
 
 
@@ -491,6 +496,12 @@ class WorkbenchReadService:
             evidence_row["status"]: evidence_row["count"]
             for evidence_row in evidence_rows
         }
+        content_truncated = len(preview) < len(content)
+        publish_blockers = _revision_publish_blockers(
+            status=row["status"],
+            evidence_by_status=evidence_by_status,
+            content_truncated=content_truncated,
+        )
         return {
             "revision_id": row["id"],
             "page_id": row["page_id"],
@@ -506,9 +517,12 @@ class WorkbenchReadService:
             "evidence_by_status": evidence_by_status,
             "content_preview": preview,
             "content_length": len(content),
-            "content_truncated": len(preview) < len(content),
+            "content_truncated": content_truncated,
             "content_integrity": "verified",
             "can_submit_review": row["status"] == "draft",
+            "can_publish": not publish_blockers,
+            "publish_blockers": publish_blockers,
+            "publish_confirmation_phrase": _publish_confirmation_phrase(revision_id),
         }
 
     def evaluations(self, *, limit: int = 10) -> list[dict[str, Any]]:
@@ -721,11 +735,59 @@ class WorkbenchActionService:
             "actor": actor,
         }
 
+    def publish_revision_web(
+        self,
+        revision_id: str,
+        *,
+        actor: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        _required_publish_confirmation(confirmation, revision_id)
+        row = self._current_revision_for_web(revision_id)
+        if row["classification"] == "restricted":
+            raise PermissionError("restricted Wiki 修订只能通过 CLI 发布")
+        content = _read_revision_content(
+            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
+        )
+        with self.database.connect() as connection:
+            evidence_rows = connection.execute(
+                """
+                SELECT e.status, COUNT(*) AS count
+                FROM revision_evidence re
+                JOIN evidence e ON e.id = re.evidence_id
+                WHERE re.revision_id = ?
+                GROUP BY e.status
+                """,
+                (revision_id,),
+            ).fetchall()
+        evidence_by_status = {
+            evidence_row["status"]: evidence_row["count"]
+            for evidence_row in evidence_rows
+        }
+        blockers = _revision_publish_blockers(
+            status=row["status"],
+            evidence_by_status=evidence_by_status,
+            content_truncated=len(content) > MAX_WIKI_PREVIEW_CHARACTERS,
+        )
+        if blockers:
+            raise KnowledgeWorkbenchError(
+                "Web 正式发布条件未满足：" + "；".join(blockers)
+            )
+        publish_revision(self.database, self.paths, revision_id, actor=actor)
+        return {
+            "entity_type": "wiki_revision",
+            "entity_id": revision_id,
+            "status": "verified",
+            "actor": actor,
+        }
+
     def _current_revision_for_web(self, revision_id: str):
         with self.database.connect() as connection:
             row = connection.execute(
                 """
-                SELECT wr.markdown_path, wr.content_sha256, d.classification
+                SELECT wr.status, wr.markdown_path, wr.content_sha256,
+                       d.classification
                 FROM wiki_revisions wr
                 JOIN wiki_pages wp ON wp.id = wr.page_id
                 JOIN documents d ON d.id = wp.source_document_id
@@ -851,6 +913,38 @@ def _required_review_note(value: str) -> str:
     if len(note) > 2000:
         raise ValueError("Wiki 修订复核意见不能超过 2000 个字符")
     return note
+
+
+def _publish_confirmation_phrase(revision_id: str) -> str:
+    return f"发布 {revision_id}"
+
+
+def _required_publish_confirmation(value: str, revision_id: str) -> str:
+    confirmation = value.strip()
+    expected = _publish_confirmation_phrase(revision_id)
+    if confirmation != expected:
+        raise ValueError(f"正式发布前必须完整输入确认短语：{expected}")
+    return confirmation
+
+
+def _revision_publish_blockers(
+    *,
+    status: str,
+    evidence_by_status: dict[str, int],
+    content_truncated: bool,
+) -> list[str]:
+    blockers: list[str] = []
+    if status != "reviewing":
+        blockers.append("修订状态必须是 reviewing")
+    evidence_count = sum(evidence_by_status.values())
+    if evidence_count == 0:
+        blockers.append("修订必须至少引用一条证据")
+    unverified_count = evidence_count - evidence_by_status.get("verified", 0)
+    if unverified_count:
+        blockers.append(f"仍有 {unverified_count} 条引用证据未通过审核")
+    if content_truncated:
+        blockers.append("Web 预览未覆盖全文，请通过 CLI 核对并发布")
+    return blockers
 
 
 def _optional_note(value: str | None) -> str | None:

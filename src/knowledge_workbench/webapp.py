@@ -81,6 +81,7 @@ class WorkbenchWebApplication:
                         "conflict-transition",
                         "wiki-revision-submit-review",
                         "wiki-revision-reject",
+                        "wiki-revision-publish",
                     ],
                 }
                 return self._json(200, payload)
@@ -165,11 +166,15 @@ class WorkbenchWebApplication:
         revision_reject_id = _route_entity_id(
             path, entity="wiki-revisions", action="reject"
         )
+        revision_publish_id = _route_entity_id(
+            path, entity="wiki-revisions", action="publish"
+        )
         if (
             evidence_id is None
             and conflict_id is None
             and revision_submit_id is None
             and revision_reject_id is None
+            and revision_publish_id is None
         ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
@@ -208,11 +213,17 @@ class WorkbenchWebApplication:
                 result = self.action_service.submit_revision_review(
                     revision_submit_id, actor=actor
                 )
-            else:
+            elif revision_reject_id is not None:
                 result = self.action_service.reject_revision_review(
                     revision_reject_id or "",
                     actor=actor,
                     note=str(payload.get("note", "")),
+                )
+            else:
+                result = self.action_service.publish_revision_web(
+                    revision_publish_id or "",
+                    actor=actor,
+                    confirmation=str(payload.get("confirmation", "")),
                 )
             return self._json(200, {"ok": True, "result": result})
         except (UnicodeError, json.JSONDecodeError):

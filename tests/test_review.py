@@ -97,6 +97,67 @@ class WikiRevisionReviewTests(unittest.TestCase):
                     note="再次驳回。",
                 )
 
+    def test_publish_rechecks_content_hash_inside_core_state_machine(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            source = root / "policy.md"
+            source.write_text("发布必须保护内容完整性。", encoding="utf-8")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            with database.connect() as connection:
+                evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (result.processing_run_id,),
+                ).fetchone()[0]
+                markdown_path = connection.execute(
+                    "SELECT markdown_path FROM wiki_revisions WHERE id = ?",
+                    (result.revision_id,),
+                ).fetchone()[0]
+            transition_evidence(
+                database, evidence_id, EvidenceStatus.REVIEWING, actor="reviewer-01"
+            )
+            transition_evidence(
+                database, evidence_id, EvidenceStatus.VERIFIED, actor="reviewer-01"
+            )
+            request_revision_review(database, result.revision_id, actor="author-01")
+            revision_path = paths.root / markdown_path
+            revision_path.write_text(
+                revision_path.read_text(encoding="utf-8") + "\n外部编辑。\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "外部修改"):
+                publish_revision(
+                    database, paths, result.revision_id, actor="publisher-01"
+                )
+            with database.connect() as connection:
+                status = connection.execute(
+                    "SELECT status FROM wiki_revisions WHERE id = ?",
+                    (result.revision_id,),
+                ).fetchone()[0]
+            self.assertEqual(status, "reviewing")
+
+    def test_publish_requires_at_least_one_cited_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            source = root / "policy.md"
+            source.write_text("正式知识必须存在证据引用。", encoding="utf-8")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            request_revision_review(database, result.revision_id, actor="author-01")
+            with database.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM revision_evidence WHERE revision_id = ?",
+                    (result.revision_id,),
+                )
+
+            with self.assertRaisesRegex(InvalidTransitionError, "至少引用一条证据"):
+                publish_revision(
+                    database, paths, result.revision_id, actor="publisher-01"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

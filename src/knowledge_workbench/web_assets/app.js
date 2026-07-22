@@ -289,6 +289,26 @@ async function rejectRevisionReview(revisionId, noteInput) {
   }
 }
 
+async function publishRevision(revisionId, confirmationInput, expectedPhrase) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const confirmation = confirmationInput.value.trim();
+  if (confirmation !== expectedPhrase) {
+    showBanner(`正式发布前必须完整输入：${expectedPhrase}`);
+    confirmationInput.focus();
+    return;
+  }
+  if (!window.confirm(`确认正式发布该 Wiki 修订？发布后会立即替代旧正式修订，并以 ${actor} 写入审计日志。`)) return;
+  try {
+    await postTransition(`/api/v1/wiki-revisions/${encodeURIComponent(revisionId)}/publish`, { actor, confirmation });
+    document.querySelector("#revision-dialog").close();
+    await loadDashboard();
+    showBanner(`Wiki 修订已正式发布，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "Wiki 修订正式发布失败");
+  }
+}
+
 async function openRevision(revisionId) {
   try {
     const response = await fetch(`/api/v1/wiki-revisions/${encodeURIComponent(revisionId)}`, { headers: { Accept: "application/json" } });
@@ -306,7 +326,9 @@ async function openRevision(revisionId) {
       notice.textContent = `页面内容共 ${formatNumber(detail.content_length)} 个字符，Web 仅显示前 ${formatNumber(detail.content_preview.length)} 个字符；提交前请在 Obsidian 或 CLI 核对全文。`;
       notice.hidden = false;
     } else if (detail.status === "reviewing") {
-      notice.textContent = "该修订正在复核；可填写复核意见并驳回，正式发布尚未在 Web 开放。";
+      notice.textContent = detail.can_publish
+        ? "该修订已满足正式发布条件；发布会立即更新当前正式知识，请再次核对全文和引用。"
+        : "该修订正在复核，但尚未满足正式发布条件。";
       notice.hidden = false;
     } else {
       notice.hidden = true;
@@ -321,10 +343,33 @@ async function openRevision(revisionId) {
       note.maxLength = 2000;
       note.rows = 3;
       note.placeholder = "复核意见（驳回时必填）";
-      actions.append(
-        note,
-        button("驳回修订", "danger", () => rejectRevisionReview(detail.revision_id, note)),
-      );
+      actions.append(note, button("驳回修订", "danger", () => rejectRevisionReview(detail.revision_id, note)));
+
+      const publishPanel = element("section", "revision-publish-panel");
+      publishPanel.append(element("strong", "", "正式发布"));
+      if (detail.can_publish) {
+        const instruction = element("p", "", "发布后将立即成为当前正式知识。请输入以下短语确认：");
+        const phrase = element("code", "publish-phrase", detail.publish_confirmation_phrase);
+        const confirmation = element("input", "revision-publish-confirmation");
+        confirmation.type = "text";
+        confirmation.autocomplete = "off";
+        confirmation.placeholder = detail.publish_confirmation_phrase;
+        confirmation.setAttribute("aria-label", "正式发布确认短语");
+        publishPanel.append(
+          instruction,
+          phrase,
+          confirmation,
+          button("正式发布", "publish", () => publishRevision(
+            detail.revision_id,
+            confirmation,
+            detail.publish_confirmation_phrase,
+          )),
+        );
+      } else {
+        const blockers = Array.isArray(detail.publish_blockers) ? detail.publish_blockers.join("；") : "发布条件未满足";
+        publishPanel.append(element("p", "publish-blockers", blockers));
+      }
+      actions.append(publishPanel);
     }
     document.querySelector("#revision-dialog").showModal();
   } catch (cause) {
