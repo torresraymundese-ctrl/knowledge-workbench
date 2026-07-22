@@ -524,6 +524,160 @@ def reject_labeling_session(
         )
 
 
+def export_labeling_annotation_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    session_id: str,
+    output: Path,
+    *,
+    actor: str,
+    limit_per_case: int = 0,
+) -> Path:
+    actor = _required_actor(actor)
+    if limit_per_case < 0 or limit_per_case > 5000:
+        raise KnowledgeWorkbenchError("每个用例的候选上限必须在 0 到 5000 之间")
+    output = output.expanduser().resolve()
+    if output.suffix.lower() != ".md":
+        raise KnowledgeWorkbenchError("标注工作包必须使用 .md 文件")
+    if output.exists():
+        raise KnowledgeWorkbenchError(f"标注工作包已存在，不允许静默覆盖：{output}")
+
+    with database.connect() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "draft":
+            raise InvalidTransitionError("只有 draft 标注集可以生成标注工作包")
+        if session["created_by"] != actor:
+            raise InvalidTransitionError("只有标注集创建人可以生成标注工作包")
+        cases = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? ORDER BY case_id",
+            (session_id,),
+        ).fetchall()
+        _ensure_labeling_output_allowed(paths, cases, output, "标注工作包")
+        generated_at = utc_now()
+        lines = [
+            "---",
+            "type: labeling-annotation-pack",
+            f"session_id: {session_id}",
+            "status: draft",
+            f"generated_at: {generated_at}",
+            "---",
+            "",
+            f"# {session['name']}：标注工作包",
+            "",
+            f"- 标注人：`{actor}`",
+            f"- 每个用例最低证据数：`{session['minimum_required_per_case']}`",
+            "- 本文件只用于本地人工定位；勾选 Markdown 不会自动修改数据库。",
+            "- 选择前必须回到来源文件核对原文、上下文和适用范围。",
+            "",
+        ]
+        candidate_count = 0
+        truncated_case_count = 0
+        for case in cases:
+            _ensure_case_source_current(connection, case)
+            total = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM evidence e
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                WHERE e.document_version_id = ?
+                  AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+                """,
+                (case["document_version_id"],),
+            ).fetchone()[0]
+            limit_clause = " LIMIT ?" if limit_per_case else ""
+            parameters: tuple = (case["id"], case["document_version_id"])
+            if limit_per_case:
+                parameters = (*parameters, limit_per_case)
+            evidence = connection.execute(
+                f"""
+                SELECT e.id, e.run_ordinal, e.excerpt, e.locator_json, e.status,
+                       pr.parser_name, pr.parser_version,
+                       CASE WHEN lee.evidence_id IS NULL THEN 0 ELSE 1 END AS selected
+                FROM evidence e
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                LEFT JOIN labeling_expected_evidence lee
+                  ON lee.case_row_id = ? AND lee.evidence_id = e.id
+                WHERE e.document_version_id = ?
+                  AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+                ORDER BY e.run_ordinal, e.id{limit_clause}
+                """,
+                parameters,
+            ).fetchall()
+            candidate_count += len(evidence)
+            if len(evidence) < total:
+                truncated_case_count += 1
+            lines.extend(
+                [
+                    f"## {case['case_id']}",
+                    "",
+                    f"- 密级：`{case['classification']}`",
+                    f"- 来源：`{_markdown_code(case['source_path'])}`",
+                    f"- 来源 SHA-256：`{case['source_sha256']}`",
+                    f"- 当前候选：显示 `{len(evidence)}` / 共 `{total}` 条",
+                    "",
+                ]
+            )
+            for row in evidence:
+                marker = "x" if row["selected"] else " "
+                lines.extend(
+                    [
+                        f"### [{marker}] #{row['run_ordinal']} `{row['id']}`",
+                        "",
+                        f"- 状态：`{row['status']}`",
+                        f"- 定位：`{_markdown_code(row['locator_json'])}`",
+                        f"- 解析器：`{row['parser_name']}:{row['parser_version']}`",
+                        "",
+                        *_blockquote(row["excerpt"]),
+                        "",
+                    ]
+                )
+            lines.extend(
+                [
+                    "### 写入本用例选择",
+                    "",
+                    "```powershell",
+                    "$Ordinals = @() # 核对原文后填写候选 #编号",
+                    (
+                        f"if ($Ordinals.Count -lt {session['minimum_required_per_case']}) "
+                        f'{{ throw "请至少填写{session["minimum_required_per_case"]}个候选编号" }}'
+                    ),
+                    (
+                        f'.\\.venv\\Scripts\\knowledge.exe --workspace .\\workspace '
+                        f"label add-ordinals {session_id} {case['case_id']} "
+                        f"$Ordinals --actor {actor}"
+                    ),
+                    "```",
+                    "",
+                ]
+            )
+
+    content = "\n".join(lines).rstrip() + "\n"
+    write_text_atomic(output, content)
+    try:
+        with database.transaction() as connection:
+            record_event(
+                connection,
+                "labeling_annotation_pack_exported",
+                "labeling_session",
+                session_id,
+                actor=actor,
+                details={
+                    "output_path": str(output),
+                    "content_sha256": sha256_text(content),
+                    "case_count": len(cases),
+                    "candidate_count": candidate_count,
+                    "limit_per_case": limit_per_case,
+                    "truncated_case_count": truncated_case_count,
+                },
+            )
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    return output
+
+
 def export_labeling_review_pack(
     database: Database,
     paths: WorkspacePaths,
@@ -1134,10 +1288,10 @@ def _ensure_labeling_output_allowed(
         raise KnowledgeWorkbenchError(f"restricted 标注集暂不允许导出{output_kind}")
     if any(case["classification"] != "public" for case in cases):
         try:
-            output.relative_to(paths.root)
+            output.relative_to(paths.evaluations)
         except ValueError as exc:
             raise KnowledgeWorkbenchError(
-                f"非公开资料的{output_kind}只能导出到当前 workspace 内"
+                f"非公开资料的{output_kind}只能导出到当前 workspace/evaluations 内"
             ) from exc
 
 

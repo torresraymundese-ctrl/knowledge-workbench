@@ -12,6 +12,7 @@ from knowledge_workbench.labeling import (
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
+    export_labeling_annotation_pack,
     export_labeling_review_pack,
     labeling_session_summary,
     labeling_session_readiness,
@@ -177,6 +178,88 @@ class LabelingWorkflowTests(unittest.TestCase):
                 selected_before_failure,
             )
 
+    def test_annotation_pack_is_local_audited_and_marks_current_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("证据一。\n\n证据二。\n\n证据三。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            first = list_labeling_candidates(
+                database, session_id, "case-1", limit=1
+            )["candidates"][0]
+            select_expected_evidence(
+                database, session_id, "case-1", first["id"], actor="alice"
+            )
+
+            with self.assertRaisesRegex(InvalidTransitionError, "创建人"):
+                export_labeling_annotation_pack(
+                    database,
+                    paths,
+                    session_id,
+                    paths.evaluations / "wrong-actor.md",
+                    actor="bob",
+                )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "workspace"):
+                export_labeling_annotation_pack(
+                    database,
+                    paths,
+                    session_id,
+                    root / "outside.md",
+                    actor="alice",
+                )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "evaluations"):
+                export_labeling_annotation_pack(
+                    database,
+                    paths,
+                    session_id,
+                    paths.raw / "must-not-write.md",
+                    actor="alice",
+                )
+
+            output = paths.evaluations / "annotation.md"
+            export_labeling_annotation_pack(
+                database,
+                paths,
+                session_id,
+                output,
+                actor="alice",
+                limit_per_case=1,
+            )
+            content = output.read_text(encoding="utf-8")
+            self.assertIn("type: labeling-annotation-pack", content)
+            self.assertIn(session_id, content)
+            self.assertIn("显示 `1` / 共 `3` 条", content)
+            self.assertIn(f"[x] #{first['run_ordinal']} `{first['id']}`", content)
+            self.assertIn("$Ordinals = @()", content)
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "不允许静默覆盖"):
+                export_labeling_annotation_pack(
+                    database,
+                    paths,
+                    session_id,
+                    output,
+                    actor="alice",
+                )
+            with database.connect() as connection:
+                event = connection.execute(
+                    """
+                    SELECT details_json FROM audit_log
+                    WHERE entity_id = ? AND event_type = ?
+                    """,
+                    (session_id, "labeling_annotation_pack_exported"),
+                ).fetchone()
+            self.assertIsNotNone(event)
+            details = json.loads(event["details_json"])
+            self.assertEqual(details["candidate_count"], 1)
+            self.assertEqual(details["truncated_case_count"], 1)
+
     def test_candidates_are_paginated_from_current_run_and_show_selection(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -292,7 +375,7 @@ class LabelingWorkflowTests(unittest.TestCase):
                     paths.evaluations / "self-review.md",
                     actor="alice",
                 )
-            with self.assertRaisesRegex(KnowledgeWorkbenchError, "workspace 内"):
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "workspace/evaluations"):
                 export_labeling_review_pack(
                     database,
                     paths,

@@ -26,6 +26,7 @@ from .labeling import (
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
+    export_labeling_annotation_pack,
     export_labeling_review_pack,
     labeling_session_summary,
     labeling_session_readiness,
@@ -359,6 +360,18 @@ def build_parser() -> argparse.ArgumentParser:
     label_review_pack.add_argument("session_id")
     label_review_pack.add_argument("output", type=Path)
     label_review_pack.add_argument("--actor", required=True)
+    label_annotation_pack = label_sub.add_parser(
+        "annotation-pack", help="由标注人导出本地 Obsidian 兼容 Markdown 工作包"
+    )
+    label_annotation_pack.add_argument("session_id")
+    label_annotation_pack.add_argument("output", type=Path)
+    label_annotation_pack.add_argument("--actor", required=True)
+    label_annotation_pack.add_argument(
+        "--limit-per-case",
+        type=int,
+        default=0,
+        help="每个用例最多输出的候选数；0 表示全部",
+    )
     return parser
 
 
@@ -1277,6 +1290,16 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             actor=args.actor,
         )
         print(f"人工复核包已导出：{output}")
+    elif command == "annotation-pack":
+        output = export_labeling_annotation_pack(
+            database,
+            paths,
+            args.session_id,
+            args.output,
+            actor=args.actor,
+            limit_per_case=args.limit_per_case,
+        )
+        print(f"人工标注工作包已导出：{output}")
 
 
 def _handle_worker(database, paths: WorkspacePaths, args) -> None:
