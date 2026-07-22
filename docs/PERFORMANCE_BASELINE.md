@@ -29,7 +29,7 @@
 
 ```powershell
 .\.venv\Scripts\knowledge.exe index build --model bge-m3
-.\.venv\Scripts\knowledge.exe benchmark --iterations 3 --synthetic-count 500
+.\.venv\Scripts\knowledge.exe benchmark --mode vector --iterations 3 --synthetic-count 500
 ```
 
 ## 结论
@@ -38,3 +38,27 @@
 
 本次 500 条结果是搜索层合成基线，不等同于 500 页真实文档的端到端摄入测试。拿到首批资料后仍需测量解析、真实批量嵌入、峰值内存和检索质量。
 
+## 真实工作区全文检索基线（2026-07-22）
+
+本轮不调用生成式模型、Ollama 或 BGE-M3，只测量当前 SQLite 数据库上的证据检索。报告仅保存查询的 SHA-256，不保存查询明文或检索结果原文。
+
+| 指标 | 结果 |
+|---|---:|
+| 当前文档 | 11 |
+| 当前原子证据 | 1,324 |
+| 通用查询数 | 5 |
+| 每组测量次数 | 50 |
+| 总测量次数 | 250 |
+| 全部查询中位数 | 5.240 ms |
+| P95 | 8.857 ms |
+| 最大值 | 11.797 ms |
+| FTS5 查询组 | 1 |
+| 中文子串回退查询组 | 4 |
+
+命令：
+
+```powershell
+.\.venv\Scripts\knowledge.exe --workspace workspace benchmark --mode fts --iterations 50
+```
+
+当前 1,324 条证据规模下，FTS5 与确定性的 `LIKE` 子串回退都能满足本地交互延迟。4 组查询进入回退路径，验证了 SQLite `unicode61` 对未分词中文的限制；这不是性能阻塞，但后续检索质量评测应继续区分“找不到”和“仅能精确子串命中”。BGE-M3 仍是可选的语义召回增强，不是 CLI 主链路或 Web 开发的硬依赖。

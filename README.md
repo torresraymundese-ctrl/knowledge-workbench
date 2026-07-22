@@ -46,7 +46,8 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe page list
 .\.venv\Scripts\knowledge.exe index build --model bge-m3
 .\.venv\Scripts\knowledge.exe semantic-search "哪些资料不能发送到云端"
-.\.venv\Scripts\knowledge.exe benchmark --synthetic-count 500
+.\.venv\Scripts\knowledge.exe benchmark --mode fts --iterations 50
+.\.venv\Scripts\knowledge.exe benchmark --mode vector --synthetic-count 500
 .\.venv\Scripts\knowledge.exe pipeline .\samples\example.md --mode faithful
 .\.venv\Scripts\knowledge.exe task list
 .\.venv\Scripts\knowledge.exe conflict list --status pending

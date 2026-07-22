@@ -15,6 +15,7 @@ from typing import Sequence
 
 import numpy as np
 
+from .benchmarking import benchmark_fts_search
 from .config import WorkspacePaths, resolve_workspace
 from .errors import KnowledgeWorkbenchError
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
@@ -161,9 +162,19 @@ def build_parser() -> argparse.ArgumentParser:
     index_build.add_argument("--batch-size", type=int, default=16)
     index_sub.add_parser("status", help="显示当前向量索引元数据")
 
-    benchmark = subparsers.add_parser("benchmark", help="测量查询向量生成和向量检索延迟")
+    benchmark = subparsers.add_parser(
+        "benchmark", help="测量全文检索或可选向量检索延迟"
+    )
+    benchmark.add_argument("--mode", choices=["fts", "vector"], default="fts")
     benchmark.add_argument("--query", default="知识证据和资料密级规则")
+    benchmark.add_argument(
+        "--fts-query",
+        action="append",
+        help="全文检索基准查询，可重复指定；报告只保存查询哈希",
+    )
     benchmark.add_argument("--iterations", type=int, default=3)
+    benchmark.add_argument("--limit", type=int, default=30)
+    benchmark.add_argument("--output", type=Path)
     benchmark.add_argument("--model", default="bge-m3")
     benchmark.add_argument("--base-url", default="http://127.0.0.1:11434")
     benchmark.add_argument("--synthetic-count", type=int, default=500)
@@ -706,6 +717,28 @@ def _handle_index(database, paths: WorkspacePaths, args) -> None:
 
 
 def _benchmark(database, paths: WorkspacePaths, args) -> None:
+    if args.mode == "fts":
+        queries = args.fts_query or ["项目", "合同", "系统", "流程", "验收"]
+        report = benchmark_fts_search(
+            database,
+            queries,
+            iterations=args.iterations,
+            limit=args.limit,
+        )
+        output = args.output
+        if output is None:
+            timestamp = report["measured_at"].replace(":", "").replace("+", "-")
+            output = paths.evaluations / f"fts-benchmark-{timestamp}.json"
+        output = output.expanduser().resolve()
+        write_text_atomic(
+            output,
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        print(f"全文检索基准报告：{output}")
+        _print_mapping(report["corpus"])
+        _print_mapping(report["aggregate"])
+        return
+
     if args.iterations < 1:
         raise KnowledgeWorkbenchError("iterations 必须大于 0")
     store = NumpyFlatVectorStore(paths.index)

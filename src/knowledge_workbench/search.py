@@ -4,6 +4,12 @@ from .database import Database
 
 
 def search_evidence(database: Database, query: str, limit: int = 10):
+    return search_evidence_with_mode(database, query, limit)[0]
+
+
+def search_evidence_with_mode(
+    database: Database, query: str, limit: int = 10
+) -> tuple[list, str]:
     with database.connect() as connection:
         try:
             rows = connection.execute(
@@ -27,10 +33,10 @@ def search_evidence(database: Database, query: str, limit: int = 10):
         except Exception:
             rows = []
         if rows:
-            return rows
+            return rows, "fts5"
         # unicode61 can treat an unspaced Chinese sentence as one token. LIKE is a
         # deterministic substring fallback until the tokenizer is configurable.
-        return connection.execute(
+        rows = connection.execute(
             """
             SELECT e.id, e.status, e.excerpt, e.locator_json,
                    d.original_name, d.classification, 0.0 AS score
@@ -46,6 +52,7 @@ def search_evidence(database: Database, query: str, limit: int = 10):
             """,
             (f"%{_escape_like(query)}%", limit),
         ).fetchall()
+        return rows, "substring_fallback"
 
 
 def _escape_like(value: str) -> str:
