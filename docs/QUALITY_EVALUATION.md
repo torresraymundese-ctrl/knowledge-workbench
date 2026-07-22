@@ -55,6 +55,8 @@ $Reviewer = "reviewer-01"
 
 # 可选：先生成只能保存在 workspace/evaluations 内的 Obsidian 兼容本地标注工作包
 .\.venv\Scripts\knowledge.exe label annotation-pack $SessionId .\workspace\evaluations\nas-pilot-v1.annotation.md --actor $Annotator
+# 在 Obsidian 中核对并勾选后保存，再增量应用所有已勾选项
+.\.venv\Scripts\knowledge.exe label apply-annotation-pack .\workspace\evaluations\nas-pilot-v1.annotation.md --actor $Annotator
 
 # 查看候选并记录列表中显示的 #编号
 .\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --limit 20
@@ -79,7 +81,7 @@ if ($Ordinals.Count -lt 3) { throw "请先核对原文并填写至少3个候选�
 
 `add-ordinals` 只负责把当前处理运行中的短编号安全解析为正式 evidence ID，不会自动判断证据是否重要。编号不存在、资料已更新、处理运行已过期或操作者不是会话创建人时，整批选择都会失败且不会留下部分写入。仍可使用 `add-evidence` 直接提交实际 evidence ID。
 
-`annotation-pack` 默认包含各用例的全部当前候选、原文片段和定位，可直接用 Obsidian 打开；勾选其中的 Markdown 复选框只用于人员记录，不会直接修改 SQLite。包中包含非公开原文，只允许保存在当前 `workspace/evaluations/`，不能写入只读的 `workspace/raw/`，且不会覆盖同名文件。资料量很大时可增加 `--limit-per-case 200`，但被截断的工作包不能替代回到原文件进行完整核对。
+`annotation-pack` 默认包含各用例的全部当前候选、原文片段和定位，可直接用 Obsidian 打开。勾选本身不会修改 SQLite；保存后必须显式运行 `apply-annotation-pack`。应用操作是增量且幂等的：只添加已勾选项，不会因为取消勾选而删除已有选择；任一编号、证据 ID、来源版本或处理运行不匹配时整包回滚。包中包含非公开原文，只允许保存在当前 `workspace/evaluations/`，不能写入只读的 `workspace/raw/`，且不会覆盖同名文件。资料量很大时可增加 `--limit-per-case 200`，但被截断的工作包不能替代回到原文件进行完整核对。
 
 标注会话支持 `list`、`remove-evidence`、`add-forbidden` 和 `remove-forbidden`。冲突、弃用或归档证据不能成为黄金证据；来源文件内容、密级、当前文件版本或当前处理运行变化后，旧会话不能提交、批准或导出。
 

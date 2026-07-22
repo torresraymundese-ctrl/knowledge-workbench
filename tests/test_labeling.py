@@ -9,6 +9,7 @@ from knowledge_workbench.errors import InvalidTransitionError, KnowledgeWorkbenc
 from knowledge_workbench.evaluation import evaluate_dataset
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.labeling import (
+    apply_labeling_annotation_pack,
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
@@ -237,7 +238,8 @@ class LabelingWorkflowTests(unittest.TestCase):
             self.assertIn("type: labeling-annotation-pack", content)
             self.assertIn(session_id, content)
             self.assertIn("显示 `1` / 共 `3` 条", content)
-            self.assertIn(f"[x] #{first['run_ordinal']} `{first['id']}`", content)
+            self.assertIn(f"### #{first['run_ordinal']} `{first['id']}`", content)
+            self.assertIn("- [x] 选择此证据", content)
             self.assertIn("$Ordinals = @()", content)
             with self.assertRaisesRegex(KnowledgeWorkbenchError, "不允许静默覆盖"):
                 export_labeling_annotation_pack(
@@ -259,6 +261,91 @@ class LabelingWorkflowTests(unittest.TestCase):
             details = json.loads(event["details_json"])
             self.assertEqual(details["candidate_count"], 1)
             self.assertEqual(details["truncated_case_count"], 1)
+
+    def test_checked_annotation_pack_is_applied_atomically_and_additively(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("证据一。\n\n证据二。\n\n证据三。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            candidates = list_labeling_candidates(
+                database, session_id, "case-1", limit=20
+            )["candidates"]
+            first, second = candidates[0], candidates[1]
+            pack = paths.evaluations / "annotation.md"
+            export_labeling_annotation_pack(
+                database, paths, session_id, pack, actor="alice"
+            )
+            checked = pack.read_text(encoding="utf-8").replace(
+                "- [ ] 选择此证据", "- [x] 选择此证据", 2
+            )
+            copied = paths.evaluations / "copied-without-provenance.md"
+            copied.write_text(checked, encoding="utf-8")
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "审计记录"):
+                apply_labeling_annotation_pack(
+                    database, paths, copied, actor="alice"
+                )
+            corrupted = checked.replace(
+                f"### #{second['run_ordinal']} `{second['id']}`",
+                f"### #999999 `{second['id']}`",
+                1,
+            )
+            pack.write_text(corrupted, encoding="utf-8")
+
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "999999"):
+                apply_labeling_annotation_pack(
+                    database, paths, pack, actor="alice"
+                )
+            self.assertEqual(
+                labeling_session_summary(database, session_id)["cases"][0][
+                    "selected_evidence_count"
+                ],
+                0,
+            )
+
+            pack.write_text(checked, encoding="utf-8")
+            applied = apply_labeling_annotation_pack(
+                database, paths, pack, actor="alice"
+            )
+            repeated = apply_labeling_annotation_pack(
+                database, paths, pack, actor="alice"
+            )
+            self.assertEqual(applied["checked_count"], 2)
+            self.assertEqual(applied["added_count"], 2)
+            self.assertEqual(repeated["added_count"], 0)
+            self.assertEqual(repeated["already_selected_count"], 2)
+
+            pack.write_text(
+                checked.replace("- [x] 选择此证据", "- [ ] 选择此证据"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "没有已勾选"):
+                apply_labeling_annotation_pack(
+                    database, paths, pack, actor="alice"
+                )
+            self.assertEqual(
+                labeling_session_summary(database, session_id)["cases"][0][
+                    "selected_evidence_count"
+                ],
+                2,
+            )
+            with database.connect() as connection:
+                events = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_log
+                    WHERE entity_id = ? AND event_type = ?
+                    """,
+                    (session_id, "labeling_annotation_pack_applied"),
+                ).fetchone()[0]
+            self.assertEqual(events, 2)
 
     def test_candidates_are_paginated_from_current_run_and_show_selection(self):
         with tempfile.TemporaryDirectory() as temporary:

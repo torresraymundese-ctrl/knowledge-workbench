@@ -61,6 +61,7 @@ $SessionId = "labels_复制实际会话ID"
 $CaseId = "nas-pilot-001"
 $Reviewer = "reviewer-01"
 .\.venv\Scripts\knowledge.exe label annotation-pack $SessionId .\workspace\evaluations\annotation.md --actor annotator-01
+.\.venv\Scripts\knowledge.exe label apply-annotation-pack .\workspace\evaluations\annotation.md --actor annotator-01
 .\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --limit 20
 .\.venv\Scripts\knowledge.exe label add-ordinals $SessionId $CaseId 22 35 48 --actor annotator-01
 .\.venv\Scripts\knowledge.exe label check $SessionId --strict

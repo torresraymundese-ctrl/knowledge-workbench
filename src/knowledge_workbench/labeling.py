@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from .audit import record_event
@@ -554,6 +555,7 @@ def export_labeling_annotation_pack(
         ).fetchall()
         _ensure_labeling_output_allowed(paths, cases, output, "标注工作包")
         generated_at = utc_now()
+        powershell_output = "'" + str(output).replace("'", "''") + "'"
         lines = [
             "---",
             "type: labeling-annotation-pack",
@@ -568,6 +570,17 @@ def export_labeling_annotation_pack(
             f"- 每个用例最低证据数：`{session['minimum_required_per_case']}`",
             "- 本文件只用于本地人工定位；勾选 Markdown 不会自动修改数据库。",
             "- 选择前必须回到来源文件核对原文、上下文和适用范围。",
+            "",
+            "## 应用已勾选项",
+            "",
+            "保存本文件后运行以下命令。该操作只增量添加勾选项，不会删除未勾选项。",
+            "",
+            "```powershell",
+            (
+                f'.\\.venv\\Scripts\\knowledge.exe --workspace .\\workspace '
+                f"label apply-annotation-pack {powershell_output} --actor {actor}"
+            ),
+            "```",
             "",
         ]
         candidate_count = 0
@@ -623,8 +636,9 @@ def export_labeling_annotation_pack(
                 marker = "x" if row["selected"] else " "
                 lines.extend(
                     [
-                        f"### [{marker}] #{row['run_ordinal']} `{row['id']}`",
+                        f"### #{row['run_ordinal']} `{row['id']}`",
                         "",
+                        f"- [{marker}] 选择此证据",
                         f"- 状态：`{row['status']}`",
                         f"- 定位：`{_markdown_code(row['locator_json'])}`",
                         f"- 解析器：`{row['parser_name']}:{row['parser_version']}`",
@@ -676,6 +690,146 @@ def export_labeling_annotation_pack(
         output.unlink(missing_ok=True)
         raise
     return output
+
+
+def apply_labeling_annotation_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_path: Path,
+    *,
+    actor: str,
+) -> dict:
+    actor = _required_actor(actor)
+    pack_path = pack_path.expanduser().resolve()
+    if pack_path.suffix.lower() != ".md":
+        raise KnowledgeWorkbenchError("标注工作包必须使用 .md 文件")
+    try:
+        pack_path.relative_to(paths.evaluations)
+    except ValueError as exc:
+        raise KnowledgeWorkbenchError(
+            "标注工作包只能从当前 workspace/evaluations 读取"
+        ) from exc
+    try:
+        content = pack_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise KnowledgeWorkbenchError(f"标注工作包不存在：{pack_path}") from exc
+    session_id, checked = _parse_labeling_annotation_pack(content)
+    if not checked:
+        raise KnowledgeWorkbenchError("标注工作包中没有已勾选的证据")
+
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "draft":
+            raise InvalidTransitionError("只有 draft 标注集可以应用标注工作包")
+        if session["created_by"] != actor:
+            raise InvalidTransitionError("只有标注集创建人可以应用标注工作包")
+        provenance_rows = connection.execute(
+            """
+            SELECT details_json FROM audit_log
+            WHERE entity_id = ? AND event_type = ? AND actor = ?
+            """,
+            (session_id, "labeling_annotation_pack_exported", actor),
+        ).fetchall()
+        if not any(
+            json.loads(row["details_json"]).get("output_path") == str(pack_path)
+            for row in provenance_rows
+        ):
+            raise KnowledgeWorkbenchError("标注工作包没有匹配的系统导出审计记录")
+
+        cases = {
+            row["case_id"]: row
+            for row in connection.execute(
+                "SELECT * FROM labeling_cases WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+        validated: dict[str, list[str]] = {}
+        for case_id, items in checked.items():
+            case = cases.get(case_id)
+            if not case:
+                raise KnowledgeWorkbenchError(f"标注工作包包含未知用例：{case_id}")
+            _ensure_case_source_current(connection, case)
+            evidence_ids = []
+            for ordinal, evidence_id in items:
+                evidence = connection.execute(
+                    """
+                    SELECT e.id
+                    FROM evidence e
+                    JOIN processing_runs pr
+                      ON pr.id = e.processing_run_id AND pr.is_current = 1
+                    WHERE e.id = ? AND e.run_ordinal = ?
+                      AND e.document_version_id = ?
+                      AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+                    """,
+                    (evidence_id, ordinal, case["document_version_id"]),
+                ).fetchone()
+                if not evidence:
+                    raise KnowledgeWorkbenchError(
+                        f"用例 {case_id} 的候选 #{ordinal} 与当前证据不匹配："
+                        f"{evidence_id}"
+                    )
+                evidence_ids.append(evidence_id)
+            validated[case_id] = evidence_ids
+
+        added_count = 0
+        already_selected_count = 0
+        selected_details: dict[str, list[str]] = {}
+        for case_id, evidence_ids in validated.items():
+            case = cases[case_id]
+            placeholders = ",".join("?" for _ in evidence_ids)
+            existing = {
+                row["evidence_id"]
+                for row in connection.execute(
+                    f"""
+                    SELECT evidence_id FROM labeling_expected_evidence
+                    WHERE case_row_id = ? AND evidence_id IN ({placeholders})
+                    """,
+                    (case["id"], *evidence_ids),
+                ).fetchall()
+            }
+            added = [value for value in evidence_ids if value not in existing]
+            if added:
+                connection.executemany(
+                    """
+                    INSERT INTO labeling_expected_evidence(
+                        case_row_id, evidence_id, selected_by, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [(case["id"], value, actor, now) for value in added],
+                )
+            added_count += len(added)
+            already_selected_count += len(existing)
+            selected_details[case_id] = evidence_ids
+        if added_count:
+            connection.execute(
+                "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+                (now, session_id),
+            )
+        record_event(
+            connection,
+            "labeling_annotation_pack_applied",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={
+                "pack_path": str(pack_path),
+                "content_sha256": sha256_text(content),
+                "case_count": len(validated),
+                "checked_count": sum(len(values) for values in validated.values()),
+                "added_count": added_count,
+                "already_selected_count": already_selected_count,
+                "evidence_ids_by_case": selected_details,
+                "mode": "additive",
+            },
+        )
+    return {
+        "session_id": session_id,
+        "case_count": len(validated),
+        "checked_count": sum(len(values) for values in validated.values()),
+        "added_count": added_count,
+        "already_selected_count": already_selected_count,
+    }
 
 
 def export_labeling_review_pack(
@@ -1272,6 +1426,75 @@ def _ensure_case_source_current(connection, case) -> None:
         raise KnowledgeWorkbenchError(
             f"标注用例 {case['case_id']} 的来源或处理运行已经过期"
         )
+
+
+def _parse_labeling_annotation_pack(
+    content: str,
+) -> tuple[str, dict[str, list[tuple[int, str]]]]:
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise KnowledgeWorkbenchError("标注工作包缺少 YAML Frontmatter")
+    try:
+        frontmatter_end = next(
+            index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+        )
+    except StopIteration as exc:
+        raise KnowledgeWorkbenchError("标注工作包的 YAML Frontmatter 未闭合") from exc
+    metadata = {}
+    for line in lines[1:frontmatter_end]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            metadata[key.strip()] = value.strip()
+    if metadata.get("type") != "labeling-annotation-pack":
+        raise KnowledgeWorkbenchError("文件不是系统生成的标注工作包")
+    session_id = metadata.get("session_id", "")
+    if not session_id:
+        raise KnowledgeWorkbenchError("标注工作包缺少 session_id")
+
+    case_pattern = re.compile(r"^##\s+(.+?)\s*$")
+    candidate_pattern = re.compile(r"^###\s+#(\d+)\s+`(ev_[A-Za-z0-9]+)`\s*$")
+    legacy_pattern = re.compile(
+        r"^###\s+\[([ xX])\]\s+#(\d+)\s+`(ev_[A-Za-z0-9]+)`\s*$"
+    )
+    task_pattern = re.compile(r"^-\s+\[([ xX])\]\s+选择此证据\s*$")
+    checked: dict[str, list[tuple[int, str]]] = {}
+    seen: set[tuple[str, int, str]] = set()
+    current_case: str | None = None
+    current_candidate: tuple[int, str] | None = None
+
+    def add_checked(ordinal: int, evidence_id: str) -> None:
+        if current_case is None:
+            raise KnowledgeWorkbenchError("已勾选证据出现在用例标题之前")
+        key = (current_case, ordinal, evidence_id)
+        if key in seen:
+            raise KnowledgeWorkbenchError(
+                f"标注工作包包含重复勾选：{current_case} #{ordinal}"
+            )
+        seen.add(key)
+        checked.setdefault(current_case, []).append((ordinal, evidence_id))
+
+    for line in lines[frontmatter_end + 1 :]:
+        case_match = case_pattern.match(line)
+        if case_match:
+            current_case = case_match.group(1)
+            current_candidate = None
+            continue
+        legacy_match = legacy_pattern.match(line)
+        if legacy_match:
+            current_candidate = (int(legacy_match.group(2)), legacy_match.group(3))
+            if legacy_match.group(1).lower() == "x":
+                add_checked(*current_candidate)
+            continue
+        candidate_match = candidate_pattern.match(line)
+        if candidate_match:
+            current_candidate = (int(candidate_match.group(1)), candidate_match.group(2))
+            continue
+        task_match = task_pattern.match(line)
+        if task_match and task_match.group(1).lower() == "x":
+            if current_candidate is None:
+                raise KnowledgeWorkbenchError("已勾选任务缺少对应的候选证据标题")
+            add_checked(*current_candidate)
+    return session_id, checked
 
 
 def _relative_source_path(source: Path, output_parent: Path) -> str:

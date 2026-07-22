@@ -23,6 +23,7 @@ from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
     add_forbidden_substring,
+    apply_labeling_annotation_pack,
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
@@ -372,6 +373,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="每个用例最多输出的候选数；0 表示全部",
     )
+    label_apply_annotation_pack = label_sub.add_parser(
+        "apply-annotation-pack", help="增量应用 Obsidian 工作包中已勾选的证据"
+    )
+    label_apply_annotation_pack.add_argument("pack", type=Path)
+    label_apply_annotation_pack.add_argument("--actor", required=True)
     return parser
 
 
@@ -1300,6 +1306,14 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             limit_per_case=args.limit_per_case,
         )
         print(f"人工标注工作包已导出：{output}")
+    elif command == "apply-annotation-pack":
+        result = apply_labeling_annotation_pack(
+            database,
+            paths,
+            args.pack,
+            actor=args.actor,
+        )
+        _print_mapping(result)
 
 
 def _handle_worker(database, paths: WorkspacePaths, args) -> None:
