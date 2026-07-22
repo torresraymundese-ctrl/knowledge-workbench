@@ -56,10 +56,13 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe evaluate .\evaluation\sample-dataset.json
 .\.venv\Scripts\knowledge.exe labeling-pack .\workspace\evaluations\nas-pilot-v1.template.json --candidates-per-case 20
 .\.venv\Scripts\knowledge.exe label --help
-.\.venv\Scripts\knowledge.exe label candidates <session_id> <case_id> --limit 20
-.\.venv\Scripts\knowledge.exe label check <session_id> --strict
-.\.venv\Scripts\knowledge.exe label review-pack <session_id> .\workspace\evaluations\review.md --actor <reviewer>
-.\.venv\Scripts\knowledge.exe label review-case <session_id> <case_id> approved --actor <reviewer>
+$SessionId = "labels_复制实际会话ID"
+$CaseId = "nas-pilot-001"
+$Reviewer = "reviewer-01"
+.\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --limit 20
+.\.venv\Scripts\knowledge.exe label check $SessionId --strict
+.\.venv\Scripts\knowledge.exe label review-pack $SessionId .\workspace\evaluations\review.md --actor $Reviewer
+.\.venv\Scripts\knowledge.exe label review-case $SessionId $CaseId approved --actor $Reviewer
 .\.venv\Scripts\knowledge.exe task enqueue faithful_pipeline --payload-file .\samples\faithful-task.json
 .\.venv\Scripts\knowledge.exe worker run-once --worker local-worker-1
 ```

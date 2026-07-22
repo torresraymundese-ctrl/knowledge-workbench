@@ -167,6 +167,25 @@ class LabelingWorkflowTests(unittest.TestCase):
             self.assertNotIn(
                 selected_id, {item["id"] for item in remaining["candidates"]}
             )
+            selected = list_labeling_candidates(
+                database,
+                session_id,
+                "case-1",
+                limit=20,
+                only_selected=True,
+            )
+            self.assertEqual(selected["total"], 1)
+            self.assertEqual(selected["candidates"][0]["id"], selected_id)
+            self.assertEqual(selected["candidates"][0]["selected"], 1)
+
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "不能同时指定"):
+                list_labeling_candidates(
+                    database,
+                    session_id,
+                    "case-1",
+                    only_selected=True,
+                    only_unselected=True,
+                )
 
     def test_candidates_refuse_stale_source(self):
         with tempfile.TemporaryDirectory() as temporary:

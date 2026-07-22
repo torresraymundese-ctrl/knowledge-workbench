@@ -324,7 +324,9 @@ def build_parser() -> argparse.ArgumentParser:
     label_candidates.add_argument("case_id")
     label_candidates.add_argument("--limit", type=int, default=20)
     label_candidates.add_argument("--offset", type=int, default=0)
-    label_candidates.add_argument("--only-unselected", action="store_true")
+    candidate_selection = label_candidates.add_mutually_exclusive_group()
+    candidate_selection.add_argument("--only-unselected", action="store_true")
+    candidate_selection.add_argument("--only-selected", action="store_true")
     label_candidates.add_argument(
         "--full", action="store_true", help="显示完整原文；restricted密级始终隐藏"
     )
@@ -1172,6 +1174,7 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             limit=args.limit,
             offset=args.offset,
             only_unselected=args.only_unselected,
+            only_selected=args.only_selected,
         )
         case = result["case"]
         _print_mapping(
@@ -1183,6 +1186,7 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
                 "offset": result["offset"],
                 "returned": len(result["candidates"]),
                 "only_unselected": result["only_unselected"],
+                "only_selected": result["only_selected"],
             }
         )
         for item in result["candidates"]:

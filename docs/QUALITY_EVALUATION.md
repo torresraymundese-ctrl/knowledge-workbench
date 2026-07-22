@@ -47,22 +47,32 @@ Lint 检查 SQLite 外键、只读原始副本及 SHA-256、当前处理运行�
 # 标注人创建空会话；默认每个用例至少选择3条必要证据
 .\.venv\Scripts\knowledge.exe label create .\workspace\evaluations\nas-pilot-v1.template.json --actor "标注人姓名"
 
-# 使用候选包中的 evidence_id 逐条选择
-.\.venv\Scripts\knowledge.exe label candidates <session_id> nas-pilot-001 --limit 20
-.\.venv\Scripts\knowledge.exe label add-evidence <session_id> nas-pilot-001 <evidence_id-1> <evidence_id-2> <evidence_id-3> --actor "标注人姓名"
+# 将创建命令输出的ID复制到这里；不要输入PowerShell保留的尖括号占位符
+$SessionId = "labels_复制实际会话ID"
+$CaseId = "nas-pilot-001"
+$Annotator = "annotator-01"
+$Reviewer = "reviewer-01"
+
+# 使用候选列表中的真实 evidence_id；下面三个 ev_... 必须替换
+.\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --limit 20
+$Evidence1 = "ev_复制第1条实际ID"
+$Evidence2 = "ev_复制第2条实际ID"
+$Evidence3 = "ev_复制第3条实际ID"
+.\.venv\Scripts\knowledge.exe label add-evidence $SessionId $CaseId $Evidence1 $Evidence2 $Evidence3 --actor $Annotator
 
 # 查看进度并提交
-.\.venv\Scripts\knowledge.exe label show <session_id>
-.\.venv\Scripts\knowledge.exe label check <session_id> --strict
-.\.venv\Scripts\knowledge.exe label submit <session_id> --actor "标注人姓名"
+.\.venv\Scripts\knowledge.exe label show $SessionId
+.\.venv\Scripts\knowledge.exe label check $SessionId --strict
+.\.venv\Scripts\knowledge.exe label submit $SessionId --actor $Annotator
 
 # 必须由另一人批准；也可以使用 reject --note 驳回
-.\.venv\Scripts\knowledge.exe label review-pack <session_id> .\workspace\evaluations\nas-pilot-v1.review.md --actor "审核人姓名"
-.\.venv\Scripts\knowledge.exe label review-case <session_id> nas-pilot-001 approved --actor "审核人姓名"
-.\.venv\Scripts\knowledge.exe label approve <session_id> --actor "审核人姓名"
+.\.venv\Scripts\knowledge.exe label review-pack $SessionId .\workspace\evaluations\nas-pilot-v1.review.md --actor $Reviewer
+.\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --only-selected --full
+.\.venv\Scripts\knowledge.exe label review-case $SessionId $CaseId approved --actor $Reviewer
+.\.venv\Scripts\knowledge.exe label approve $SessionId --actor $Reviewer
 
 # 批准后导出到 workspace 内，不允许覆盖已有文件
-.\.venv\Scripts\knowledge.exe label export <session_id> .\workspace\evaluations\nas-pilot-v1.json --actor "审核人姓名"
+.\.venv\Scripts\knowledge.exe label export $SessionId .\workspace\evaluations\nas-pilot-v1.json --actor $Reviewer
 ```
 
 标注会话支持 `list`、`remove-evidence`、`add-forbidden` 和 `remove-forbidden`。冲突、弃用或归档证据不能成为黄金证据；来源文件内容、密级、当前文件版本或当前处理运行变化后，旧会话不能提交、批准或导出。

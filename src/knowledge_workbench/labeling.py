@@ -692,11 +692,14 @@ def list_labeling_candidates(
     limit: int = 20,
     offset: int = 0,
     only_unselected: bool = False,
+    only_selected: bool = False,
 ) -> dict:
     if limit < 1 or limit > 200:
         raise KnowledgeWorkbenchError("候选证据分页大小必须在 1 到 200 之间")
     if offset < 0:
         raise KnowledgeWorkbenchError("候选证据分页偏移不能小于 0")
+    if only_unselected and only_selected:
+        raise KnowledgeWorkbenchError("不能同时指定 only_unselected 和 only_selected")
     with database.connect() as connection:
         session = _get_session(connection, session_id)
         case = connection.execute(
@@ -706,7 +709,12 @@ def list_labeling_candidates(
         if not case:
             raise KnowledgeWorkbenchError(f"标注用例不存在：{case_id}")
         _ensure_case_source_current(connection, case)
-        selection_filter = "AND lee.evidence_id IS NULL" if only_unselected else ""
+        if only_unselected:
+            selection_filter = "AND lee.evidence_id IS NULL"
+        elif only_selected:
+            selection_filter = "AND lee.evidence_id IS NOT NULL"
+        else:
+            selection_filter = ""
         total = connection.execute(
             f"""
             SELECT COUNT(*)
@@ -756,6 +764,7 @@ def list_labeling_candidates(
         "limit": limit,
         "offset": offset,
         "only_unselected": only_unselected,
+        "only_selected": only_selected,
         "candidates": [
             {
                 **dict(row),
