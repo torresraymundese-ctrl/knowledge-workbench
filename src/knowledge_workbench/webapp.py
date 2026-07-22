@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .config import WorkspacePaths
 from .database import Database
 from .errors import KnowledgeWorkbenchError
-from .web_service import WorkbenchReadService
+from .web_service import WorkbenchActionService, WorkbenchReadService
 
 
 ASSET_ROOT = Path(__file__).with_name("web_assets")
@@ -18,6 +19,7 @@ ASSETS = {
     "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
+MAX_REQUEST_BODY = 16 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,13 +30,30 @@ class WebResponse:
 
 
 class WorkbenchWebApplication:
-    def __init__(self, service: WorkbenchReadService):
-        self.service = service
+    def __init__(
+        self,
+        read_service: WorkbenchReadService,
+        action_service: WorkbenchActionService,
+        *,
+        csrf_token: str | None = None,
+    ):
+        self.read_service = read_service
+        self.action_service = action_service
+        self.csrf_token = csrf_token or secrets.token_urlsafe(32)
 
-    def handle(self, method: str, target: str) -> WebResponse:
-        if method not in {"GET", "HEAD"}:
-            return self._json(405, {"error": "首版 Web 工作台仅提供只读访问"})
+    def handle(
+        self,
+        method: str,
+        target: str,
+        *,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> WebResponse:
         parsed = urlsplit(target)
+        if method == "POST":
+            return self._handle_post(parsed.path, body, headers or {})
+        if method not in {"GET", "HEAD"}:
+            return self._json(405, {"error": "Web 工作台不支持该请求方法"})
         if parsed.path in ASSETS:
             filename, content_type = ASSETS[parsed.path]
             try:
@@ -47,16 +66,28 @@ class WorkbenchWebApplication:
             if parsed.path == "/api/v1/health":
                 return self._json(
                     200,
-                    {"status": "ok", "mode": "local-read-only", "api_version": "v1"},
+                    {
+                        "status": "ok",
+                        "mode": "local-controlled-write",
+                        "api_version": "v1",
+                    },
                 )
             if parsed.path == "/api/v1/bootstrap":
-                return self._json(200, self.service.bootstrap())
+                payload = self.read_service.bootstrap()
+                payload["web"] = {
+                    "csrf_token": self.csrf_token,
+                    "write_capabilities": [
+                        "evidence-transition",
+                        "conflict-transition",
+                    ],
+                }
+                return self._json(200, payload)
             if parsed.path == "/api/v1/summary":
-                return self._json(200, self.service.summary())
+                return self._json(200, self.read_service.summary())
             if parsed.path == "/api/v1/documents":
                 return self._json(
                     200,
-                    self.service.documents(
+                    self.read_service.documents(
                         limit=_integer_query(query, "limit", 20),
                         offset=_integer_query(query, "offset", 0),
                     ),
@@ -64,25 +95,91 @@ class WorkbenchWebApplication:
             if parsed.path == "/api/v1/review-queue":
                 return self._json(
                     200,
-                    self.service.review_queue(
+                    self.read_service.review_queue(
                         limit=_integer_query(query, "limit", 20)
                     ),
                 )
             if parsed.path == "/api/v1/evaluations":
                 return self._json(
                     200,
-                    self.service.evaluations(
+                    self.read_service.evaluations(
                         limit=_integer_query(query, "limit", 10)
                     ),
                 )
             if parsed.path == "/api/v1/activity":
                 return self._json(
                     200,
-                    self.service.activity(limit=_integer_query(query, "limit", 20)),
+                    self.read_service.activity(
+                        limit=_integer_query(query, "limit", 20)
+                    ),
                 )
+            evidence_id = _route_entity_id(
+                parsed.path, entity="evidence", action="detail"
+            )
+            if evidence_id is not None:
+                return self._json(
+                    200, self.read_service.evidence_detail(evidence_id)
+                )
+        except PermissionError as exc:
+            return self._json(403, {"error": str(exc)})
+        except KnowledgeWorkbenchError as exc:
+            return self._json(404, {"error": str(exc)})
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
         return self._json(404, {"error": "资源不存在"})
+
+    def _handle_post(
+        self, path: str, body: bytes, headers: dict[str, str]
+    ) -> WebResponse:
+        evidence_id = _route_entity_id(
+            path, entity="evidence", action="transition"
+        )
+        conflict_id = _route_entity_id(
+            path, entity="conflicts", action="transition"
+        )
+        if evidence_id is None and conflict_id is None:
+            return self._json(405, {"error": "该资源不支持 Web 写操作"})
+        normalized_headers = {key.lower(): value for key, value in headers.items()}
+        content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
+        if content_type.strip().lower() != "application/json":
+            return self._json(415, {"error": "写操作只接受 application/json"})
+        supplied_token = normalized_headers.get("x-workbench-csrf", "")
+        if not secrets.compare_digest(supplied_token, self.csrf_token):
+            return self._json(403, {"error": "CSRF 校验失败，请刷新页面后重试"})
+        origin = normalized_headers.get("origin")
+        host = normalized_headers.get("host")
+        if origin and host and origin.rstrip("/") != f"http://{host}":
+            return self._json(403, {"error": "写操作来源不是当前本地工作台"})
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("请求正文必须是 JSON 对象")
+            actor = str(payload.get("actor", ""))
+            target = str(payload.get("target", ""))
+            if evidence_id is not None:
+                result = self.action_service.transition_evidence(
+                    evidence_id, target, actor=actor
+                )
+            else:
+                result = self.action_service.transition_conflict(
+                    conflict_id or "",
+                    target,
+                    actor=actor,
+                    note=(
+                        None
+                        if payload.get("note") is None
+                        else str(payload.get("note"))
+                    ),
+                )
+            return self._json(200, {"ok": True, "result": result})
+        except (UnicodeError, json.JSONDecodeError):
+            return self._json(400, {"error": "请求正文不是有效 UTF-8 JSON"})
+        except PermissionError as exc:
+            return self._json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)})
+        except KnowledgeWorkbenchError as exc:
+            return self._json(409, {"error": str(exc)})
 
     @staticmethod
     def _json(status: int, payload: object) -> WebResponse:
@@ -115,12 +212,40 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
     def _respond(self, *, head_only: bool = False) -> None:
         application = self.server.application  # type: ignore[attr-defined]
-        response = application.handle(self.command, self.path)
+        if not _allowed_host_header(self.headers.get("Host", "")):
+            response = application._json(403, {"error": "Host 不是本地工作台"})
+        else:
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                response = application._json(400, {"error": "Content-Length 无效"})
+            else:
+                if content_length < 0 or content_length > MAX_REQUEST_BODY:
+                    response = application._json(413, {"error": "请求正文过大"})
+                else:
+                    body = self.rfile.read(content_length) if content_length else b""
+                    response = application.handle(
+                        self.command,
+                        self.path,
+                        body=body,
+                        headers={
+                            "Content-Type": self.headers.get("Content-Type", ""),
+                            "X-Workbench-CSRF": self.headers.get(
+                                "X-Workbench-CSRF", ""
+                            ),
+                            "Origin": self.headers.get("Origin", ""),
+                            "Host": self.headers.get("Host", ""),
+                        },
+                    )
         self.send_response(response.status)
         self.send_header("Content-Type", response.content_type)
         self.send_header("Content-Length", str(len(response.body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; object-src 'none'; "
+            "frame-ancestors 'none'; base-uri 'none'",
+        )
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -154,7 +279,9 @@ def build_web_server(
     if port < 0 or port > 65535:
         raise KnowledgeWorkbenchError("Web 端口必须在 0 到 65535 之间")
     service = WorkbenchReadService(database, paths)
-    return WorkbenchHTTPServer((host, port), WorkbenchWebApplication(service))
+    actions = WorkbenchActionService(database)
+    application = WorkbenchWebApplication(service, actions)
+    return WorkbenchHTTPServer((host, port), application)
 
 
 def serve_web(
@@ -167,7 +294,7 @@ def serve_web(
     server = build_web_server(database, paths, host=host, port=port)
     actual_host, actual_port = server.server_address[:2]
     print(f"本地 Web 工作台：http://{actual_host}:{actual_port}")
-    print("当前为只读模式；按 Ctrl+C 停止。")
+    print("当前开放受控证据审核与冲突处理；按 Ctrl+C 停止。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -184,3 +311,26 @@ def _integer_query(query: dict[str, list[str]], name: str, default: int) -> int:
         return int(values[-1])
     except ValueError as exc:
         raise ValueError(f"{name} 必须是整数") from exc
+
+
+def _route_entity_id(path: str, *, entity: str, action: str) -> str | None:
+    parts = path.split("/")
+    if action == "detail":
+        if len(parts) == 5 and parts[1:4] == ["api", "v1", entity]:
+            return unquote(parts[4]) or None
+        return None
+    if (
+        len(parts) == 6
+        and parts[1:4] == ["api", "v1", entity]
+        and parts[5] == action
+    ):
+        return unquote(parts[4]) or None
+    return None
+
+
+def _allowed_host_header(value: str) -> bool:
+    host = value.strip().lower()
+    if not host:
+        return False
+    hostname = host.rsplit(":", 1)[0] if ":" in host else host
+    return hostname in {"127.0.0.1", "localhost"}

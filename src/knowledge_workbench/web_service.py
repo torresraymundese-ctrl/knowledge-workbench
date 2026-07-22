@@ -5,7 +5,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import WorkspacePaths
+from .conflicts import transition_conflict
 from .database import Database
+from .errors import KnowledgeWorkbenchError
+from .models import ConflictStatus, EvidenceStatus
+from .review import transition_evidence
 
 
 class WorkbenchReadService:
@@ -70,7 +74,7 @@ class WorkbenchReadService:
             "active_task_count": active_tasks,
             "needs_revalidation_count": needs_revalidation,
             "approved_labeling_session_count": approved_labeling_sessions,
-            "access_mode": "local-read-only",
+            "access_mode": "local-controlled-write",
         }
 
     def documents(self, *, limit: int = 20, offset: int = 0) -> dict[str, Any]:
@@ -113,6 +117,31 @@ class WorkbenchReadService:
     def review_queue(self, *, limit: int = 20) -> dict[str, Any]:
         limit, _ = _pagination(limit, 0)
         with self.database.connect() as connection:
+            evidence_total = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM evidence e
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                JOIN documents d ON d.current_version_id = pr.document_version_id
+                WHERE e.status IN ('draft', 'reviewing', 'conflicted')
+                """
+            ).fetchone()[0]
+            conflict_total = connection.execute(
+                "SELECT COUNT(*) FROM conflicts WHERE status IN ('pending', 'reviewing')"
+            ).fetchone()[0]
+            revision_total = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM wiki_revisions wr
+                JOIN wiki_pages wp ON wp.id = wr.page_id
+                JOIN documents d ON d.id = wp.source_document_id
+                JOIN processing_runs pr
+                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
+                WHERE wr.status = 'reviewing'
+                  AND d.current_version_id = pr.document_version_id
+                """
+            ).fetchone()[0]
             evidence = connection.execute(
                 """
                 SELECT e.id, e.status, e.run_ordinal, e.locator_json,
@@ -121,8 +150,13 @@ class WorkbenchReadService:
                 JOIN processing_runs pr
                   ON pr.id = e.processing_run_id AND pr.is_current = 1
                 JOIN documents d ON d.current_version_id = pr.document_version_id
-                WHERE e.status IN ('reviewing', 'conflicted')
-                ORDER BY e.updated_at DESC, e.id
+                WHERE e.status IN ('draft', 'reviewing', 'conflicted')
+                ORDER BY CASE e.status
+                             WHEN 'conflicted' THEN 0
+                             WHEN 'reviewing' THEN 1
+                             ELSE 2
+                         END,
+                         e.updated_at DESC, e.id
                 LIMIT ?
                 """,
                 (limit,),
@@ -156,9 +190,43 @@ class WorkbenchReadService:
                 (limit,),
             ).fetchall()
         return {
+            "totals": {
+                "evidence": evidence_total,
+                "conflicts": conflict_total,
+                "wiki_revisions": revision_total,
+            },
             "evidence": [self._evidence_review_projection(row) for row in evidence],
             "conflicts": [self._conflict_projection(row) for row in conflicts],
             "wiki_revisions": [self._revision_projection(row) for row in revisions],
+        }
+
+    def evidence_detail(self, evidence_id: str) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT e.id, e.status, e.run_ordinal, e.excerpt, e.locator_json,
+                       e.updated_at, d.original_name, d.classification
+                FROM evidence e
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                JOIN documents d ON d.current_version_id = pr.document_version_id
+                WHERE e.id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(f"当前原子证据不存在：{evidence_id}")
+        if row["classification"] == "restricted":
+            raise PermissionError("restricted 证据不能通过 Web 查看原文")
+        return {
+            "evidence_id": row["id"],
+            "status": row["status"],
+            "ordinal": row["run_ordinal"],
+            "excerpt": row["excerpt"],
+            "locator": _safe_locator(row["locator_json"]),
+            "document_name": row["original_name"],
+            "classification": row["classification"],
+            "updated_at": row["updated_at"],
         }
 
     def evaluations(self, *, limit: int = 10) -> list[dict[str, Any]]:
@@ -243,12 +311,143 @@ class WorkbenchReadService:
         }
 
 
+class WorkbenchActionService:
+    """Narrow Web adapter that delegates all writes to existing state machines."""
+
+    evidence_targets = frozenset(
+        {
+            EvidenceStatus.DRAFT,
+            EvidenceStatus.REVIEWING,
+            EvidenceStatus.VERIFIED,
+            EvidenceStatus.CONFLICTED,
+        }
+    )
+    conflict_targets = frozenset(
+        {
+            ConflictStatus.REVIEWING,
+            ConflictStatus.RESOLVED,
+            ConflictStatus.DISMISSED,
+        }
+    )
+
+    def __init__(self, database: Database):
+        self.database = database
+
+    def transition_evidence(
+        self, evidence_id: str, target: str, *, actor: str
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        try:
+            target_status = EvidenceStatus(target)
+        except ValueError as exc:
+            raise ValueError(f"Web 不支持证据目标状态：{target}") from exc
+        if target_status not in self.evidence_targets:
+            raise ValueError(f"Web 不支持证据目标状态：{target}")
+        classification = self._current_evidence_classification(evidence_id)
+        if classification == "restricted":
+            raise PermissionError("restricted 证据只能回到原始资料并通过 CLI 审核")
+        transition_evidence(
+            self.database,
+            evidence_id,
+            target_status,
+            actor=actor,
+        )
+        return {
+            "entity_type": "evidence",
+            "entity_id": evidence_id,
+            "status": target_status.value,
+            "actor": actor,
+        }
+
+    def transition_conflict(
+        self,
+        conflict_id: str,
+        target: str,
+        *,
+        actor: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        note = _optional_note(note)
+        try:
+            target_status = ConflictStatus(target)
+        except ValueError as exc:
+            raise ValueError(f"Web 不支持冲突目标状态：{target}") from exc
+        if target_status not in self.conflict_targets:
+            raise ValueError(f"Web 不支持冲突目标状态：{target}")
+        classification = self._conflict_classification(conflict_id)
+        if classification == "restricted":
+            raise PermissionError("restricted 冲突只能回到原始资料并通过 CLI 处理")
+        transition_conflict(
+            self.database,
+            conflict_id,
+            target_status,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "conflict",
+            "entity_id": conflict_id,
+            "status": target_status.value,
+            "actor": actor,
+        }
+
+    def _current_evidence_classification(self, evidence_id: str) -> str:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT d.classification
+                FROM evidence e
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                JOIN documents d ON d.current_version_id = pr.document_version_id
+                WHERE e.id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(f"当前原子证据不存在：{evidence_id}")
+        return row["classification"]
+
+    def _conflict_classification(self, conflict_id: str) -> str:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT d.classification
+                FROM conflicts c JOIN documents d ON d.id = c.document_id
+                WHERE c.id = ?
+                """,
+                (conflict_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(f"冲突不存在：{conflict_id}")
+        return row["classification"]
+
+
 def _pagination(limit: int, offset: int) -> tuple[int, int]:
     if limit < 1 or limit > 200:
         raise ValueError("limit 必须在 1 到 200 之间")
     if offset < 0:
         raise ValueError("offset 不能小于 0")
     return limit, offset
+
+
+def _required_actor(value: str) -> str:
+    actor = value.strip()
+    if not actor:
+        raise ValueError("actor 不能为空")
+    if len(actor) > 80:
+        raise ValueError("actor 不能超过 80 个字符")
+    return actor
+
+
+def _optional_note(value: str | None) -> str | None:
+    if value is None:
+        return None
+    note = value.strip()
+    if len(note) > 2000:
+        raise ValueError("note 不能超过 2000 个字符")
+    return note or None
 
 
 def _safe_locator(raw: str) -> dict[str, Any]:

@@ -111,4 +111,6 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 .\.venv\Scripts\knowledge.exe --workspace workspace web
 ```
 
-然后打开 `http://127.0.0.1:8765/`。当前页面提供工作区总览、当前资料、审核队列、质量评测和脱敏审计动态。服务只允许绑定 `127.0.0.1` 或 `localhost`，不提供写接口，不暴露来源路径、评测集路径、审计详情或证据原文；`restricted` 资料名称和定位也会隐藏。状态流转仍通过既有业务服务和 CLI 完成。
+然后打开 `http://127.0.0.1:8765/`。当前页面提供工作区总览、当前资料、审核队列、质量评测、脱敏审计动态，以及受控的证据审核和冲突处理。服务只允许绑定 `127.0.0.1` 或 `localhost`，不暴露来源路径、评测集路径或审计详情；列表接口不批量返回证据原文，只有明确打开非 `restricted` 证据时才返回单条详情，`restricted` 名称、定位、原文和 Web 写操作始终被阻断。
+
+Web 写操作必须填写 `actor`，使用进程级 CSRF 令牌、同源与 Host 校验，并继续调用既有证据/冲突状态机写入审计日志。Web 层不直接执行状态 SQL，也不修改 Markdown。Wiki 发布和其他高影响写操作尚未开放。

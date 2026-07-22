@@ -24,7 +24,7 @@
       </nav>
       <div class="local-lock">
         <span class="status-dot" aria-hidden="true"></span>
-        <div><strong>本机只读</strong><small>仅监听 127.0.0.1</small></div>
+        <div><strong>本机受控</strong><small>状态机 + 审计日志</small></div>
       </div>
     </aside>
 
@@ -35,6 +35,10 @@
           <h1>证据、审核与知识质量，一处掌握</h1>
         </div>
         <div class="top-actions">
+          <label class="actor-control">
+            <span>操作者</span>
+            <input id="actor" type="text" maxlength="80" placeholder="reviewer-01" autocomplete="off">
+          </label>
           <span id="sync-state" class="sync-state"><span></span>正在读取</span>
           <button id="refresh" type="button">刷新数据</button>
         </div>
@@ -76,7 +80,7 @@
       <section id="reviews" aria-labelledby="reviews-title">
         <div class="section-heading">
           <div><p class="eyebrow">REVIEW QUEUE</p><h2 id="reviews-title">审核队列</h2></div>
-          <p class="muted">首版只读，不在页面内执行状态变更</p>
+          <p class="muted">所有操作复用现有状态机并记录 actor</p>
         </div>
         <div id="review-columns" class="review-grid"></div>
       </section>
@@ -97,9 +101,21 @@
         <div class="panel"><ol id="activity-list" class="timeline"></ol></div>
       </section>
 
-      <footer>知识工作台 · 本地只读里程碑 · SQLite 为状态唯一真相</footer>
+      <footer>知识工作台 · 本机受控审核里程碑 · SQLite 为状态唯一真相</footer>
     </main>
   </div>
+  <dialog id="evidence-dialog" aria-labelledby="evidence-dialog-title">
+    <div class="dialog-shell">
+      <header>
+        <div><p class="eyebrow">EVIDENCE REVIEW</p><h2 id="evidence-dialog-title">审核原子证据</h2></div>
+        <button id="close-evidence-dialog" class="quiet-button" type="button" aria-label="关闭">关闭</button>
+      </header>
+      <div id="evidence-dialog-meta" class="dialog-meta"></div>
+      <blockquote id="evidence-dialog-excerpt"></blockquote>
+      <div class="locator-row"><strong>来源定位</strong><code id="evidence-dialog-locator"></code></div>
+      <div id="evidence-dialog-actions" class="dialog-actions"></div>
+    </div>
+  </dialog>
   <div id="error-banner" class="error-banner" role="alert" hidden></div>
 </body>
 </html>
