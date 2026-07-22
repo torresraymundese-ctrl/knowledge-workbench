@@ -36,6 +36,7 @@ from .labeling import (
     remove_expected_evidence,
     remove_forbidden_substring,
     select_expected_evidence_batch,
+    select_expected_evidence_by_ordinals,
     submit_labeling_session,
 )
 from .models import (
@@ -286,6 +287,13 @@ def build_parser() -> argparse.ArgumentParser:
     label_add.add_argument("case_id")
     label_add.add_argument("evidence_id", nargs="+")
     label_add.add_argument("--actor", required=True)
+    label_add_ordinals = label_sub.add_parser(
+        "add-ordinals", help="按候选列表中的短编号批量选择当前原子证据"
+    )
+    label_add_ordinals.add_argument("session_id")
+    label_add_ordinals.add_argument("case_id")
+    label_add_ordinals.add_argument("ordinal", nargs="+", type=int)
+    label_add_ordinals.add_argument("--actor", required=True)
     label_remove = label_sub.add_parser("remove-evidence", help="移除已选证据")
     label_remove.add_argument("session_id")
     label_remove.add_argument("case_id")
@@ -1101,6 +1109,18 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
         )
         print(
             f"必要证据处理完成：新增 {result['added_count']} 条，"
+            f"已存在 {result['already_selected_count']} 条。"
+        )
+    elif command == "add-ordinals":
+        result = select_expected_evidence_by_ordinals(
+            database,
+            args.session_id,
+            args.case_id,
+            args.ordinal,
+            actor=args.actor,
+        )
+        print(
+            f"候选编号处理完成：新增 {result['added_count']} 条，"
             f"已存在 {result['already_selected_count']} 条。"
         )
     elif command == "remove-evidence":

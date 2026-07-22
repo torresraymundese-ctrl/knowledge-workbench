@@ -200,6 +200,61 @@ def select_expected_evidence_batch(
     }
 
 
+def select_expected_evidence_by_ordinals(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    ordinals: list[int],
+    *,
+    actor: str,
+) -> dict:
+    actor = _required_actor(actor)
+    unique_ordinals = list(dict.fromkeys(ordinals))
+    if not unique_ordinals:
+        raise KnowledgeWorkbenchError("至少需要提供一个候选编号")
+    if any(value < 1 for value in unique_ordinals):
+        raise KnowledgeWorkbenchError("候选编号必须是大于 0 的整数")
+    if len(unique_ordinals) > 100:
+        raise KnowledgeWorkbenchError("单次最多选择 100 个候选编号")
+
+    with database.connect() as connection:
+        _, case = _editable_case(connection, session_id, case_id, actor)
+        _ensure_case_source_current(connection, case)
+        placeholders = ",".join("?" for _ in unique_ordinals)
+        rows = connection.execute(
+            f"""
+            SELECT e.id, e.run_ordinal
+            FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
+            WHERE e.document_version_id = ?
+              AND e.run_ordinal IN ({placeholders})
+              AND e.status NOT IN ('conflicted', 'deprecated', 'archived')
+            """,
+            (case["document_version_id"], *unique_ordinals),
+        ).fetchall()
+    evidence_by_ordinal = {row["run_ordinal"]: row["id"] for row in rows}
+    missing = [value for value in unique_ordinals if value not in evidence_by_ordinal]
+    if missing:
+        raise KnowledgeWorkbenchError(
+            "以下候选编号不属于该用例的当前处理运行："
+            + ", ".join(str(value) for value in missing)
+        )
+
+    result = select_expected_evidence_batch(
+        database,
+        session_id,
+        case_id,
+        [evidence_by_ordinal[value] for value in unique_ordinals],
+        actor=actor,
+    )
+    return {
+        **result,
+        "requested_ordinal_count": len(ordinals),
+        "unique_ordinal_count": len(unique_ordinals),
+    }
+
+
 def remove_expected_evidence(
     database: Database,
     session_id: str,

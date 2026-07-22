@@ -20,6 +20,7 @@ from knowledge_workbench.labeling import (
     review_labeling_case,
     select_expected_evidence,
     select_expected_evidence_batch,
+    select_expected_evidence_by_ordinals,
     submit_labeling_session,
 )
 from knowledge_workbench.linting import lint_workspace
@@ -127,6 +128,54 @@ class LabelingWorkflowTests(unittest.TestCase):
                 ].split(",")
             )
             self.assertNotIn(third, selected_ids)
+
+    def test_selection_by_candidate_ordinals_resolves_current_evidence_atomically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("证据一。\n\n证据二。\n\n证据三。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            candidates = list_labeling_candidates(
+                database, session_id, "case-1", limit=20
+            )["candidates"]
+            ordinals = [candidates[0]["run_ordinal"], candidates[2]["run_ordinal"]]
+
+            result = select_expected_evidence_by_ordinals(
+                database,
+                session_id,
+                "case-1",
+                [ordinals[0], ordinals[1], ordinals[0]],
+                actor="alice",
+            )
+
+            self.assertEqual(result["requested_ordinal_count"], 3)
+            self.assertEqual(result["unique_ordinal_count"], 2)
+            self.assertEqual(result["added_count"], 2)
+            selected_before_failure = labeling_session_summary(
+                database, session_id
+            )["cases"][0]["selected_evidence_count"]
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "999999"):
+                select_expected_evidence_by_ordinals(
+                    database,
+                    session_id,
+                    "case-1",
+                    [candidates[1]["run_ordinal"], 999999],
+                    actor="alice",
+                )
+            self.assertEqual(
+                labeling_session_summary(database, session_id)["cases"][0][
+                    "selected_evidence_count"
+                ],
+                selected_before_failure,
+            )
 
     def test_candidates_are_paginated_from_current_run_and_show_selection(self):
         with tempfile.TemporaryDirectory() as temporary:

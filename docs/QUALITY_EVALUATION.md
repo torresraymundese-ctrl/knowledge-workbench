@@ -53,12 +53,11 @@ $CaseId = "nas-pilot-001"
 $Annotator = "annotator-01"
 $Reviewer = "reviewer-01"
 
-# 使用候选列表中的真实 evidence_id；下面三个 ev_... 必须替换
+# 查看候选并记录列表中显示的 #编号
 .\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --limit 20
-$Evidence1 = "ev_复制第1条实际ID"
-$Evidence2 = "ev_复制第2条实际ID"
-$Evidence3 = "ev_复制第3条实际ID"
-.\.venv\Scripts\knowledge.exe label add-evidence $SessionId $CaseId $Evidence1 $Evidence2 $Evidence3 --actor $Annotator
+$Ordinals = @() # 核对原文后填写，例如 @(22, 35, 48)；空数组不会写入
+if ($Ordinals.Count -lt 3) { throw "请先核对原文并填写至少3个候选编号" }
+.\.venv\Scripts\knowledge.exe label add-ordinals $SessionId $CaseId $Ordinals --actor $Annotator
 
 # 查看进度并提交
 .\.venv\Scripts\knowledge.exe label show $SessionId
@@ -74,6 +73,8 @@ $Evidence3 = "ev_复制第3条实际ID"
 # 批准后导出到 workspace 内，不允许覆盖已有文件
 .\.venv\Scripts\knowledge.exe label export $SessionId .\workspace\evaluations\nas-pilot-v1.json --actor $Reviewer
 ```
+
+`add-ordinals` 只负责把当前处理运行中的短编号安全解析为正式 evidence ID，不会自动判断证据是否重要。编号不存在、资料已更新、处理运行已过期或操作者不是会话创建人时，整批选择都会失败且不会留下部分写入。仍可使用 `add-evidence` 直接提交实际 evidence ID。
 
 标注会话支持 `list`、`remove-evidence`、`add-forbidden` 和 `remove-forbidden`。冲突、弃用或归档证据不能成为黄金证据；来源文件内容、密级、当前文件版本或当前处理运行变化后，旧会话不能提交、批准或导出。
 
