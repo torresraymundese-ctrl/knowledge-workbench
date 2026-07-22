@@ -82,6 +82,36 @@
           <div><p class="eyebrow">REVIEW QUEUE</p><h2 id="reviews-title">审核队列</h2></div>
           <p class="muted">所有操作复用现有状态机并记录 actor</p>
         </div>
+        <form id="review-filters" class="review-toolbar" role="search">
+          <label>
+            <span>搜索</span>
+            <input id="review-query" type="search" maxlength="120" placeholder="资料名、证据 ID 或冲突类型">
+          </label>
+          <label>
+            <span>状态</span>
+            <select id="review-status">
+              <option value="">全部待处理状态</option>
+              <option value="draft">草稿</option>
+              <option value="reviewing">审核中</option>
+              <option value="conflicted">有冲突</option>
+              <option value="pending">待处理</option>
+            </select>
+          </label>
+          <label>
+            <span>密级</span>
+            <select id="review-classification">
+              <option value="">全部密级</option>
+              <option value="public">public</option>
+              <option value="internal">internal</option>
+              <option value="confidential">confidential</option>
+              <option value="restricted">restricted</option>
+            </select>
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">查询</button>
+            <button id="clear-review-filters" type="button">清除</button>
+          </div>
+        </form>
         <div id="review-columns" class="review-grid"></div>
       </section>
 

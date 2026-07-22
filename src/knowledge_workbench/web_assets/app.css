@@ -21,7 +21,7 @@
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { margin: 0; color: var(--ink); background: var(--canvas); }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 
 .shell { min-height: 100vh; display: grid; grid-template-columns: 244px minmax(0, 1fr); }
 .sidebar { position: sticky; top: 0; height: 100vh; padding: 28px 20px; background: var(--navy); color: #eef4f7; display: flex; flex-direction: column; }
@@ -98,6 +98,13 @@ td { padding: 14px 16px; border-top: 1px solid #edf0f2; font-size: 12px; vertica
 .state.warn { color: var(--amber); font-weight: 650; }
 
 .review-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.review-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 170px 160px auto; gap: 10px; align-items: end; margin-bottom: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+.review-toolbar label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
+.review-toolbar input, .review-toolbar select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px; color: var(--ink); background: #fff; outline: none; }
+.review-toolbar input:focus, .review-toolbar select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(22,126,102,.1); }
+.review-toolbar-actions { display: flex; gap: 7px; }
+.review-toolbar-actions button { padding: 8px 11px; box-shadow: none; }
+.review-toolbar-actions .primary-filter { border-color: var(--green); color: #fff; background: var(--green); }
 .review-column { min-height: 190px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); }
 .review-column header { display: flex; justify-content: space-between; margin-bottom: 13px; }
 .review-column header span { color: var(--muted); font-size: 11px; }
@@ -112,6 +119,8 @@ td { padding: 14px 16px; border-top: 1px solid #edf0f2; font-size: 12px; vertica
 .queue-actions button.danger { border-color: #e8c4c4; color: var(--red); background: var(--red-soft); }
 .queue-note { width: 100%; margin-top: 8px; border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; color: var(--ink); background: #fff; font-size: 10px; outline: none; }
 .queue-note:focus { border-color: var(--green); }
+.queue-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 9px; }
+.queue-pagination button { padding: 5px 8px; border-radius: 7px; font-size: 9px; box-shadow: none; }
 .empty { padding: 26px 10px; color: #9ba5ae; text-align: center; font-size: 11px; }
 
 .evaluation-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
@@ -147,6 +156,7 @@ dialog::backdrop { background: rgba(15,28,40,.48); backdrop-filter: blur(2px); }
 @media (max-width: 1050px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .review-grid, .evaluation-grid { grid-template-columns: 1fr 1fr; }
+  .review-toolbar { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 760px) {
   .shell { display: block; }
@@ -160,6 +170,7 @@ dialog::backdrop { background: rgba(15,28,40,.48); backdrop-filter: blur(2px); }
   .topbar, .section-heading { align-items: flex-start; flex-direction: column; }
   .top-actions { width: 100%; justify-content: space-between; }
   .actor-control { align-items: flex-start; flex-direction: column; }
+  .review-toolbar { grid-template-columns: 1fr; }
   .metric-grid, .insight-grid, .review-grid, .evaluation-grid { grid-template-columns: 1fr; }
   .timeline li { grid-template-columns: 1fr; gap: 5px; }
   .timeline .actor { text-align: left; }

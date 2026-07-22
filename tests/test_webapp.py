@@ -14,6 +14,7 @@ from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
 from knowledge_workbench.models import EvidenceStatus
 from knowledge_workbench.review import transition_evidence
+from knowledge_workbench.review import request_revision_review
 from knowledge_workbench.web_service import (
     WorkbenchActionService,
     WorkbenchReadService,
@@ -78,6 +79,130 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(restricted_review["document_name"], "[受限资料]")
             self.assertEqual(restricted_review["locator"], {})
             self.assertEqual(review_queue["totals"]["evidence"], 3)
+
+    def test_review_queue_supports_pagination_filters_and_safe_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "内部审核资料.md"
+            restricted = root / "绝密代号火星.md"
+            internal.write_text("第一条证据。\n\n第二条证据。", encoding="utf-8")
+            restricted.write_text("受限证据。", encoding="utf-8")
+            ingest_file(internal, paths, Classification.INTERNAL)
+            ingest_file(restricted, paths, Classification.RESTRICTED)
+            database = Database(paths.database)
+            with database.connect() as connection:
+                internal_ids = [
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT e.id
+                        FROM evidence e
+                        JOIN processing_runs pr
+                          ON pr.id = e.processing_run_id AND pr.is_current = 1
+                        JOIN documents d ON d.current_version_id = pr.document_version_id
+                        WHERE d.classification = 'internal'
+                        ORDER BY e.run_ordinal
+                        """
+                    ).fetchall()
+                ]
+            transition_evidence(
+                database,
+                internal_ids[0],
+                EvidenceStatus.REVIEWING,
+                actor="reviewer-01",
+            )
+            service = WorkbenchReadService(database, paths)
+
+            first_page = service.review_queue_page(
+                kind="evidence", limit=1, offset=0, classification="internal"
+            )
+            second_page = service.review_queue_page(
+                kind="evidence", limit=1, offset=1, classification="internal"
+            )
+            reviewing = service.review_queue_page(
+                kind="evidence", status="reviewing", query="内部审核"
+            )
+            hidden_name = service.review_queue_page(
+                kind="evidence", query="绝密代号火星"
+            )
+
+            self.assertEqual(first_page["total"], 2)
+            self.assertEqual(len(first_page["items"]), 1)
+            self.assertFalse(first_page["has_previous"])
+            self.assertTrue(first_page["has_next"])
+            self.assertTrue(second_page["has_previous"])
+            self.assertFalse(second_page["has_next"])
+            self.assertEqual(reviewing["total"], 1)
+            self.assertEqual(reviewing["items"][0]["status"], "reviewing")
+            self.assertEqual(hidden_name["total"], 0)
+
+            restricted_by_class = service.review_queue_page(
+                kind="evidence", classification="restricted"
+            )
+            self.assertEqual(restricted_by_class["items"][0]["document_name"], "[受限资料]")
+            self.assertEqual(restricted_by_class["items"][0]["locator"], {})
+
+            application = WorkbenchWebApplication(
+                service,
+                WorkbenchActionService(database),
+                csrf_token="csrf",
+            )
+            response = application.handle(
+                "GET",
+                "/api/v1/review-queue?kind=evidence&limit=1&offset=1&classification=internal",
+            )
+            payload = json.loads(response.body.decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["offset"], 1)
+            self.assertEqual(len(payload["items"]), 1)
+            invalid_kind = application.handle(
+                "GET", "/api/v1/review-queue?kind=unknown"
+            )
+            self.assertEqual(invalid_kind.status, 400)
+            oversized_query = application.handle(
+                "GET", f"/api/v1/review-queue?kind=evidence&q={'x' * 121}"
+            )
+            self.assertEqual(oversized_query.status, 400)
+
+    def test_review_queue_pages_cover_conflicts_and_current_wiki_revisions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            source = root / "审核策略.md"
+            source.write_text("系统允许用户提交申请。", encoding="utf-8")
+            ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            with database.connect() as connection:
+                revision_id = connection.execute(
+                    """
+                    SELECT wr.id
+                    FROM wiki_revisions wr
+                    JOIN processing_runs pr
+                      ON pr.id = wr.processing_run_id AND pr.is_current = 1
+                    LIMIT 1
+                    """
+                ).fetchone()[0]
+            request_revision_review(database, revision_id, actor="reviewer-01")
+            service = WorkbenchReadService(database, paths)
+
+            revisions = service.review_queue_page(
+                kind="wiki_revisions", query="审核策略", status="reviewing"
+            )
+
+            self.assertEqual(revisions["total"], 1)
+            self.assertEqual(revisions["items"][0]["revision_id"], revision_id)
+            self.assertEqual(revisions["items"][0]["status"], "reviewing")
+
+            source.write_text("系统禁止用户提交申请。", encoding="utf-8")
+            ingest_file(source, paths, Classification.INTERNAL)
+            conflicts = service.review_queue_page(
+                kind="conflicts", query="审核策略", status="pending"
+            )
+
+            self.assertEqual(conflicts["total"], 1)
+            self.assertEqual(conflicts["items"][0]["status"], "pending")
+            self.assertEqual(conflicts["items"][0]["document_name"], "审核策略.md")
 
     def test_evaluation_projection_exposes_metrics_without_local_paths(self):
         with tempfile.TemporaryDirectory() as temporary:

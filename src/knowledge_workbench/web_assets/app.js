@@ -5,6 +5,7 @@ const statusLabels = {
   reviewing: "审核中",
   verified: "已验证",
   conflicted: "有冲突",
+  pending: "待处理",
   deprecated: "已弃用",
   archived: "已归档",
 };
@@ -24,6 +25,12 @@ const eventLabels = {
 };
 
 let csrfToken = "";
+const reviewKinds = ["evidence", "conflicts", "wiki_revisions"];
+const reviewState = {
+  limit: 5,
+  offsets: { evidence: 0, conflicts: 0, wiki_revisions: 0 },
+  filters: { query: "", status: "", classification: "" },
+};
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -114,22 +121,39 @@ function renderDocuments(documents) {
   });
 }
 
-function queueColumn(title, items, describe) {
+function queueColumn(title, page, describe) {
+  const items = page.items;
   const column = element("article", "review-column");
   const header = document.createElement("header");
-  header.append(element("h3", "", title), element("span", "", `${items.length} 项`));
+  const rangeStart = page.total ? page.offset + 1 : 0;
+  const rangeEnd = page.offset + items.length;
+  header.append(element("h3", "", title), element("span", "", `${rangeStart}-${rangeEnd}/${page.total} 项`));
   const list = element("div", "queue-list");
   if (!items.length) {
     list.append(element("div", "empty", "当前没有待处理项"));
   } else {
-    items.slice(0, 5).forEach((item) => {
+    items.forEach((item) => {
       const card = element("div", "queue-item");
       const [primary, secondary] = describe(item);
       card.append(element("strong", "", primary), element("small", "", secondary));
       list.append(card);
     });
   }
-  column.append(header, list);
+  const pagination = element("div", "queue-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    reviewState.offsets[page.kind] = Math.max(0, page.offset - page.limit);
+    await refreshReviewQueues();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    reviewState.offsets[page.kind] = page.offset + page.limit;
+    await refreshReviewQueues();
+  });
+  next.disabled = !page.has_next;
+  pagination.append(previous, element("span", "", `第 ${pageNumber}/${pageCount} 页`), next);
+  column.append(header, list, pagination);
   return column;
 }
 
@@ -232,9 +256,8 @@ async function transitionConflict(conflictId, target, label, noteInput) {
 function renderReviews(queue) {
   const columns = document.querySelector("#review-columns");
   const evidenceColumn = queueColumn("原子证据", queue.evidence, (item) => [item.document_name, `${statusLabels[item.status] || item.status} · #${item.ordinal}`]);
-  evidenceColumn.querySelector("header span").textContent = `${Math.min(queue.evidence.length, 5)}/${queue.totals.evidence} 项`;
   evidenceColumn.querySelectorAll(".queue-item").forEach((card, index) => {
-    const item = queue.evidence[index];
+    const item = queue.evidence.items[index];
     if (!item) return;
     const actions = element("div", "queue-actions");
     if (item.classification === "restricted") {
@@ -245,10 +268,9 @@ function renderReviews(queue) {
     card.append(actions);
   });
 
-  const conflictColumn = queueColumn("潜在冲突", queue.conflicts, (item) => [item.document_name, `${item.conflict_type} · ${item.status}`]);
-  conflictColumn.querySelector("header span").textContent = `${Math.min(queue.conflicts.length, 5)}/${queue.totals.conflicts} 项`;
+  const conflictColumn = queueColumn("潜在冲突", queue.conflicts, (item) => [item.document_name, `${item.conflict_type} · ${statusLabels[item.status] || item.status}`]);
   conflictColumn.querySelectorAll(".queue-item").forEach((card, index) => {
-    const item = queue.conflicts[index];
+    const item = queue.conflicts.items[index];
     if (!item) return;
     const note = element("input", "queue-note");
     note.type = "text";
@@ -273,8 +295,35 @@ function renderReviews(queue) {
   });
 
   const wikiColumn = queueColumn("Wiki 修订", queue.wiki_revisions, (item) => [item.page_title, `修订 ${item.revision_number} · ${statusLabels[item.status] || item.status}`]);
-  wikiColumn.querySelector("header span").textContent = `${Math.min(queue.wiki_revisions.length, 5)}/${queue.totals.wiki_revisions} 项`;
   columns.replaceChildren(evidenceColumn, conflictColumn, wikiColumn);
+}
+
+async function fetchReviewPage(kind) {
+  const parameters = new URLSearchParams({
+    kind,
+    limit: String(reviewState.limit),
+    offset: String(reviewState.offsets[kind]),
+  });
+  if (reviewState.filters.query) parameters.set("q", reviewState.filters.query);
+  if (reviewState.filters.status) parameters.set("status", reviewState.filters.status);
+  if (reviewState.filters.classification) parameters.set("classification", reviewState.filters.classification);
+  const response = await fetch(`/api/v1/review-queue?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `审核队列读取失败（HTTP ${response.status}）`);
+  return page;
+}
+
+async function loadReviewQueues() {
+  const pages = await Promise.all(reviewKinds.map(fetchReviewPage));
+  renderReviews(Object.fromEntries(pages.map((page) => [page.kind, page])));
+}
+
+async function refreshReviewQueues() {
+  try {
+    await loadReviewQueues();
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "审核队列读取失败");
+  }
 }
 
 function renderEvaluations(reports) {
@@ -328,7 +377,7 @@ async function loadDashboard() {
     csrfToken = data.web.csrf_token;
     renderSummary(data.summary);
     renderDocuments(data.documents);
-    renderReviews(data.review_queue);
+    await loadReviewQueues();
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -343,6 +392,20 @@ async function loadDashboard() {
 }
 
 document.querySelector("#refresh").addEventListener("click", loadDashboard);
+document.querySelector("#review-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  reviewState.filters.query = document.querySelector("#review-query").value.trim();
+  reviewState.filters.status = document.querySelector("#review-status").value;
+  reviewState.filters.classification = document.querySelector("#review-classification").value;
+  reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
+  await refreshReviewQueues();
+});
+document.querySelector("#clear-review-filters").addEventListener("click", async () => {
+  document.querySelector("#review-filters").reset();
+  reviewState.filters = { query: "", status: "", classification: "" };
+  reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
+  await refreshReviewQueues();
+});
 document.querySelector("#close-evidence-dialog").addEventListener("click", () => document.querySelector("#evidence-dialog").close());
 document.querySelectorAll(".nav-item").forEach((item) => {
   item.addEventListener("click", () => {

@@ -93,6 +93,19 @@ class WorkbenchWebApplication:
                     ),
                 )
             if parsed.path == "/api/v1/review-queue":
+                kind = _string_query(query, "kind")
+                if kind is not None:
+                    return self._json(
+                        200,
+                        self.read_service.review_queue_page(
+                            kind=kind,
+                            limit=_integer_query(query, "limit", 5),
+                            offset=_integer_query(query, "offset", 0),
+                            status=_string_query(query, "status"),
+                            classification=_string_query(query, "classification"),
+                            query=_string_query(query, "q"),
+                        ),
+                    )
                 return self._json(
                     200,
                     self.read_service.review_queue(
@@ -311,6 +324,13 @@ def _integer_query(query: dict[str, list[str]], name: str, default: int) -> int:
         return int(values[-1])
     except ValueError as exc:
         raise ValueError(f"{name} 必须是整数") from exc
+
+
+def _string_query(query: dict[str, list[str]], name: str) -> str | None:
+    values = query.get(name)
+    if not values:
+        return None
+    return values[-1]
 
 
 def _route_entity_id(path: str, *, entity: str, action: str) -> str | None:

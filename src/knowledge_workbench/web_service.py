@@ -200,6 +200,224 @@ class WorkbenchReadService:
             "wiki_revisions": [self._revision_projection(row) for row in revisions],
         }
 
+    def review_queue_page(
+        self,
+        *,
+        kind: str,
+        limit: int = 10,
+        offset: int = 0,
+        status: str | None = None,
+        classification: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one filtered review queue page without exposing restricted metadata."""
+
+        limit, offset = _pagination(limit, offset)
+        kind = _review_kind(kind)
+        status = _review_status(status)
+        classification = _classification_filter(classification)
+        query = _review_query(query)
+        if kind == "evidence":
+            total, rows = self._evidence_review_page(
+                limit=limit,
+                offset=offset,
+                status=status,
+                classification=classification,
+                query=query,
+            )
+            items = [self._evidence_review_projection(row) for row in rows]
+        elif kind == "conflicts":
+            total, rows = self._conflict_review_page(
+                limit=limit,
+                offset=offset,
+                status=status,
+                classification=classification,
+                query=query,
+            )
+            items = [self._conflict_projection(row) for row in rows]
+        else:
+            total, rows = self._revision_review_page(
+                limit=limit,
+                offset=offset,
+                status=status,
+                classification=classification,
+                query=query,
+            )
+            items = [self._revision_projection(row) for row in rows]
+        return {
+            "kind": kind,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_previous": offset > 0,
+            "has_next": offset + len(items) < total,
+            "items": items,
+            "filters": {
+                "status": status,
+                "classification": classification,
+                "query": query,
+            },
+        }
+
+    def _evidence_review_page(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        status: str | None,
+        classification: str | None,
+        query: str | None,
+    ):
+        where = ["e.status IN ('draft', 'reviewing', 'conflicted')"]
+        parameters: list[Any] = []
+        if status:
+            where.append("e.status = ?")
+            parameters.append(status)
+        if classification:
+            where.append("d.classification = ?")
+            parameters.append(classification)
+        if query:
+            where.append(
+                """
+                (instr(lower(e.id), lower(?)) > 0
+                 OR instr(CAST(e.run_ordinal AS TEXT), ?) > 0
+                 OR (d.classification <> 'restricted'
+                     AND instr(lower(d.original_name), lower(?)) > 0))
+                """
+            )
+            parameters.extend((query, query, query))
+        predicate = " AND ".join(where)
+        source = f"""
+            FROM evidence e
+            JOIN processing_runs pr
+              ON pr.id = e.processing_run_id AND pr.is_current = 1
+            JOIN documents d ON d.current_version_id = pr.document_version_id
+            WHERE {predicate}
+        """
+        with self.database.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) {source}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT e.id, e.status, e.run_ordinal, e.locator_json,
+                       d.original_name, d.classification, e.updated_at
+                {source}
+                ORDER BY CASE e.status
+                             WHEN 'conflicted' THEN 0
+                             WHEN 'reviewing' THEN 1
+                             ELSE 2
+                         END,
+                         e.updated_at DESC, e.id
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit, offset),
+            ).fetchall()
+        return total, rows
+
+    def _conflict_review_page(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        status: str | None,
+        classification: str | None,
+        query: str | None,
+    ):
+        where = ["c.status IN ('pending', 'reviewing')"]
+        parameters: list[Any] = []
+        if status:
+            where.append("c.status = ?")
+            parameters.append(status)
+        if classification:
+            where.append("d.classification = ?")
+            parameters.append(classification)
+        if query:
+            where.append(
+                """
+                (instr(lower(c.id), lower(?)) > 0
+                 OR instr(lower(c.conflict_type), lower(?)) > 0
+                 OR (d.classification <> 'restricted'
+                     AND instr(lower(d.original_name), lower(?)) > 0))
+                """
+            )
+            parameters.extend((query, query, query))
+        predicate = " AND ".join(where)
+        source = f"""
+            FROM conflicts c
+            JOIN documents d ON d.id = c.document_id
+            WHERE {predicate}
+        """
+        with self.database.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) {source}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT c.id, c.status, c.conflict_type, c.created_at,
+                       d.original_name, d.classification
+                {source}
+                ORDER BY c.updated_at DESC, c.id
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit, offset),
+            ).fetchall()
+        return total, rows
+
+    def _revision_review_page(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        status: str | None,
+        classification: str | None,
+        query: str | None,
+    ):
+        where = [
+            "wr.status = 'reviewing'",
+            "d.current_version_id = pr.document_version_id",
+        ]
+        parameters: list[Any] = []
+        if status:
+            where.append("wr.status = ?")
+            parameters.append(status)
+        if classification:
+            where.append("d.classification = ?")
+            parameters.append(classification)
+        if query:
+            where.append(
+                """
+                (instr(lower(wr.id), lower(?)) > 0
+                 OR (d.classification <> 'restricted'
+                     AND instr(lower(wp.title), lower(?)) > 0))
+                """
+            )
+            parameters.extend((query, query))
+        predicate = " AND ".join(where)
+        source = f"""
+            FROM wiki_revisions wr
+            JOIN wiki_pages wp ON wp.id = wr.page_id
+            JOIN documents d ON d.id = wp.source_document_id
+            JOIN processing_runs pr
+              ON pr.id = wr.processing_run_id AND pr.is_current = 1
+            WHERE {predicate}
+        """
+        with self.database.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) {source}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT wr.id, wr.status, wr.revision_number, wr.updated_at,
+                       wp.title, d.classification
+                {source}
+                ORDER BY wr.updated_at DESC, wr.id
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit, offset),
+            ).fetchall()
+        return total, rows
+
     def evidence_detail(self, evidence_id: str) -> dict[str, Any]:
         with self.database.connect() as connection:
             row = connection.execute(
@@ -430,6 +648,39 @@ def _pagination(limit: int, offset: int) -> tuple[int, int]:
     if offset < 0:
         raise ValueError("offset 不能小于 0")
     return limit, offset
+
+
+def _review_kind(value: str) -> str:
+    if value not in {"evidence", "conflicts", "wiki_revisions"}:
+        raise ValueError("kind 必须是 evidence、conflicts 或 wiki_revisions")
+    return value
+
+
+def _review_status(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    status = value.strip()
+    if status not in {"draft", "reviewing", "conflicted", "pending"}:
+        raise ValueError("审核队列 status 不受支持")
+    return status
+
+
+def _classification_filter(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    classification = value.strip()
+    if classification not in {"public", "internal", "confidential", "restricted"}:
+        raise ValueError("classification 不受支持")
+    return classification
+
+
+def _review_query(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    query = value.strip()
+    if len(query) > 120:
+        raise ValueError("q 不能超过 120 个字符")
+    return query
 
 
 def _required_actor(value: str) -> str:
