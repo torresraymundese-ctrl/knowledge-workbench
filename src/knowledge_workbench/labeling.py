@@ -336,6 +336,66 @@ def submit_labeling_session(database: Database, session_id: str, *, actor: str) 
         )
 
 
+def review_labeling_case(
+    database: Database,
+    session_id: str,
+    case_id: str,
+    decision: str,
+    *,
+    actor: str,
+    note: str | None = None,
+) -> None:
+    actor = _required_actor(actor)
+    decision = decision.strip().lower()
+    note = (note or "").strip() or None
+    if decision not in {"approved", "rejected"}:
+        raise KnowledgeWorkbenchError("复核决定必须是 approved 或 rejected")
+    if decision == "rejected" and not note:
+        raise KnowledgeWorkbenchError("驳回单个用例必须填写原因")
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "reviewing":
+            raise InvalidTransitionError("只有 reviewing 标注集可以逐项复核")
+        if session["submitted_by"] == actor:
+            raise InvalidTransitionError("复核人必须与提交人不同")
+        case = connection.execute(
+            "SELECT * FROM labeling_cases WHERE session_id = ? AND case_id = ?",
+            (session_id, case_id),
+        ).fetchone()
+        if not case:
+            raise KnowledgeWorkbenchError(f"标注用例不存在：{case_id}")
+        _ensure_case_ready(connection, session, case)
+        connection.execute(
+            """
+            INSERT INTO labeling_case_reviews(
+                case_row_id, reviewer, decision, note, reviewed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(case_row_id) DO UPDATE SET
+                reviewer = excluded.reviewer,
+                decision = excluded.decision,
+                note = excluded.note,
+                reviewed_at = excluded.reviewed_at
+            """,
+            (case["id"], actor, decision, note, now),
+        )
+        connection.execute(
+            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+            (now, session_id),
+        )
+        details = {"case_id": case_id, "decision": decision}
+        if note:
+            details["note_sha256"] = sha256_text(note)
+        record_event(
+            connection,
+            "labeling_case_reviewed",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details=details,
+        )
+
+
 def approve_labeling_session(database: Database, session_id: str, *, actor: str) -> None:
     actor = _required_actor(actor)
     now = utc_now()
@@ -346,6 +406,7 @@ def approve_labeling_session(database: Database, session_id: str, *, actor: str)
         if session["submitted_by"] == actor:
             raise InvalidTransitionError("批准人必须与提交人不同")
         _ensure_session_ready(connection, session)
+        _ensure_case_reviews(connection, session, actor)
         connection.execute(
             """
             UPDATE labeling_sessions
@@ -381,6 +442,15 @@ def reject_labeling_session(
             raise InvalidTransitionError("只有 reviewing 标注集可以驳回")
         if session["submitted_by"] == actor:
             raise InvalidTransitionError("复核人必须与提交人不同")
+        connection.execute(
+            """
+            DELETE FROM labeling_case_reviews
+            WHERE case_row_id IN (
+                SELECT id FROM labeling_cases WHERE session_id = ?
+            )
+            """,
+            (session_id,),
+        )
         connection.execute(
             """
             UPDATE labeling_sessions
@@ -598,10 +668,14 @@ def labeling_session_summary(database: Database, session_id: str) -> dict:
             SELECT lc.case_id, lc.classification,
                    COUNT(DISTINCT lee.evidence_id) AS selected_evidence_count,
                    GROUP_CONCAT(DISTINCT lee.evidence_id) AS selected_evidence_ids,
-                   COUNT(DISTINCT lfs.id) AS forbidden_count
+                   COUNT(DISTINCT lfs.id) AS forbidden_count,
+                   lcr.decision AS review_decision,
+                   lcr.reviewer AS reviewer,
+                   lcr.reviewed_at AS reviewed_at
             FROM labeling_cases lc
             LEFT JOIN labeling_expected_evidence lee ON lee.case_row_id = lc.id
             LEFT JOIN labeling_forbidden_substrings lfs ON lfs.case_row_id = lc.id
+            LEFT JOIN labeling_case_reviews lcr ON lcr.case_row_id = lc.id
             WHERE lc.session_id = ?
             GROUP BY lc.id ORDER BY lc.case_id
             """,
@@ -760,28 +834,73 @@ def labeling_session_readiness(database: Database, session_id: str) -> dict:
                             "message": str(exc),
                         }
                     )
+            review = connection.execute(
+                """
+                SELECT reviewer, decision, reviewed_at
+                FROM labeling_case_reviews WHERE case_row_id = ?
+                """,
+                (case["id"],),
+            ).fetchone()
+            if session["status"] in {"reviewing", "approved"}:
+                if not review:
+                    issues.append(
+                        {
+                            "code": "case_review_missing",
+                            "message": "该用例尚未记录复核决定",
+                        }
+                    )
+                elif review["decision"] != "approved":
+                    issues.append(
+                        {
+                            "code": "case_review_rejected",
+                            "message": "该用例的当前复核决定为 rejected",
+                        }
+                    )
+                elif (
+                    session["status"] == "approved"
+                    and review["reviewer"] != session["approved_by"]
+                ):
+                    issues.append(
+                        {
+                            "code": "case_reviewer_mismatch",
+                            "message": "用例复核人与会话批准人不一致",
+                        }
+                    )
             results.append(
                 {
                     "case_id": case["case_id"],
                     "classification": case["classification"],
                     "selected_evidence_count": len(selected_ids),
                     "minimum_required": session["minimum_required_per_case"],
+                    "review_decision": review["decision"] if review else None,
+                    "reviewer": review["reviewer"] if review else None,
                     "ready": not issues,
                     "issues": issues,
                 }
             )
     ready = all(case["ready"] for case in results)
     status = session["status"]
+    reviewers = {
+        case["reviewer"] for case in results if case["reviewer"] is not None
+    }
+    review_consistent = (
+        len(reviewers) == 1 and session["submitted_by"] not in reviewers
+    )
     return {
         "session_id": session["id"],
         "status": status,
         "ready": ready,
         "case_count": len(results),
         "ready_case_count": sum(case["ready"] for case in results),
+        "reviewed_case_count": sum(
+            case["review_decision"] is not None for case in results
+        ),
+        "review_consistent": review_consistent,
+        "reviewer": next(iter(reviewers)) if len(reviewers) == 1 else None,
         "issue_count": sum(len(case["issues"]) for case in results),
         "can_submit": ready and status == "draft",
-        "can_approve": ready and status == "reviewing",
-        "can_export": ready and status == "approved",
+        "can_approve": ready and status == "reviewing" and review_consistent,
+        "can_export": ready and status == "approved" and review_consistent,
         "cases": results,
     }
 
@@ -790,6 +909,8 @@ def validate_labeling_session_ready(database: Database, session_id: str) -> None
     with database.connect() as connection:
         session = _get_session(connection, session_id)
         _ensure_session_ready(connection, session)
+        if session["status"] == "approved":
+            _ensure_case_reviews(connection, session, session["approved_by"])
 
 
 def _load_template(path: Path) -> dict:
@@ -854,22 +975,57 @@ def _ensure_session_ready(connection, session) -> None:
         (session["id"],),
     ).fetchall()
     for case in cases:
-        _ensure_case_source_current(connection, case)
-        selected = connection.execute(
-            """
-            SELECT lee.evidence_id
-            FROM labeling_expected_evidence lee
-            WHERE lee.case_row_id = ?
-            """,
-            (case["id"],),
-        ).fetchall()
-        if len(selected) < session["minimum_required_per_case"]:
-            raise KnowledgeWorkbenchError(
-                f"标注用例 {case['case_id']} 只有 {len(selected)} 条必要证据，"
-                f"至少需要 {session['minimum_required_per_case']} 条"
-            )
-        for row in selected:
-            _ensure_evidence_is_current_for_case(connection, case, row["evidence_id"])
+        _ensure_case_ready(connection, session, case)
+
+
+def _ensure_case_ready(connection, session, case) -> None:
+    _ensure_case_source_current(connection, case)
+    selected = connection.execute(
+        """
+        SELECT lee.evidence_id
+        FROM labeling_expected_evidence lee
+        WHERE lee.case_row_id = ?
+        """,
+        (case["id"],),
+    ).fetchall()
+    if len(selected) < session["minimum_required_per_case"]:
+        raise KnowledgeWorkbenchError(
+            f"标注用例 {case['case_id']} 只有 {len(selected)} 条必要证据，"
+            f"至少需要 {session['minimum_required_per_case']} 条"
+        )
+    for row in selected:
+        _ensure_evidence_is_current_for_case(connection, case, row["evidence_id"])
+
+
+def _ensure_case_reviews(connection, session, actor: str) -> None:
+    rows = connection.execute(
+        """
+        SELECT lc.case_id, lcr.reviewer, lcr.decision
+        FROM labeling_cases lc
+        LEFT JOIN labeling_case_reviews lcr ON lcr.case_row_id = lc.id
+        WHERE lc.session_id = ? ORDER BY lc.case_id
+        """,
+        (session["id"],),
+    ).fetchall()
+    missing = [row["case_id"] for row in rows if row["decision"] is None]
+    rejected = [row["case_id"] for row in rows if row["decision"] == "rejected"]
+    wrong_reviewer = [
+        row["case_id"]
+        for row in rows
+        if row["decision"] == "approved" and row["reviewer"] != actor
+    ]
+    if missing:
+        raise KnowledgeWorkbenchError(
+            "以下用例尚未逐项复核：" + ", ".join(missing)
+        )
+    if rejected:
+        raise KnowledgeWorkbenchError(
+            "以下用例复核未通过：" + ", ".join(rejected)
+        )
+    if wrong_reviewer:
+        raise KnowledgeWorkbenchError(
+            "批准人必须与所有用例的复核人一致：" + ", ".join(wrong_reviewer)
+        )
 
 
 def _ensure_case_source_current(connection, case) -> None:

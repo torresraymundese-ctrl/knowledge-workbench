@@ -31,6 +31,7 @@ from .labeling import (
     list_labeling_candidates,
     list_labeling_sessions,
     reject_labeling_session,
+    review_labeling_case,
     remove_expected_evidence,
     remove_forbidden_substring,
     select_expected_evidence_batch,
@@ -299,6 +300,14 @@ def build_parser() -> argparse.ArgumentParser:
     label_reject.add_argument("session_id")
     label_reject.add_argument("--actor", required=True)
     label_reject.add_argument("--note", required=True)
+    label_review_case = label_sub.add_parser(
+        "review-case", help="由复核人逐项记录 approved 或 rejected"
+    )
+    label_review_case.add_argument("session_id")
+    label_review_case.add_argument("case_id")
+    label_review_case.add_argument("decision", choices=["approved", "rejected"])
+    label_review_case.add_argument("--actor", required=True)
+    label_review_case.add_argument("--note")
     label_show = label_sub.add_parser("show", help="查看标注集与各用例进度")
     label_show.add_argument("session_id")
     label_check = label_sub.add_parser(
@@ -1100,6 +1109,16 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             note=args.note,
         )
         print("标注集已驳回并返回 draft。")
+    elif command == "review-case":
+        review_labeling_case(
+            database,
+            args.session_id,
+            args.case_id,
+            args.decision,
+            actor=args.actor,
+            note=args.note,
+        )
+        print(f"用例复核决定已记录：{args.decision}。")
     elif command == "show":
         summary = labeling_session_summary(database, args.session_id)
         _print_mapping(summary["session"])
@@ -1107,7 +1126,9 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
             print(
                 f"{case['case_id']} | {case['classification']} | "
                 f"selected={case['selected_evidence_count']} | "
-                f"forbidden={case['forbidden_count']}"
+                f"forbidden={case['forbidden_count']} | "
+                f"review={case['review_decision'] or '-'} | "
+                f"reviewer={case['reviewer'] or '-'}"
             )
             if case["selected_evidence_ids"]:
                 print(f"  evidence: {case['selected_evidence_ids']}")
@@ -1122,6 +1143,11 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
                     f"{readiness['ready_case_count']}/{readiness['case_count']}"
                 ),
                 "issue_count": readiness["issue_count"],
+                "reviewed_cases": (
+                    f"{readiness['reviewed_case_count']}/{readiness['case_count']}"
+                ),
+                "review_consistent": readiness["review_consistent"],
+                "reviewer": readiness["reviewer"],
                 "can_submit": readiness["can_submit"],
                 "can_approve": readiness["can_approve"],
                 "can_export": readiness["can_export"],

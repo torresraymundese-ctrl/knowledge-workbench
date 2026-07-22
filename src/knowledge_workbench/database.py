@@ -337,6 +337,24 @@ CREATE INDEX idx_labeling_expected_evidence
 """
 
 
+MIGRATION_6 = """
+CREATE TABLE labeling_case_reviews (
+    case_row_id TEXT PRIMARY KEY REFERENCES labeling_cases(id) ON DELETE CASCADE,
+    reviewer TEXT NOT NULL CHECK (length(trim(reviewer)) > 0),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    note TEXT,
+    reviewed_at TEXT NOT NULL,
+    CHECK (
+        decision = 'approved'
+        OR (note IS NOT NULL AND length(trim(note)) > 0)
+    )
+);
+
+CREATE INDEX idx_labeling_case_reviews_reviewer
+    ON labeling_case_reviews(reviewer, decision, reviewed_at);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -399,6 +417,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (5, applied_at),
+                )
+                applied.add(5)
+            if 6 not in applied:
+                connection.executescript(MIGRATION_6)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (6, applied_at),
                 )
 
     @contextmanager

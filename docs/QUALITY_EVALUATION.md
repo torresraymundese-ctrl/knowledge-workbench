@@ -58,6 +58,7 @@ Lint 检查 SQLite 外键、只读原始副本及 SHA-256、当前处理运行�
 
 # 必须由另一人批准；也可以使用 reject --note 驳回
 .\.venv\Scripts\knowledge.exe label review-pack <session_id> .\workspace\evaluations\nas-pilot-v1.review.md --actor "审核人姓名"
+.\.venv\Scripts\knowledge.exe label review-case <session_id> nas-pilot-001 approved --actor "审核人姓名"
 .\.venv\Scripts\knowledge.exe label approve <session_id> --actor "审核人姓名"
 
 # 批准后导出到 workspace 内，不允许覆盖已有文件

@@ -17,6 +17,7 @@ from knowledge_workbench.labeling import (
     labeling_session_readiness,
     list_labeling_candidates,
     reject_labeling_session,
+    review_labeling_case,
     select_expected_evidence,
     select_expected_evidence_batch,
     submit_labeling_session,
@@ -246,6 +247,16 @@ class LabelingWorkflowTests(unittest.TestCase):
                 )
             with self.assertRaisesRegex(InvalidTransitionError, "必须与提交人不同"):
                 approve_labeling_session(database, session_id, actor="alice")
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "尚未逐项复核"):
+                approve_labeling_session(database, session_id, actor="bob")
+            review_labeling_case(
+                database,
+                session_id,
+                "case-1",
+                "approved",
+                actor="bob",
+                note="已回源核对",
+            )
             approve_labeling_session(database, session_id, actor="bob")
             output = paths.evaluations / "approved-dataset.json"
             export_labeling_dataset(
@@ -261,6 +272,8 @@ class LabelingWorkflowTests(unittest.TestCase):
             summary = labeling_session_summary(database, session_id)
             self.assertEqual(summary["session"]["status"], "approved")
             self.assertEqual(summary["session"]["approved_by"], "bob")
+            self.assertEqual(summary["cases"][0]["review_decision"], "approved")
+            self.assertEqual(summary["cases"][0]["reviewer"], "bob")
             with database.connect() as connection:
                 events = {
                     row[0]
@@ -271,6 +284,7 @@ class LabelingWorkflowTests(unittest.TestCase):
                 }
             self.assertIn("labeling_session_submitted", events)
             self.assertIn("labeling_review_pack_exported", events)
+            self.assertIn("labeling_case_reviewed", events)
             self.assertIn("labeling_session_approved", events)
             self.assertIn("labeling_dataset_exported", events)
 
@@ -334,6 +348,16 @@ class LabelingWorkflowTests(unittest.TestCase):
                 database, session_id, "case-1", evidence_id, actor="alice"
             )
             submit_labeling_session(database, session_id, actor="alice")
+            review_labeling_case(
+                database,
+                session_id,
+                "case-1",
+                "rejected",
+                actor="bob",
+                note="需要补充定位核对",
+            )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "复核未通过"):
+                approve_labeling_session(database, session_id, actor="bob")
             reject_labeling_session(
                 database,
                 session_id,
@@ -345,6 +369,86 @@ class LabelingWorkflowTests(unittest.TestCase):
                 labeling_session_summary(database, session_id)["session"]["status"],
                 "draft",
             )
+            with database.connect() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM labeling_case_reviews"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_rejected_case_review_requires_note(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("需要复核的事实。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            with database.connect() as connection:
+                evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE document_version_id = ?",
+                    (result.version_id,),
+                ).fetchone()[0]
+            select_expected_evidence(
+                database, session_id, "case-1", evidence_id, actor="alice"
+            )
+            submit_labeling_session(database, session_id, actor="alice")
+
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "必须填写原因"):
+                review_labeling_case(
+                    database,
+                    session_id,
+                    "case-1",
+                    "rejected",
+                    actor="bob",
+                )
+
+    def test_lint_rejects_approved_session_missing_case_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("正式证据。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            session_id = create_labeling_session(
+                database,
+                _write_template(root / "template.json", source),
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            with database.connect() as connection:
+                evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE document_version_id = ?",
+                    (result.version_id,),
+                ).fetchone()[0]
+            select_expected_evidence(
+                database, session_id, "case-1", evidence_id, actor="alice"
+            )
+            submit_labeling_session(database, session_id, actor="alice")
+            review_labeling_case(
+                database, session_id, "case-1", "approved", actor="bob"
+            )
+            approve_labeling_session(database, session_id, actor="bob")
+            with database.transaction() as connection:
+                connection.execute("DELETE FROM labeling_case_reviews")
+
+            report = lint_workspace(database, paths)
+
+            self.assertFalse(report["passed"])
+            issue = next(
+                issue
+                for issue in report["issues"]
+                if issue["code"] == "labeling_session_invalid"
+            )
+            self.assertIn("尚未逐项复核", issue["message"])
 
 
 def _write_template(path: Path, source: Path) -> Path:

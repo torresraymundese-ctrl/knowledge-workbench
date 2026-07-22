@@ -59,6 +59,7 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe label candidates <session_id> <case_id> --limit 20
 .\.venv\Scripts\knowledge.exe label check <session_id> --strict
 .\.venv\Scripts\knowledge.exe label review-pack <session_id> .\workspace\evaluations\review.md --actor <reviewer>
+.\.venv\Scripts\knowledge.exe label review-case <session_id> <case_id> approved --actor <reviewer>
 .\.venv\Scripts\knowledge.exe task enqueue faithful_pipeline --payload-file .\samples\faithful-task.json
 .\.venv\Scripts\knowledge.exe worker run-once --worker local-worker-1
 ```
@@ -79,7 +80,7 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 
 旧版 `.doc` 转换完全在本机完成：Word 以隐藏、只读、禁用宏的方式打开源文件，在临时目录生成 DOCX，解析完成后删除临时文件。原始 `.doc` 的 SHA-256 和只读副本仍是来源真相；每条证据额外保存转换工具、工具版本和临时 DOCX 的 SHA-256。该开关只授权单次命令，不会改变全局默认策略。
 
-黄金标注使用 SQLite Schema v5 状态机，不直接手改正式 JSON：创建者选择当前证据并提交，另一位审核人批准后才能导出。来源文件、密级、当前版本或当前处理运行发生变化时，提交、批准和导出都会被阻断。非公开评测集只能导出到当前 `workspace/` 内，且不会覆盖已有文件。
+黄金标注使用 SQLite Schema v6 状态机，不直接手改正式 JSON：创建者选择当前证据并提交，另一位审核人逐用例记录复核决定，全部通过后才能批准和导出。来源文件、密级、当前版本或当前处理运行发生变化时，提交、复核、批准和导出都会被阻断。非公开评测集只能导出到当前 `workspace/` 内，且不会覆盖已有文件。
 
 ## 资料密级
 
