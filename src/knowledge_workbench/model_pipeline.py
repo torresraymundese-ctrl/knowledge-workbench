@@ -21,18 +21,25 @@ def analyze_with_model(
     allow_internal_cloud_once: bool = False,
 ) -> dict:
     schema = load_schema("analysis-result-v1.json")
-    units = [
-        {"text": unit.text, "locator": unit.locator}
-        for unit in parsed.units
+    source_candidates = FaithfulEvidenceExtractor().extract(parsed)
+    source_evidence = [
+        {
+            "candidate_id": f"E{index:04d}",
+            "excerpt": candidate.excerpt,
+        }
+        for index, candidate in enumerate(source_candidates, start=1)
     ]
     prompt = (
-        "从解析单元提取原子证据。excerpt 必须逐字来自某个 text；不要生成结论。"
-        "locator 统一填写空对象 {}，不要猜测或删改来源定位；系统会在本地按 excerpt "
-        "从 parsed_units 回填 locator 和全部 locators。"
+        "对本地已抽取的原子证据做语义标注；不要生成结论。"
+        "必须完整、同序返回 source_evidence 的每一项；只能使用其中已有的 candidate_id，"
+        "不得遗漏、创建、重排或改写 ID。"
+        "excerpt 必须原样复制对应 source_evidence 的 excerpt，不得增删或改写任何字符；"
+        "系统仍会在本地按 candidate_id 强制覆盖 excerpt、locator 和全部 locators。"
+        "locator 统一填写空对象 {}，不要猜测来源定位。"
         "只返回一个 JSON 对象，包含 evidence 数组，数组元素必须符合所给 Schema 的 $defs.evidenceItem。\n"
-        "prompt_version=analysis-v2-local-locators\n"
+        "prompt_version=analysis-v3-source-anchored\n"
         f"evidence_item_schema={json.dumps(schema['$defs']['evidenceItem'], ensure_ascii=False)}\n"
-        f"parsed_units={json.dumps(units, ensure_ascii=False)}"
+        f"source_evidence={json.dumps(source_evidence, ensure_ascii=False)}"
     )
     content = gateway.generate(
         prompt,
@@ -41,7 +48,6 @@ def analyze_with_model(
         allow_internal_cloud_once=allow_internal_cloud_once,
     )
     model_output = _json_object(content)
-    source_candidates = FaithfulEvidenceExtractor().extract(parsed)
     evidence = _with_source_locators(
         model_output.get("evidence"), source_candidates
     )
@@ -56,7 +62,7 @@ def analyze_with_model(
             "mode": "model_assisted",
             "provider": type(gateway.provider).__name__,
             "model": gateway.provider.name,
-            "prompt_version": "analysis-v2-local-locators",
+            "prompt_version": "analysis-v3-source-anchored",
         },
         "evidence": evidence,
     }
@@ -69,36 +75,39 @@ def _with_source_locators(
 ) -> object:
     if not isinstance(evidence, list):
         return evidence
+    source_by_id = {
+        f"E{index:04d}": candidate
+        for index, candidate in enumerate(source_candidates, start=1)
+    }
+    expected_ids = list(source_by_id)
+    actual_ids = [
+        item.get("candidate_id") if isinstance(item, dict) else None
+        for item in evidence
+    ]
+    unknown_ids = [
+        candidate_id
+        for candidate_id in actual_ids
+        if candidate_id not in source_by_id
+    ]
+    if unknown_ids:
+        raise KnowledgeWorkbenchError(
+            "模型返回了本地证据清单中不存在的 candidate_id："
+            + ", ".join(repr(candidate_id) for candidate_id in unknown_ids)
+        )
+    if actual_ids != expected_ids:
+        raise KnowledgeWorkbenchError("模型证据 ID 必须与本地证据清单完整同序一致")
     hydrated = []
     for raw_item in evidence:
         if not isinstance(raw_item, dict):
             hydrated.append(raw_item)
             continue
         item = deepcopy(raw_item)
-        excerpt = item.get("excerpt")
-        if not isinstance(excerpt, str) or not excerpt:
-            hydrated.append(item)
-            continue
-        locators = []
-        seen = set()
-        for candidate in source_candidates:
-            if excerpt not in candidate.excerpt:
-                continue
-            for source_locator in candidate.locators:
-                locator = deepcopy(source_locator)
-                canonical = json.dumps(
-                    locator,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                if canonical in seen:
-                    continue
-                seen.add(canonical)
-                locators.append(locator)
-        if locators:
-            item["locator"] = locators[0]
-            item["locators"] = locators
+        candidate_id = item.get("candidate_id")
+        candidate = source_by_id[candidate_id]
+        locators = [deepcopy(locator) for locator in candidate.locators]
+        item["excerpt"] = candidate.excerpt
+        item["locator"] = locators[0]
+        item["locators"] = locators
         hydrated.append(item)
     return hydrated
 

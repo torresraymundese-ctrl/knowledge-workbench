@@ -88,19 +88,20 @@ class ModelPipelineTests(unittest.TestCase):
         self.assertEqual(analysis["evidence"][0]["locators"], [expected_locator])
         self.assertEqual(
             analysis["provenance"]["prompt_version"],
-            "analysis-v2-local-locators",
+            "analysis-v3-source-anchored",
         )
         self.assertEqual(len(model.calls), 2)
-        self.assertIn("系统会在本地", model.calls[0])
+        self.assertIn("按 candidate_id 强制覆盖", model.calls[0])
+        self.assertIn('"candidate_id": "E0001"', model.calls[0])
         generation_prompt = model.calls[1]
         self.assertIn("逐字完全相同", generation_prompt)
         self.assertIn("禁止把多条证据综合成新结论", generation_prompt)
         self.assertIn("禁止推断原文未明确陈述", generation_prompt)
         self.assertIn("prompt_version=wiki-generation-v2-extractive", generation_prompt)
 
-    def test_model_cannot_invent_excerpt(self):
+    def test_model_cannot_invent_candidate_id(self):
         evidence = {
-            "candidate_id": "E0001",
+            "candidate_id": "E9999",
             "excerpt": "模型凭空生成的句子。",
             "locator": {},
             "evidence_type": "fact",
@@ -117,12 +118,86 @@ class ModelPipelineTests(unittest.TestCase):
                 WorkspacePaths(Path(temporary) / "workspace")
             )
             gateway = AuditedModelGateway(database, model)
-            with self.assertRaisesRegex(KnowledgeWorkbenchError, "无法回到解析结果"):
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "不存在的 candidate_id"):
                 analyze_with_model(
                     gateway,
                     parsed,
                     document_version_id="ver_abcdef",
                     source_sha256="c" * 64,
+                    classification=Classification.PUBLIC,
+                    actor="tester",
+                )
+
+    def test_model_excerpt_is_replaced_by_source_candidate(self):
+        evidence = {
+            "candidate_id": "E0001",
+            "excerpt": "模型改写后的句子。",
+            "locator": {"invented": True},
+            "evidence_type": "fact",
+            "entities": [],
+            "concepts": [],
+            "projects": [],
+            "applicability": {"scope": None, "valid_from": None, "valid_to": None},
+            "potential_conflicts": [],
+        }
+        source_excerpt = "必须逐字保留的真实原文。"
+        model = ResponseQueueModel(
+            [json.dumps({"evidence": [evidence]}, ensure_ascii=False)]
+        )
+        parsed = ParseResult(
+            "test", "1", (ParsedUnit(source_excerpt, {"paragraph": 3}),)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            database = initialize_workspace(
+                WorkspacePaths(Path(temporary) / "workspace")
+            )
+            analysis = analyze_with_model(
+                AuditedModelGateway(database, model),
+                parsed,
+                document_version_id="ver_abcdef",
+                source_sha256="e" * 64,
+                classification=Classification.PUBLIC,
+                actor="tester",
+            )
+
+        item = analysis["evidence"][0]
+        self.assertEqual(item["excerpt"], source_excerpt)
+        self.assertEqual(item["locator"]["paragraph"], 3)
+        self.assertNotIn("invented", item["locator"])
+
+    def test_model_must_return_every_source_candidate_in_order(self):
+        evidence = {
+            "candidate_id": "E0002",
+            "excerpt": "第二条。",
+            "locator": {},
+            "evidence_type": "fact",
+            "entities": [],
+            "concepts": [],
+            "projects": [],
+            "applicability": {"scope": None, "valid_from": None, "valid_to": None},
+            "potential_conflicts": [],
+        }
+        model = ResponseQueueModel(
+            [json.dumps({"evidence": [evidence]}, ensure_ascii=False)]
+        )
+        parsed = ParseResult(
+            "test",
+            "1",
+            (
+                ParsedUnit("第一条。", {"paragraph": 1}),
+                ParsedUnit("第二条。", {"paragraph": 2}),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            database = initialize_workspace(
+                WorkspacePaths(Path(temporary) / "workspace")
+            )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "完整同序一致"):
+                analyze_with_model(
+                    AuditedModelGateway(database, model),
+                    parsed,
+                    document_version_id="ver_abcdef",
+                    source_sha256="f" * 64,
                     classification=Classification.PUBLIC,
                     actor="tester",
                 )
