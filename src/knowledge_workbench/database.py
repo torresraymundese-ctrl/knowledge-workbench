@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 SCHEMA = """
@@ -355,6 +355,14 @@ CREATE INDEX idx_labeling_case_reviews_reviewer
 """
 
 
+MIGRATION_7 = """
+ALTER TABLE tasks ADD COLUMN lease_owner TEXT;
+
+CREATE INDEX idx_tasks_lease_owner
+    ON tasks(lease_owner, status);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -424,6 +432,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (6, applied_at),
+                )
+                applied.add(6)
+            if 7 not in applied:
+                connection.executescript(MIGRATION_7)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (7, applied_at),
                 )
 
     @contextmanager

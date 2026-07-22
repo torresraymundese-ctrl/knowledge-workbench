@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from knowledge_workbench.database import Database
+from knowledge_workbench.errors import InvalidTransitionError
 from knowledge_workbench.ingest import initialize_workspace
 from knowledge_workbench.models import TaskStatus
 from knowledge_workbench.config import WorkspacePaths
@@ -12,6 +13,7 @@ from knowledge_workbench.tasks import (
     enqueue_task,
     fail_task,
     recover_expired_tasks,
+    renew_task_lease,
 )
 
 
@@ -83,7 +85,63 @@ class TaskQueueTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(status, "retrying")
 
+    def test_task_lease_owner_is_enforced_and_cleared_on_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = WorkspacePaths(Path(temporary) / "workspace")
+            database = initialize_workspace(paths)
+            task_id = enqueue_task(database, "test", {})
+            claim_next_task(database, worker="worker-1", lease_seconds=30)
+            with database.connect() as connection:
+                owner = connection.execute(
+                    "SELECT lease_owner FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()[0]
+            self.assertEqual(owner, "worker-1")
+
+            with self.assertRaisesRegex(InvalidTransitionError, "租约属于 worker-1"):
+                complete_task(database, task_id, {}, worker="worker-2")
+            renewed_until = renew_task_lease(
+                database, task_id, worker="worker-1", lease_seconds=60
+            )
+            self.assertTrue(renewed_until)
+            complete_task(database, task_id, {"ok": True}, worker="worker-1")
+            with database.connect() as connection:
+                row = connection.execute(
+                    "SELECT status, lease_owner, lease_expires_at FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                versions = {
+                    item[0]
+                    for item in connection.execute(
+                        "SELECT version FROM schema_migrations"
+                    ).fetchall()
+                }
+            self.assertEqual(row["status"], "done")
+            self.assertIsNone(row["lease_owner"])
+            self.assertIsNone(row["lease_expires_at"])
+            self.assertIn(7, versions)
+
+    def test_expired_lease_cannot_be_renewed_or_completed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = WorkspacePaths(Path(temporary) / "workspace")
+            database = initialize_workspace(paths)
+            task_id = enqueue_task(database, "test", {})
+            claim_next_task(database, worker="worker-1", lease_seconds=30)
+            with database.transaction() as connection:
+                connection.execute(
+                    "UPDATE tasks SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                    (task_id,),
+                )
+            with self.assertRaisesRegex(InvalidTransitionError, "租约已过期"):
+                renew_task_lease(database, task_id, worker="worker-1")
+            with self.assertRaisesRegex(InvalidTransitionError, "租约已过期"):
+                complete_task(database, task_id, {}, worker="worker-1")
+            self.assertEqual(recover_expired_tasks(database), 1)
+            with database.connect() as connection:
+                owner = connection.execute(
+                    "SELECT lease_owner FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()[0]
+            self.assertIsNone(owner)
+
 
 if __name__ == "__main__":
     unittest.main()
-

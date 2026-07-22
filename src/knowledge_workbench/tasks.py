@@ -67,6 +67,7 @@ def claim_next_task(
     worker: str,
     lease_seconds: int = 300,
 ) -> ClaimedTask | None:
+    worker = _worker_id(worker)
     if lease_seconds < 1:
         raise KnowledgeWorkbenchError("lease_seconds 必须大于 0")
     now = utc_now()
@@ -90,10 +91,10 @@ def claim_next_task(
             """
             UPDATE tasks
             SET status = 'running', attempts = attempts + 1,
-                lease_expires_at = ?, updated_at = ?
+                lease_expires_at = ?, lease_owner = ?, updated_at = ?
             WHERE id = ?
             """,
-            (lease_expires, now, row["id"]),
+            (lease_expires, worker, now, row["id"]),
         )
         record_event(
             connection,
@@ -119,16 +120,16 @@ def complete_task(
     *,
     worker: str,
 ) -> None:
+    worker = _worker_id(worker)
     now = utc_now()
     with database.transaction() as connection:
         row = _task(connection, task_id)
-        if TaskStatus(row["status"]) is not TaskStatus.RUNNING:
-            raise InvalidTransitionError("只有 running 任务可以完成")
+        _ensure_active_lease(row, worker=worker, now=now, action="完成")
         connection.execute(
             """
             UPDATE tasks
             SET status = 'done', result_json = ?, lease_expires_at = NULL,
-                last_error = NULL, updated_at = ?
+                lease_owner = NULL, last_error = NULL, updated_at = ?
             WHERE id = ?
             """,
             (json.dumps(result or {}, ensure_ascii=False, sort_keys=True), now, task_id),
@@ -147,15 +148,15 @@ def fail_task(
     base_delay_seconds: int = 30,
     retryable: bool = True,
 ) -> TaskStatus:
+    worker = _worker_id(worker)
     now = utc_now()
     with database.transaction() as connection:
         row = _task(connection, task_id)
-        if TaskStatus(row["status"]) is not TaskStatus.RUNNING:
-            raise InvalidTransitionError("只有 running 任务可以报告失败")
+        _ensure_active_lease(row, worker=worker, now=now, action="报告失败")
         if retryable and row["attempts"] < row["max_attempts"]:
             target = TaskStatus.RETRYING
             delay = base_delay_seconds * (2 ** max(row["attempts"] - 1, 0))
-            next_attempt_at = _after_seconds(delay)
+            next_attempt_at = now if delay == 0 else _after_seconds(delay)
         else:
             target = TaskStatus.FAILED
             next_attempt_at = None
@@ -163,7 +164,7 @@ def fail_task(
             """
             UPDATE tasks
             SET status = ?, next_attempt_at = ?, lease_expires_at = NULL,
-                last_error = ?, updated_at = ?
+                lease_owner = NULL, last_error = ?, updated_at = ?
             WHERE id = ?
             """,
             (target.value, next_attempt_at, error[:4000], now, task_id),
@@ -189,7 +190,7 @@ def retry_failed_task(database: Database, task_id: str, *, actor: str) -> None:
             """
             UPDATE tasks
             SET status = 'retrying', attempts = 0, next_attempt_at = ?,
-                lease_expires_at = NULL, updated_at = ?
+                lease_expires_at = NULL, lease_owner = NULL, updated_at = ?
             WHERE id = ?
             """,
             (now, now, task_id),
@@ -203,6 +204,32 @@ def recover_expired_tasks(database: Database, *, actor: str = "recovery") -> int
     now = utc_now()
     with database.transaction() as connection:
         return _recover_expired_in_transaction(connection, now, actor=actor)
+
+
+def renew_task_lease(
+    database: Database,
+    task_id: str,
+    *,
+    worker: str,
+    lease_seconds: int = 300,
+) -> str:
+    worker = _worker_id(worker)
+    if lease_seconds < 1:
+        raise KnowledgeWorkbenchError("lease_seconds 必须大于 0")
+    now = utc_now()
+    lease_expires = _after_seconds(lease_seconds)
+    with database.transaction() as connection:
+        row = _task(connection, task_id)
+        _ensure_active_lease(row, worker=worker, now=now, action="续租")
+        connection.execute(
+            """
+            UPDATE tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (lease_expires, now, task_id),
+        )
+    return lease_expires
 
 
 def _recover_expired_in_transaction(connection, now: str, *, actor: str) -> int:
@@ -219,7 +246,7 @@ def _recover_expired_in_transaction(connection, now: str, *, actor: str) -> int:
             """
             UPDATE tasks
             SET status = ?, next_attempt_at = ?, lease_expires_at = NULL,
-                last_error = 'worker lease expired', updated_at = ?
+                lease_owner = NULL, last_error = 'worker lease expired', updated_at = ?
             WHERE id = ?
             """,
             (target, now if target == "retrying" else None, now, row["id"]),
@@ -242,5 +269,29 @@ def _task(connection, task_id: str):
     return row
 
 
+def _worker_id(value: str) -> str:
+    worker = value.strip()
+    if not worker:
+        raise KnowledgeWorkbenchError("worker 不能为空")
+    if len(worker) > 80:
+        raise KnowledgeWorkbenchError("worker 不能超过 80 个字符")
+    return worker
+
+
+def _ensure_active_lease(row, *, worker: str, now: str, action: str) -> None:
+    if TaskStatus(row["status"]) is not TaskStatus.RUNNING:
+        raise InvalidTransitionError(f"只有 running 任务可以{action}")
+    lease_owner = row["lease_owner"]
+    if lease_owner is not None and lease_owner != worker:
+        raise InvalidTransitionError(
+            f"任务租约属于 {lease_owner}，{worker} 不能{action}"
+        )
+    lease_expires_at = row["lease_expires_at"]
+    if lease_expires_at is not None and lease_expires_at <= now:
+        raise InvalidTransitionError(f"任务租约已过期，不能{action}")
+
+
 def _after_seconds(seconds: int) -> str:
-    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(
+        timespec="microseconds"
+    )

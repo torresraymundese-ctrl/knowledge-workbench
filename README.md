@@ -73,6 +73,8 @@ $Reviewer = "reviewer-01"
 .\.venv\Scripts\knowledge.exe label review-case $SessionId $CaseId approved --actor $Reviewer
 .\.venv\Scripts\knowledge.exe task enqueue faithful_pipeline --payload-file .\samples\faithful-task.json
 .\.venv\Scripts\knowledge.exe worker run-once --worker local-worker-1
+.\.venv\Scripts\knowledge.exe worker run --worker local-worker-1
+.\.venv\Scripts\knowledge.exe worker run --worker local-worker-1 --stop-when-idle
 ```
 
 DeepSeek 是可选增强。只有配置 `DEEPSEEK_API_KEY` 后才能显式运行 `--mode deepseek`；`internal` 资料还必须增加 `--allow-internal-cloud-once`。`confidential` 和 `restricted` 资料始终禁止云调用。项目禁止使用 `qwen2.5:7b-instruct`。
@@ -92,6 +94,8 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 旧版 `.doc` 转换完全在本机完成：Word 以隐藏、只读、禁用宏的方式打开源文件，在临时目录生成 DOCX，解析完成后删除临时文件。原始 `.doc` 的 SHA-256 和只读副本仍是来源真相；每条证据额外保存转换工具、工具版本和临时 DOCX 的 SHA-256。该开关只授权单次命令，不会改变全局默认策略。
 
 黄金标注使用 SQLite Schema v6 状态机，不直接手改正式 JSON：创建者选择当前证据并提交，另一位审核人逐用例记录复核决定，全部通过后才能批准和导出。来源文件、密级、当前版本或当前处理运行发生变化时，提交、复核、批准和导出都会被阻断。非公开评测集只能导出到当前 `workspace/` 内，且不会覆盖已有文件。
+
+持续后台工作器使用 SQLite Schema v7 租约所有权：领取任务时写入 `lease_owner`，只有该工作器能续租、完成或报告失败；长任务由独立心跳延长租期，租约过期后原工作器不能再提交结果。`worker run` 在队列为空时从 `--poll-seconds` 指数退避到 `--max-poll-seconds`，收到 `Ctrl+C` 或终止信号后等待当前任务结束再退出，并把启动、停止原因和处理统计写入审计。`--stop-when-idle` 用于排空当前队列后退出，`--max-tasks` 可限制单次处理数量。当前可信处理器仍只有 `faithful_pipeline`，未知任务类型会直接进入 `failed`，不会浪费重试次数。
 
 ## 资料密级
 

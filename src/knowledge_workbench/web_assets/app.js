@@ -20,6 +20,8 @@ const eventLabels = {
   wiki_revision_published: "Wiki 修订已发布",
   potential_conflict_queued: "发现潜在冲突",
   conflict_status_changed: "冲突状态已变更",
+  worker_started: "后台工作器已启动",
+  worker_stopped: "后台工作器已停止",
   labeling_session_created: "黄金标注已创建",
   labeling_session_approved: "黄金标注已批准",
   labeling_dataset_exported: "黄金评测集已导出",

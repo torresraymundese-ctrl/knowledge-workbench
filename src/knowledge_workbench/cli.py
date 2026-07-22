@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import signal
 import shutil
 import sqlite3
 import statistics
@@ -10,7 +11,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import asdict
 from pathlib import Path
+from threading import Event
 from typing import Sequence
 
 import numpy as np
@@ -76,7 +79,7 @@ from .tasks import (
 from .utils import sha256_file
 from .wiki import write_text_atomic
 from .wiki_links import add_wiki_link, remove_wiki_link
-from .worker import run_once
+from .worker import WorkerRunResult, run_forever, run_once
 from .webapp import serve_web
 from .embeddings import OllamaEmbeddingClient
 from .vector_store import (
@@ -251,6 +254,21 @@ def build_parser() -> argparse.ArgumentParser:
     worker_once = worker_sub.add_parser("run-once", help="领取并执行一个任务后退出")
     worker_once.add_argument("--worker", required=True)
     worker_once.add_argument("--lease-seconds", type=int, default=300)
+    worker_run = worker_sub.add_parser("run", help="持续领取任务，收到停止信号后优雅退出")
+    worker_run.add_argument("--worker", required=True)
+    worker_run.add_argument("--lease-seconds", type=int, default=300)
+    worker_run.add_argument("--poll-seconds", type=float, default=1.0)
+    worker_run.add_argument("--max-poll-seconds", type=float, default=10.0)
+    worker_run.add_argument(
+        "--stop-when-idle",
+        action="store_true",
+        help="队列首次为空时退出，可用于排空任务",
+    )
+    worker_run.add_argument(
+        "--max-tasks",
+        type=int,
+        help="本次最多处理的任务数；默认持续运行",
+    )
 
     conflict = subparsers.add_parser("conflict", help="查看和处理潜在证据冲突")
     conflict_sub = conflict.add_subparsers(dest="conflict_command", required=True)
@@ -1375,6 +1393,42 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
 
 
 def _handle_worker(database, paths: WorkspacePaths, args) -> None:
+    if args.worker_command == "run":
+        stop_event = Event()
+
+        def request_stop(_signum, _frame) -> None:
+            stop_event.set()
+
+        handled_signals = [signal.SIGINT]
+        if hasattr(signal, "SIGTERM"):
+            handled_signals.append(signal.SIGTERM)
+        previous_handlers = {
+            handled_signal: signal.getsignal(handled_signal)
+            for handled_signal in handled_signals
+        }
+        for handled_signal in handled_signals:
+            signal.signal(handled_signal, request_stop)
+        print(
+            f"工作器 {args.worker} 已启动；按 Ctrl+C 将在当前任务完成后停止。"
+        )
+        try:
+            service_result = run_forever(
+                database,
+                paths,
+                worker_id=args.worker,
+                lease_seconds=args.lease_seconds,
+                poll_seconds=args.poll_seconds,
+                max_poll_seconds=args.max_poll_seconds,
+                stop_event=stop_event,
+                stop_when_idle=args.stop_when_idle,
+                max_tasks=args.max_tasks,
+                on_result=_print_worker_run_result,
+            )
+        finally:
+            for handled_signal, previous_handler in previous_handlers.items():
+                signal.signal(handled_signal, previous_handler)
+        print(json.dumps(asdict(service_result), ensure_ascii=False, indent=2))
+        return
     result = run_once(
         database,
         paths,
@@ -1383,6 +1437,12 @@ def _handle_worker(database, paths: WorkspacePaths, args) -> None:
     )
     if result.task_id is None:
         print(result.message)
+        return
+    _print_worker_run_result(result)
+
+
+def _print_worker_run_result(result: WorkerRunResult) -> None:
+    if result.task_id is None:
         return
     print(
         f"{result.task_id} {result.task_type} "
