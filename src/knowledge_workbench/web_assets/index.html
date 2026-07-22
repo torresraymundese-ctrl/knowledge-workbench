@@ -19,8 +19,9 @@
         <a class="nav-item active" href="#overview"><span>总览</span><kbd>1</kbd></a>
         <a class="nav-item" href="#documents"><span>资料</span><kbd>2</kbd></a>
         <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
-        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>4</kbd></a>
-        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>5</kbd></a>
+        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>4</kbd></a>
+        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>5</kbd></a>
+        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>6</kbd></a>
       </nav>
       <div class="local-lock">
         <span class="status-dot" aria-hidden="true"></span>
@@ -139,6 +140,42 @@
           <span id="rejected-history-count" class="count-pill">—</span>
         </div>
         <div id="rejected-history" class="rejected-history panel"></div>
+      </section>
+
+      <section id="conflict-labeling" aria-labelledby="conflict-labeling-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">CROSS-DOCUMENT CONFLICTS</p><h2 id="conflict-labeling-title">跨文档冲突标注</h2></div>
+          <span id="candidate-pack-count" class="count-pill">—</span>
+        </div>
+        <form id="candidate-filters" class="candidate-toolbar" role="search">
+          <label>
+            <span>候选包</span>
+            <select id="candidate-pack"></select>
+          </label>
+          <label>
+            <span>状态</span>
+            <select id="candidate-state">
+              <option value="all">全部候选</option>
+              <option value="unlabeled">未标注</option>
+              <option value="labeled">已标注</option>
+              <option value="unreviewed">未复核</option>
+              <option value="approved">复核通过</option>
+              <option value="rejected">复核驳回</option>
+              <option value="disagreement">与规则预测不一致</option>
+            </select>
+          </label>
+          <label>
+            <span>搜索</span>
+            <input id="candidate-query" type="search" maxlength="120" placeholder="候选 ID、资料名、证据 ID 或原文">
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">查询</button>
+            <button id="clear-candidate-filters" type="button">清除</button>
+          </div>
+        </form>
+        <div id="candidate-pack-summary" class="candidate-pack-summary panel"></div>
+        <div id="candidate-list" class="candidate-list" aria-live="polite"></div>
+        <div id="candidate-pagination" class="candidate-pagination panel"></div>
       </section>
 
       <section id="quality" aria-labelledby="quality-title">

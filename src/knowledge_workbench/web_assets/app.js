@@ -22,6 +22,8 @@ const eventLabels = {
   conflict_status_changed: "冲突状态已变更",
   conflict_candidate_pack_created: "跨文档冲突候选包已生成",
   conflict_candidate_annotations_submitted: "跨文档冲突标签已提交",
+  conflict_candidate_label_updated: "跨文档冲突标签已更新",
+  conflict_candidate_review_updated: "跨文档冲突复核已更新",
   conflict_dataset_finalized: "跨文档冲突数据集已固化",
   worker_started: "后台工作器已启动",
   worker_stopped: "后台工作器已停止",
@@ -42,6 +44,20 @@ const reviewState = {
     classification: "",
     statuses: { evidence: "", conflicts: "", wiki_revisions: "" },
   },
+};
+const candidateState = {
+  limit: 10,
+  offset: 0,
+  packId: "",
+  state: "all",
+  query: "",
+  contentSha256: "",
+};
+const candidatePhaseLabels = {
+  labeling: "标注中",
+  reviewing: "复核中",
+  reviewed: "复核完成",
+  invalid: "完整性异常",
 };
 
 function element(tag, className, text) {
@@ -533,6 +549,243 @@ async function refreshReviewQueues() {
   }
 }
 
+function candidateSide(side, label) {
+  const root = element("section", "candidate-side");
+  const heading = element("div", "candidate-side-heading");
+  heading.append(
+    element("strong", "", `${label} · ${side.document_name}`),
+    element("code", "", shortId(side.evidence_id)),
+  );
+  const excerpt = element("pre", "candidate-excerpt", side.excerpt);
+  const locator = element("small", "candidate-locator", JSON.stringify(side.locators));
+  root.append(heading, excerpt, locator);
+  return root;
+}
+
+async function saveCandidateLabel(candidate, conflictSelect, typeSelect, noteInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  if (!conflictSelect.value) {
+    showBanner("请选择冲突或非冲突");
+    conflictSelect.focus();
+    return;
+  }
+  const expectedConflict = conflictSelect.value === "true";
+  const expectedType = expectedConflict ? typeSelect.value || null : null;
+  if (expectedConflict && !expectedType) {
+    showBanner("标记为冲突时必须选择冲突类型");
+    typeSelect.focus();
+    return;
+  }
+  try {
+    await postTransition(`/api/v1/conflict-candidate-packs/${encodeURIComponent(candidateState.packId)}/label`, {
+      actor,
+      candidate_id: candidate.candidate_id,
+      expected_content_sha256: candidateState.contentSha256,
+      expected_conflict: expectedConflict,
+      expected_type: expectedType,
+      note: noteInput.value.trim() || null,
+    });
+    await loadCandidatePage();
+    showBanner(`候选标签已保存，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "候选标签保存失败");
+  }
+}
+
+async function saveCandidateReview(candidate, decisionSelect, noteInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const decision = decisionSelect.value;
+  if (!decision) {
+    showBanner("请选择复核通过或驳回");
+    decisionSelect.focus();
+    return;
+  }
+  const note = noteInput.value.trim();
+  if (decision === "rejected" && !note) {
+    showBanner("驳回复核必须填写意见");
+    noteInput.focus();
+    return;
+  }
+  try {
+    await postTransition(`/api/v1/conflict-candidate-packs/${encodeURIComponent(candidateState.packId)}/review`, {
+      actor,
+      candidate_id: candidate.candidate_id,
+      expected_content_sha256: candidateState.contentSha256,
+      decision,
+      note: note || null,
+    });
+    await loadCandidatePage();
+    showBanner(`候选复核已保存，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "候选复核保存失败");
+  }
+}
+
+async function submitCandidatePack(page) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  if (!window.confirm(`确认提交全部 ${page.counts.total} 条标签？提交后标签将锁定，并以 ${actor} 写入审计日志。`)) return;
+  try {
+    await postTransition(`/api/v1/conflict-candidate-packs/${encodeURIComponent(page.pack_id)}/submit`, {
+      actor,
+      expected_content_sha256: page.content_sha256,
+    });
+    await loadCandidatePacks();
+    showBanner(`候选标签已提交复核，标注人：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "候选标签提交失败");
+  }
+}
+
+function renderCandidatePage(page) {
+  candidateState.contentSha256 = page.content_sha256;
+  const summary = document.querySelector("#candidate-pack-summary");
+  const metadata = element("div", "candidate-summary-metadata");
+  metadata.append(
+    element("strong", "", candidatePhaseLabels[page.phase] || page.phase),
+    element("span", "", `${page.counts.labeled}/${page.counts.total} 已标注 · ${page.counts.approved} 通过 · ${page.counts.rejected} 驳回`),
+    element("small", "", `生成者 ${page.generated_by} · 相似度阈值 ${page.minimum_similarity}${page.annotator ? ` · 标注人 ${page.annotator}` : ""}`),
+  );
+  const controls = element("div", "candidate-summary-actions");
+  if (page.phase === "labeling") {
+    const submit = button("提交整包复核", "primary", () => submitCandidatePack(page));
+    submit.disabled = page.counts.labeled !== page.counts.total || page.statistics.truncated;
+    controls.append(submit);
+    if (page.statistics.truncated) controls.append(element("small", "", "截断候选包不能作为完整基线提交"));
+  } else if (page.phase === "reviewed") {
+    controls.append(element("small", "", "全部复核通过，可使用 CLI 固化评测数据集"));
+  } else {
+    controls.append(element("small", "", "标签已锁定，复核人必须与标注人不同"));
+  }
+  summary.replaceChildren(metadata, controls);
+
+  const list = document.querySelector("#candidate-list");
+  list.replaceChildren();
+  if (!page.items.length) {
+    list.append(element("div", "panel empty", "当前筛选没有候选项"));
+  }
+  page.items.forEach((candidate) => {
+    const card = element("article", "candidate-card panel");
+    const header = element("header", "candidate-card-heading");
+    const prediction = candidate.predicted_conflict
+      ? `规则预测：${candidate.predicted_type}`
+      : "规则预测：非冲突";
+    header.append(
+      element("div", "", candidate.candidate_id),
+      element("span", "tag", `${prediction} · ${Math.round(candidate.similarity * 100)}%`),
+    );
+    const comparison = element("div", "candidate-comparison");
+    comparison.append(candidateSide(candidate.left, "左侧"), candidateSide(candidate.right, "右侧"));
+    const form = element("div", "candidate-decision");
+    if (page.phase === "labeling") {
+      const conflict = element("select");
+      [["", "请选择人工标签"], ["true", "冲突"], ["false", "非冲突"]].forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        conflict.append(option);
+      });
+      conflict.value = candidate.label.expected_conflict === null ? "" : String(candidate.label.expected_conflict);
+      const type = element("select");
+      [["", "选择冲突类型"], ["polarity_change", "polarity_change"], ["value_change", "value_change"]].forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        type.append(option);
+      });
+      type.value = candidate.label.expected_type || "";
+      type.disabled = conflict.value !== "true";
+      conflict.addEventListener("change", () => {
+        type.disabled = conflict.value !== "true";
+        if (type.disabled) type.value = "";
+      });
+      const note = element("textarea");
+      note.maxLength = 2000;
+      note.rows = 2;
+      note.placeholder = "标注依据（可选）";
+      note.value = candidate.label.note || "";
+      form.append(conflict, type, note, button("保存标签", "primary", () => saveCandidateLabel(candidate, conflict, type, note)));
+    } else {
+      const labelText = candidate.label.expected_conflict
+        ? `人工标签：${candidate.label.expected_type}`
+        : "人工标签：非冲突";
+      form.append(element("strong", "candidate-human-label", labelText));
+      const decision = element("select");
+      [["", "请选择复核决定"], ["approved", "复核通过"], ["rejected", "复核驳回"]].forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        decision.append(option);
+      });
+      decision.value = candidate.review.decision || "";
+      const note = element("textarea");
+      note.maxLength = 2000;
+      note.rows = 2;
+      note.placeholder = "复核意见（驳回时必填）";
+      note.value = candidate.review.note || "";
+      form.append(decision, note, button("保存复核", "primary", () => saveCandidateReview(candidate, decision, note)));
+    }
+    card.append(header, comparison, form);
+    list.append(card);
+  });
+
+  const pagination = document.querySelector("#candidate-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    candidateState.offset = Math.max(0, page.offset - page.limit);
+    await loadCandidatePage();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    candidateState.offset = page.offset + page.limit;
+    await loadCandidatePage();
+  });
+  next.disabled = !page.has_next;
+  pagination.replaceChildren(previous, element("span", "", `第 ${pageNumber}/${pageCount} 页 · ${page.total} 项`), next);
+}
+
+async function loadCandidatePage() {
+  if (!candidateState.packId) return;
+  const parameters = new URLSearchParams({
+    limit: String(candidateState.limit),
+    offset: String(candidateState.offset),
+    state: candidateState.state,
+  });
+  if (candidateState.query) parameters.set("q", candidateState.query);
+  const response = await fetch(`/api/v1/conflict-candidate-packs/${encodeURIComponent(candidateState.packId)}?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `候选包读取失败（HTTP ${response.status}）`);
+  renderCandidatePage(page);
+}
+
+async function loadCandidatePacks() {
+  const response = await fetch("/api/v1/conflict-candidate-packs", { headers: { Accept: "application/json" } });
+  const listing = await response.json();
+  if (!response.ok) throw new Error(listing.error || `候选包列表读取失败（HTTP ${response.status}）`);
+  document.querySelector("#candidate-pack-count").textContent = listing.invalid_count
+    ? `${listing.total} 个候选包 · ${listing.invalid_count} 个校验失败`
+    : `${listing.total} 个候选包`;
+  const selector = document.querySelector("#candidate-pack");
+  const previous = candidateState.packId;
+  selector.replaceChildren();
+  listing.items.forEach((item) => {
+    const option = element("option", "", `${shortId(item.pack_id)} · ${candidatePhaseLabels[item.phase] || item.phase} · ${item.counts.labeled}/${item.counts.total}`);
+    option.value = item.pack_id;
+    selector.append(option);
+  });
+  candidateState.packId = listing.items.some((item) => item.pack_id === previous)
+    ? previous
+    : listing.items[0]?.pack_id || "";
+  selector.value = candidateState.packId;
+  if (!candidateState.packId) {
+    document.querySelector("#candidate-pack-summary").replaceChildren(element("div", "empty", "尚无有效跨文档冲突候选包"));
+    document.querySelector("#candidate-list").replaceChildren();
+    document.querySelector("#candidate-pagination").replaceChildren();
+    return;
+  }
+  await loadCandidatePage();
+}
+
 function renderEvaluations(reports) {
   const root = document.querySelector("#evaluations");
   root.replaceChildren();
@@ -584,7 +837,16 @@ async function loadDashboard() {
     csrfToken = data.web.csrf_token;
     renderSummary(data.summary);
     renderDocuments(data.documents);
-    await loadReviewQueues();
+    const candidateLoad = loadCandidatePacks().catch((cause) => {
+      const message = cause instanceof Error ? cause.message : "候选包读取失败";
+      document.querySelector("#candidate-pack-summary").replaceChildren(
+        element("div", "empty", message),
+      );
+      document.querySelector("#candidate-list").replaceChildren();
+      document.querySelector("#candidate-pagination").replaceChildren();
+      showBanner(message);
+    });
+    await Promise.all([loadReviewQueues(), candidateLoad]);
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -622,6 +884,33 @@ document.querySelector("#clear-review-filters").addEventListener("click", async 
   reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
   reviewState.historyOffset = 0;
   await refreshReviewQueues();
+});
+document.querySelector("#candidate-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  candidateState.packId = document.querySelector("#candidate-pack").value;
+  candidateState.state = document.querySelector("#candidate-state").value;
+  candidateState.query = document.querySelector("#candidate-query").value.trim();
+  candidateState.offset = 0;
+  try { await loadCandidatePage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "候选包读取失败");
+  }
+});
+document.querySelector("#candidate-pack").addEventListener("change", async (event) => {
+  candidateState.packId = event.target.value;
+  candidateState.offset = 0;
+  try { await loadCandidatePage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "候选包读取失败");
+  }
+});
+document.querySelector("#clear-candidate-filters").addEventListener("click", async () => {
+  document.querySelector("#candidate-state").value = "all";
+  document.querySelector("#candidate-query").value = "";
+  candidateState.state = "all";
+  candidateState.query = "";
+  candidateState.offset = 0;
+  try { await loadCandidatePage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "候选包读取失败");
+  }
 });
 document.querySelector("#close-evidence-dialog").addEventListener("click", () => document.querySelector("#evidence-dialog").close());
 document.querySelector("#close-revision-dialog").addEventListener("click", () => document.querySelector("#revision-dialog").close());

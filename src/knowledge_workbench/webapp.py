@@ -82,6 +82,9 @@ class WorkbenchWebApplication:
                         "wiki-revision-submit-review",
                         "wiki-revision-reject",
                         "wiki-revision-publish",
+                        "conflict-candidate-label",
+                        "conflict-candidate-submit",
+                        "conflict-candidate-review",
                     ],
                 }
                 return self._json(200, payload)
@@ -139,6 +142,22 @@ class WorkbenchWebApplication:
                         limit=_integer_query(query, "limit", 20)
                     ),
                 )
+            if parsed.path == "/api/v1/conflict-candidate-packs":
+                return self._json(200, self.read_service.conflict_candidate_packs())
+            candidate_pack_id = _route_entity_id(
+                parsed.path, entity="conflict-candidate-packs", action="detail"
+            )
+            if candidate_pack_id is not None:
+                return self._json(
+                    200,
+                    self.read_service.conflict_candidate_page(
+                        candidate_pack_id,
+                        limit=_integer_query(query, "limit", 10),
+                        offset=_integer_query(query, "offset", 0),
+                        state=_string_query(query, "state"),
+                        query=_string_query(query, "q"),
+                    ),
+                )
             evidence_id = _route_entity_id(
                 parsed.path, entity="evidence", action="detail"
             )
@@ -179,12 +198,24 @@ class WorkbenchWebApplication:
         revision_publish_id = _route_entity_id(
             path, entity="wiki-revisions", action="publish"
         )
+        candidate_label_id = _route_entity_id(
+            path, entity="conflict-candidate-packs", action="label"
+        )
+        candidate_submit_id = _route_entity_id(
+            path, entity="conflict-candidate-packs", action="submit"
+        )
+        candidate_review_id = _route_entity_id(
+            path, entity="conflict-candidate-packs", action="review"
+        )
         if (
             evidence_id is None
             and conflict_id is None
             and revision_submit_id is None
             and revision_reject_id is None
             and revision_publish_id is None
+            and candidate_label_id is None
+            and candidate_submit_id is None
+            and candidate_review_id is None
         ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
@@ -202,7 +233,10 @@ class WorkbenchWebApplication:
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求正文必须是 JSON 对象")
-            actor = str(payload.get("actor", ""))
+            actor_value = payload.get("actor", "")
+            if not isinstance(actor_value, str):
+                raise ValueError("actor 必须是字符串")
+            actor = actor_value
             target = str(payload.get("target", ""))
             if evidence_id is not None:
                 result = self.action_service.transition_evidence(
@@ -229,11 +263,42 @@ class WorkbenchWebApplication:
                     actor=actor,
                     note=str(payload.get("note", "")),
                 )
-            else:
+            elif revision_publish_id is not None:
                 result = self.action_service.publish_revision_web(
                     revision_publish_id or "",
                     actor=actor,
                     confirmation=str(payload.get("confirmation", "")),
+                )
+            elif candidate_label_id is not None:
+                result = self.action_service.update_conflict_candidate_label(
+                    candidate_label_id,
+                    str(payload.get("candidate_id", "")),
+                    expected_content_sha256=str(
+                        payload.get("expected_content_sha256", "")
+                    ),
+                    expected_conflict=payload.get("expected_conflict"),
+                    expected_type=payload.get("expected_type"),
+                    note=payload.get("note"),
+                    actor=actor,
+                )
+            elif candidate_submit_id is not None:
+                result = self.action_service.submit_conflict_candidate_pack(
+                    candidate_submit_id,
+                    expected_content_sha256=str(
+                        payload.get("expected_content_sha256", "")
+                    ),
+                    actor=actor,
+                )
+            else:
+                result = self.action_service.update_conflict_candidate_review(
+                    candidate_review_id or "",
+                    str(payload.get("candidate_id", "")),
+                    expected_content_sha256=str(
+                        payload.get("expected_content_sha256", "")
+                    ),
+                    decision=str(payload.get("decision", "")),
+                    note=payload.get("note"),
+                    actor=actor,
                 )
             return self._json(200, {"ok": True, "result": result})
         except (UnicodeError, json.JSONDecodeError):

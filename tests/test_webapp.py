@@ -8,6 +8,9 @@ import urllib.request
 from pathlib import Path
 
 from knowledge_workbench.config import WorkspacePaths
+from knowledge_workbench.conflict_candidates import (
+    create_cross_document_candidate_pack,
+)
 from knowledge_workbench.database import Database
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
@@ -977,6 +980,89 @@ class WorkbenchWebTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(row["status"], "resolved")
             self.assertEqual(row["resolution_note"], "已核对新版本适用范围。")
+
+    def test_conflict_candidate_web_api_lists_pages_and_writes_with_csrf(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            for name, content in (
+                ("允许.md", "内部资料允许发送到云端模型。"),
+                ("禁止.md", "内部资料禁止发送到云端模型。"),
+            ):
+                source = root / name
+                source.write_text(content, encoding="utf-8")
+                ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            pack = create_cross_document_candidate_pack(
+                database,
+                paths,
+                paths.evaluations / "web-pack.json",
+                actor="pack-builder",
+                limit=20,
+                minimum_similarity=0.5,
+            )
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+
+            listing = application.handle("GET", "/api/v1/conflict-candidate-packs")
+            self.assertEqual(listing.status, 200)
+            listed = json.loads(listing.body)
+            self.assertEqual(listed["total"], 1)
+            detail = application.handle(
+                "GET",
+                f"/api/v1/conflict-candidate-packs/{pack['pack_id']}?limit=1&state=unlabeled",
+            )
+            self.assertEqual(detail.status, 200)
+            page = json.loads(detail.body)
+            self.assertEqual(len(page["items"]), 1)
+            candidate = page["items"][0]
+            route = f"/api/v1/conflict-candidate-packs/{pack['pack_id']}/label"
+            payload = json.dumps(
+                {
+                    "actor": "annotator-01",
+                    "candidate_id": candidate["candidate_id"],
+                    "expected_content_sha256": page["content_sha256"],
+                    "expected_conflict": candidate["predicted_conflict"],
+                    "expected_type": candidate["predicted_type"],
+                    "note": "已回源核对。",
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            forbidden = application.handle(
+                "POST",
+                route,
+                body=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(forbidden.status, 403)
+            written = application.handle(
+                "POST",
+                route,
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                },
+            )
+            self.assertEqual(written.status, 200)
+            stale = application.handle(
+                "POST",
+                route,
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                },
+            )
+            self.assertEqual(stale.status, 409)
+            refreshed = application.handle(
+                "GET",
+                f"/api/v1/conflict-candidate-packs/{pack['pack_id']}?state=labeled",
+            )
+            self.assertEqual(json.loads(refreshed.body)["total"], 1)
 
     def test_http_server_sets_security_headers_and_binds_loopback(self):
         with tempfile.TemporaryDirectory() as temporary:

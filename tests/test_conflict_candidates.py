@@ -6,8 +6,13 @@ from pathlib import Path
 from knowledge_workbench.config import WorkspacePaths
 from knowledge_workbench.conflict_candidates import (
     create_cross_document_candidate_pack,
+    cross_document_candidate_page,
     finalize_cross_document_candidate_pack,
+    list_cross_document_candidate_packs,
     submit_cross_document_candidate_annotations,
+    submit_cross_document_candidate_annotations_by_id,
+    update_cross_document_candidate_label,
+    update_cross_document_candidate_review,
 )
 from knowledge_workbench.conflict_evaluation import evaluate_conflict_dataset
 from knowledge_workbench.database import Database
@@ -244,6 +249,137 @@ class CrossDocumentConflictCandidateTests(unittest.TestCase):
                 submit_cross_document_candidate_annotations(
                     database, paths, pack_path, actor="annotator-01"
                 )
+
+    def test_web_annotation_projection_enforces_hash_lock_and_two_person_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            self._ingest_sources(root, paths)
+            database = Database(paths.database)
+            pack_path = paths.evaluations / "web-candidates.json"
+            pack = create_cross_document_candidate_pack(
+                database,
+                paths,
+                pack_path,
+                actor="pack-builder",
+                limit=20,
+                minimum_similarity=0.5,
+            )
+
+            listing = list_cross_document_candidate_packs(database, paths)
+            self.assertEqual(listing["total"], 1)
+            self.assertEqual(listing["items"][0]["phase"], "labeling")
+            self.assertNotIn("web-candidates.json", json.dumps(listing))
+            page = cross_document_candidate_page(
+                database,
+                paths,
+                pack["pack_id"],
+                limit=1,
+                state="unlabeled",
+            )
+            self.assertEqual(page["total"], 3)
+            stale_sha256 = page["content_sha256"]
+            first = page["items"][0]
+            updated = update_cross_document_candidate_label(
+                database,
+                paths,
+                pack["pack_id"],
+                first["candidate_id"],
+                expected_content_sha256=stale_sha256,
+                expected_conflict=first["predicted_conflict"],
+                expected_type=first["predicted_type"],
+                note="已回源核对。",
+                actor="annotator-01",
+            )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "刷新后重试"):
+                update_cross_document_candidate_label(
+                    database,
+                    paths,
+                    pack["pack_id"],
+                    pack["candidates"][1]["candidate_id"],
+                    expected_content_sha256=stale_sha256,
+                    expected_conflict=False,
+                    expected_type=None,
+                    note=None,
+                    actor="annotator-01",
+                )
+
+            content_sha256 = updated["content_sha256"]
+            for candidate in pack["candidates"][1:]:
+                updated = update_cross_document_candidate_label(
+                    database,
+                    paths,
+                    pack["pack_id"],
+                    candidate["candidate_id"],
+                    expected_content_sha256=content_sha256,
+                    expected_conflict=candidate["predicted_conflict"],
+                    expected_type=candidate["predicted_type"],
+                    note=None,
+                    actor="annotator-01",
+                )
+                content_sha256 = updated["content_sha256"]
+            submitted = submit_cross_document_candidate_annotations_by_id(
+                database,
+                paths,
+                pack["pack_id"],
+                expected_content_sha256=content_sha256,
+                actor="annotator-01",
+            )
+            self.assertEqual(submitted["phase"], "reviewing")
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "不能继续修改"):
+                update_cross_document_candidate_label(
+                    database,
+                    paths,
+                    pack["pack_id"],
+                    first["candidate_id"],
+                    expected_content_sha256=content_sha256,
+                    expected_conflict=False,
+                    expected_type=None,
+                    note=None,
+                    actor="annotator-01",
+                )
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "必须不同"):
+                update_cross_document_candidate_review(
+                    database,
+                    paths,
+                    pack["pack_id"],
+                    first["candidate_id"],
+                    expected_content_sha256=content_sha256,
+                    decision="approved",
+                    note=None,
+                    actor="annotator-01",
+                )
+            reviewed = update_cross_document_candidate_review(
+                database,
+                paths,
+                pack["pack_id"],
+                first["candidate_id"],
+                expected_content_sha256=content_sha256,
+                decision="approved",
+                note="复核通过。",
+                actor="reviewer-01",
+            )
+            approved = cross_document_candidate_page(
+                database,
+                paths,
+                pack["pack_id"],
+                state="approved",
+            )
+            self.assertEqual(reviewed["phase"], "reviewing")
+            self.assertEqual(approved["total"], 1)
+            with database.connect() as connection:
+                events = {
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT event_type FROM audit_log
+                        WHERE entity_id = ?
+                        """,
+                        (pack["pack_id"],),
+                    ).fetchall()
+                }
+            self.assertIn("conflict_candidate_label_updated", events)
+            self.assertIn("conflict_candidate_review_updated", events)
 
     @staticmethod
     def _ingest_sources(root: Path, paths: WorkspacePaths) -> None:

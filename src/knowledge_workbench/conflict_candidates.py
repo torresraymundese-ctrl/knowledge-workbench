@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 from collections import defaultdict
 from difflib import SequenceMatcher
 from itertools import combinations
@@ -16,8 +18,218 @@ from .schema_validation import (
     validate_conflict_candidate_pack,
     validate_conflict_evaluation_dataset,
 )
-from .utils import sha256_text, utc_now
+from .utils import sha256_file, sha256_text, utc_now
 from .wiki import write_text_atomic
+
+
+_CANDIDATE_PACK_WRITE_LOCK = threading.RLock()
+_WEB_PAGE_LIMIT_MAXIMUM = 100
+_CONFLICT_TYPES = frozenset({"polarity_change", "value_change"})
+
+
+def list_cross_document_candidate_packs(
+    database: Database, paths: WorkspacePaths
+) -> dict[str, Any]:
+    """Return safe summaries for valid candidate packs in evaluations."""
+
+    records, invalid_count = _candidate_pack_records(paths)
+    items = []
+    for path, pack in records:
+        submission = _latest_annotation_submission(database, pack["pack_id"])
+        annotation_sha256 = _annotation_sha256(pack)
+        drifted = bool(
+            submission and submission["annotation_sha256"] != annotation_sha256
+        )
+        counts = _candidate_counts(pack)
+        items.append(
+            {
+                "pack_id": pack["pack_id"],
+                "generated_at": pack["generated_at"],
+                "generated_by": pack["generated_by"],
+                "minimum_similarity": pack["minimum_similarity"],
+                "statistics": pack["statistics"],
+                "counts": counts,
+                "phase": _candidate_pack_phase(submission, drifted, counts),
+                "annotator": submission["actor"] if submission else None,
+                "content_sha256": sha256_file(path),
+            }
+        )
+    items.sort(key=lambda item: (item["generated_at"], item["pack_id"]), reverse=True)
+    return {"items": items, "total": len(items), "invalid_count": invalid_count}
+
+
+def cross_document_candidate_page(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    *,
+    limit: int = 10,
+    offset: int = 0,
+    state: str | None = None,
+    query: str | None = None,
+) -> dict[str, Any]:
+    limit, offset = _candidate_pagination(limit, offset)
+    state = _candidate_state_filter(state)
+    query = _candidate_query(query)
+    path, pack = _candidate_pack_by_id(paths, pack_id)
+    _validate_pack_provenance(database, pack)
+    submission, drifted = _candidate_submission_state(database, pack)
+    counts = _candidate_counts(pack)
+    phase = _candidate_pack_phase(submission, drifted, counts)
+    if drifted:
+        raise KnowledgeWorkbenchError(
+            "候选包标签在提交审计后发生变化；已锁定 Web 操作，请恢复已提交版本"
+        )
+    candidates = [
+        candidate
+        for candidate in pack["candidates"]
+        if _candidate_matches(candidate, state=state, query=query)
+    ]
+    total = len(candidates)
+    page = candidates[offset : offset + limit]
+    return {
+        "pack_id": pack["pack_id"],
+        "generated_at": pack["generated_at"],
+        "generated_by": pack["generated_by"],
+        "minimum_similarity": pack["minimum_similarity"],
+        "statistics": pack["statistics"],
+        "counts": counts,
+        "phase": phase,
+        "annotator": submission["actor"] if submission else None,
+        "content_sha256": sha256_file(path),
+        "items": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_previous": offset > 0,
+        "has_next": offset + len(page) < total,
+        "state": state,
+        "query": query,
+    }
+
+
+def update_cross_document_candidate_label(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    candidate_id: str,
+    *,
+    expected_content_sha256: str,
+    expected_conflict: bool,
+    expected_type: str | None,
+    note: str | None,
+    actor: str,
+) -> dict[str, Any]:
+    actor = _required_actor(actor)
+    if not isinstance(expected_conflict, bool):
+        raise KnowledgeWorkbenchError("expected_conflict 必须是布尔值")
+    if expected_conflict and expected_type not in _CONFLICT_TYPES:
+        raise KnowledgeWorkbenchError("冲突标签必须指定 polarity_change 或 value_change")
+    if not expected_conflict and expected_type is not None:
+        raise KnowledgeWorkbenchError("非冲突标签的 expected_type 必须为 null")
+    note = _candidate_note(note, required=False)
+
+    def mutate(pack: dict[str, Any]) -> dict[str, Any]:
+        submission, drifted = _candidate_submission_state(database, pack)
+        if submission or drifted:
+            raise KnowledgeWorkbenchError("候选标签已提交，不能继续修改")
+        candidate = _candidate_by_id(pack, candidate_id)
+        candidate["label"] = {
+            "expected_conflict": expected_conflict,
+            "expected_type": expected_type,
+            "note": note,
+        }
+        return {
+            "event_type": "conflict_candidate_label_updated",
+            "details": {
+                "candidate_id": candidate_id,
+                "expected_conflict": expected_conflict,
+                "expected_type": expected_type,
+                "note_sha256": sha256_text(note) if note else None,
+            },
+        }
+
+    return _mutate_candidate_pack(
+        database,
+        paths,
+        pack_id,
+        expected_content_sha256=expected_content_sha256,
+        actor=actor,
+        mutate=mutate,
+    )
+
+
+def submit_cross_document_candidate_annotations_by_id(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    *,
+    expected_content_sha256: str,
+    actor: str,
+) -> dict[str, Any]:
+    actor = _required_actor(actor)
+    with _CANDIDATE_PACK_WRITE_LOCK:
+        path, _ = _candidate_pack_by_id(paths, pack_id)
+        pack, _ = _read_candidate_pack_at_sha256(
+            path, pack_id, expected_content_sha256
+        )
+        _validate_pack_provenance(database, pack)
+        submission, drifted = _candidate_submission_state(database, pack)
+        if drifted:
+            raise KnowledgeWorkbenchError("候选包标签在提交审计后发生变化")
+        if submission:
+            raise KnowledgeWorkbenchError("候选标签已经提交复核")
+        _require_content_sha256(path, expected_content_sha256)
+        result = _record_candidate_annotation_submission(database, pack, actor=actor)
+        result["content_sha256"] = sha256_file(path)
+        result["phase"] = "reviewing"
+        return result
+
+
+def update_cross_document_candidate_review(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    candidate_id: str,
+    *,
+    expected_content_sha256: str,
+    decision: str,
+    note: str | None,
+    actor: str,
+) -> dict[str, Any]:
+    actor = _required_actor(actor)
+    if decision not in {"approved", "rejected"}:
+        raise KnowledgeWorkbenchError("复核决定必须是 approved 或 rejected")
+    note = _candidate_note(note, required=decision == "rejected")
+
+    def mutate(pack: dict[str, Any]) -> dict[str, Any]:
+        submission, drifted = _candidate_submission_state(database, pack)
+        if drifted:
+            raise KnowledgeWorkbenchError("候选包标签在提交审计后发生变化")
+        if not submission:
+            raise KnowledgeWorkbenchError("候选标签尚未提交，不能复核")
+        if submission["actor"] == actor:
+            raise KnowledgeWorkbenchError("标注人与复核人必须不同")
+        candidate = _candidate_by_id(pack, candidate_id)
+        candidate["review"] = {"decision": decision, "note": note}
+        return {
+            "event_type": "conflict_candidate_review_updated",
+            "details": {
+                "candidate_id": candidate_id,
+                "decision": decision,
+                "annotator": submission["actor"],
+                "note_sha256": sha256_text(note) if note else None,
+            },
+        }
+
+    return _mutate_candidate_pack(
+        database,
+        paths,
+        pack_id,
+        expected_content_sha256=expected_content_sha256,
+        actor=actor,
+        mutate=mutate,
+    )
 
 
 def create_cross_document_candidate_pack(
@@ -118,6 +330,12 @@ def submit_cross_document_candidate_annotations(
     pack = _read_candidate_pack(paths, pack_path)
     _validate_pack_identity(pack)
     _validate_pack_provenance(database, pack)
+    return _record_candidate_annotation_submission(database, pack, actor=actor)
+
+
+def _record_candidate_annotation_submission(
+    database: Database, pack: dict[str, Any], *, actor: str
+) -> dict[str, Any]:
     if pack["statistics"]["truncated"]:
         raise KnowledgeWorkbenchError("候选包已截断，不能提交为完整质量基线")
     _validated_labels(pack)
@@ -212,6 +430,288 @@ def finalize_cross_document_candidate_pack(
         output.unlink(missing_ok=True)
         raise
     return dataset
+
+
+def _candidate_pack_records(
+    paths: WorkspacePaths,
+) -> tuple[list[tuple[Path, dict[str, Any]]], int]:
+    evaluations = paths.evaluations.resolve()
+    if not evaluations.exists():
+        return [], 0
+    records: list[tuple[Path, dict[str, Any]]] = []
+    invalid_count = 0
+    seen: set[str] = set()
+    for path in sorted(evaluations.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != (
+            "cross-document-conflict-candidate-pack"
+        ):
+            continue
+        try:
+            validate_conflict_candidate_pack(payload)
+            _validate_pack_identity(payload)
+        except KnowledgeWorkbenchError:
+            invalid_count += 1
+            continue
+        if payload["pack_id"] in seen:
+            raise KnowledgeWorkbenchError(
+                f"工作区存在重复候选包身份：{payload['pack_id']}"
+            )
+        seen.add(payload["pack_id"])
+        records.append((path.resolve(), payload))
+    return records, invalid_count
+
+
+def _candidate_pack_by_id(
+    paths: WorkspacePaths, pack_id: str
+) -> tuple[Path, dict[str, Any]]:
+    if not isinstance(pack_id, str) or not pack_id.startswith("cpack_"):
+        raise KnowledgeWorkbenchError("冲突候选包 ID 无效")
+    records, _ = _candidate_pack_records(paths)
+    matches = [record for record in records if record[1]["pack_id"] == pack_id]
+    if not matches:
+        raise KnowledgeWorkbenchError(f"冲突候选包不存在或校验失败：{pack_id}")
+    if len(matches) != 1:
+        raise KnowledgeWorkbenchError(f"工作区存在重复候选包身份：{pack_id}")
+    return matches[0]
+
+
+def _candidate_submission_state(
+    database: Database, pack: dict[str, Any]
+) -> tuple[dict[str, str] | None, bool]:
+    submission = _latest_annotation_submission(database, pack["pack_id"])
+    if not submission:
+        return None, False
+    return submission, submission["annotation_sha256"] != _annotation_sha256(pack)
+
+
+def _latest_annotation_submission(
+    database: Database, pack_id: str
+) -> dict[str, str] | None:
+    with database.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT actor, details_json FROM audit_log
+            WHERE event_type = 'conflict_candidate_annotations_submitted'
+              AND entity_type = 'conflict_candidate_pack'
+              AND entity_id = ?
+            ORDER BY id DESC
+            """,
+            (pack_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"])
+        except json.JSONDecodeError:
+            continue
+        annotation_sha256 = details.get("annotation_sha256")
+        if isinstance(annotation_sha256, str):
+            return {"actor": row["actor"], "annotation_sha256": annotation_sha256}
+    return None
+
+
+def _candidate_counts(pack: dict[str, Any]) -> dict[str, int]:
+    candidates = pack["candidates"]
+    return {
+        "total": len(candidates),
+        "labeled": sum(
+            item["label"]["expected_conflict"] is not None for item in candidates
+        ),
+        "approved": sum(
+            item["review"]["decision"] == "approved" for item in candidates
+        ),
+        "rejected": sum(
+            item["review"]["decision"] == "rejected" for item in candidates
+        ),
+    }
+
+
+def _candidate_pack_phase(
+    submission: dict[str, str] | None,
+    drifted: bool,
+    counts: dict[str, int],
+) -> str:
+    if drifted:
+        return "invalid"
+    if not submission:
+        return "labeling"
+    if counts["approved"] == counts["total"] and counts["total"]:
+        return "reviewed"
+    return "reviewing"
+
+
+def _candidate_pagination(limit: int, offset: int) -> tuple[int, int]:
+    if limit < 1 or limit > _WEB_PAGE_LIMIT_MAXIMUM:
+        raise KnowledgeWorkbenchError(
+            f"limit 必须在 1 到 {_WEB_PAGE_LIMIT_MAXIMUM} 之间"
+        )
+    if offset < 0:
+        raise KnowledgeWorkbenchError("offset 不能小于 0")
+    return limit, offset
+
+
+def _candidate_state_filter(value: str | None) -> str:
+    state = (value or "all").strip()
+    allowed = {
+        "all",
+        "unlabeled",
+        "labeled",
+        "unreviewed",
+        "approved",
+        "rejected",
+        "disagreement",
+    }
+    if state not in allowed:
+        raise KnowledgeWorkbenchError(f"候选状态筛选不受支持：{state}")
+    return state
+
+
+def _candidate_query(value: str | None) -> str:
+    query = (value or "").strip()
+    if len(query) > 120:
+        raise KnowledgeWorkbenchError("q 不能超过 120 个字符")
+    return query
+
+
+def _candidate_matches(
+    candidate: dict[str, Any], *, state: str, query: str
+) -> bool:
+    label = candidate["label"]
+    review = candidate["review"]
+    if state == "unlabeled" and label["expected_conflict"] is not None:
+        return False
+    if state == "labeled" and label["expected_conflict"] is None:
+        return False
+    if state == "unreviewed" and review["decision"] is not None:
+        return False
+    if state in {"approved", "rejected"} and review["decision"] != state:
+        return False
+    if state == "disagreement":
+        if label["expected_conflict"] is None:
+            return False
+        if (
+            label["expected_conflict"] == candidate["predicted_conflict"]
+            and label["expected_type"] == candidate["predicted_type"]
+        ):
+            return False
+    if not query:
+        return True
+    needle = query.casefold()
+    searchable = [candidate["candidate_id"], candidate.get("reason") or ""]
+    for side_name in ("left", "right"):
+        side = candidate[side_name]
+        searchable.extend(
+            [side["evidence_id"], side["document_name"], side["excerpt"]]
+        )
+    return any(needle in value.casefold() for value in searchable)
+
+
+def _candidate_by_id(
+    pack: dict[str, Any], candidate_id: str
+) -> dict[str, Any]:
+    for candidate in pack["candidates"]:
+        if candidate["candidate_id"] == candidate_id:
+            return candidate
+    raise KnowledgeWorkbenchError(f"候选不存在：{candidate_id}")
+
+
+def _candidate_note(value: str | None, *, required: bool) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise KnowledgeWorkbenchError("note 必须是字符串或 null")
+    note = (value or "").strip()
+    if required and not note:
+        raise KnowledgeWorkbenchError("驳回复核必须填写意见")
+    if len(note) > 2000:
+        raise KnowledgeWorkbenchError("note 不能超过 2000 个字符")
+    return note or None
+
+
+def _require_content_sha256(path: Path, expected: str) -> None:
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise KnowledgeWorkbenchError("expected_content_sha256 无效")
+    if sha256_file(path) != expected:
+        raise KnowledgeWorkbenchError("候选包已被其他操作修改，请刷新后重试")
+
+
+def _read_candidate_pack_at_sha256(
+    path: Path, pack_id: str, expected_content_sha256: str
+) -> tuple[dict[str, Any], str]:
+    _require_content_sha256(path, expected_content_sha256)
+    try:
+        content_bytes = path.read_bytes()
+        if hashlib.sha256(content_bytes).hexdigest() != expected_content_sha256:
+            raise KnowledgeWorkbenchError(
+                "候选包已被其他操作修改，请刷新后重试"
+            )
+        content = content_bytes.decode("utf-8")
+        pack = json.loads(content)
+    except KnowledgeWorkbenchError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise KnowledgeWorkbenchError("冲突候选包无法安全读取") from exc
+    validate_conflict_candidate_pack(pack)
+    _validate_pack_identity(pack)
+    if pack["pack_id"] != pack_id:
+        raise KnowledgeWorkbenchError("候选包身份在读取期间发生变化")
+    return pack, content
+
+
+def _mutate_candidate_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    *,
+    expected_content_sha256: str,
+    actor: str,
+    mutate,
+) -> dict[str, Any]:
+    with _CANDIDATE_PACK_WRITE_LOCK:
+        path, _ = _candidate_pack_by_id(paths, pack_id)
+        pack, original_content = _read_candidate_pack_at_sha256(
+            path, pack_id, expected_content_sha256
+        )
+        _validate_pack_provenance(database, pack)
+        event = mutate(pack)
+        _validate_pack_identity(pack)
+        validate_conflict_candidate_pack(pack)
+        content = json.dumps(pack, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        before_sha256 = sha256_text(original_content)
+        after_sha256 = sha256_text(content)
+        _require_content_sha256(path, expected_content_sha256)
+        write_text_atomic(path, content)
+        try:
+            with database.transaction() as connection:
+                details = dict(event["details"])
+                details.update(
+                    {
+                        "content_sha256_before": before_sha256,
+                        "content_sha256_after": after_sha256,
+                    }
+                )
+                record_event(
+                    connection,
+                    event["event_type"],
+                    "conflict_candidate_pack",
+                    pack_id,
+                    actor=actor,
+                    details=details,
+                )
+        except Exception:
+            write_text_atomic(path, original_content)
+            raise
+        submission, drifted = _candidate_submission_state(database, pack)
+        return {
+            "pack_id": pack_id,
+            "candidate_id": event["details"]["candidate_id"],
+            "content_sha256": after_sha256,
+            "phase": _candidate_pack_phase(
+                submission, drifted, _candidate_counts(pack)
+            ),
+            "actor": actor,
+        }
 
 
 def _validated_labels(pack: dict[str, Any]) -> list[dict[str, Any]]:
@@ -503,7 +1003,11 @@ def _validated_output(paths: WorkspacePaths, output: Path) -> Path:
 
 
 def _required_actor(value: str) -> str:
+    if not isinstance(value, str):
+        raise KnowledgeWorkbenchError("actor 必须是字符串")
     actor = value.strip()
     if not actor:
         raise KnowledgeWorkbenchError("actor 不能为空")
+    if len(actor) > 80:
+        raise KnowledgeWorkbenchError("actor 不能超过 80 个字符")
     return actor

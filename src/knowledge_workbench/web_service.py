@@ -5,6 +5,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import WorkspacePaths
+from .conflict_candidates import (
+    cross_document_candidate_page,
+    list_cross_document_candidate_packs,
+    submit_cross_document_candidate_annotations_by_id,
+    update_cross_document_candidate_label,
+    update_cross_document_candidate_review,
+)
 from .conflicts import transition_conflict
 from .database import Database
 from .errors import KnowledgeWorkbenchError
@@ -40,6 +47,28 @@ class WorkbenchReadService:
             "evaluations": self.evaluations(limit=6),
             "activity": self.activity(limit=8),
         }
+
+    def conflict_candidate_packs(self) -> dict[str, Any]:
+        return list_cross_document_candidate_packs(self.database, self.paths)
+
+    def conflict_candidate_page(
+        self,
+        pack_id: str,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        state: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        return cross_document_candidate_page(
+            self.database,
+            self.paths,
+            pack_id,
+            limit=limit,
+            offset=offset,
+            state=state,
+            query=query,
+        )
 
     def summary(self) -> dict[str, Any]:
         with self.database.connect() as connection:
@@ -763,6 +792,65 @@ class WorkbenchActionService:
             "status": target_status.value,
             "actor": actor,
         }
+
+    def update_conflict_candidate_label(
+        self,
+        pack_id: str,
+        candidate_id: str,
+        *,
+        expected_content_sha256: str,
+        expected_conflict: bool,
+        expected_type: str | None,
+        note: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        return update_cross_document_candidate_label(
+            self.database,
+            self.paths,
+            pack_id,
+            candidate_id,
+            expected_content_sha256=expected_content_sha256,
+            expected_conflict=expected_conflict,
+            expected_type=expected_type,
+            note=note,
+            actor=actor,
+        )
+
+    def submit_conflict_candidate_pack(
+        self,
+        pack_id: str,
+        *,
+        expected_content_sha256: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        return submit_cross_document_candidate_annotations_by_id(
+            self.database,
+            self.paths,
+            pack_id,
+            expected_content_sha256=expected_content_sha256,
+            actor=actor,
+        )
+
+    def update_conflict_candidate_review(
+        self,
+        pack_id: str,
+        candidate_id: str,
+        *,
+        expected_content_sha256: str,
+        decision: str,
+        note: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        return update_cross_document_candidate_review(
+            self.database,
+            self.paths,
+            pack_id,
+            candidate_id,
+            expected_content_sha256=expected_content_sha256,
+            decision=decision,
+            note=note,
+            actor=actor,
+        )
 
     def transition_conflict(
         self,
