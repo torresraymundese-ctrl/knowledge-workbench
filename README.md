@@ -66,6 +66,7 @@ $Reviewer = "reviewer-01"
 .\.venv\Scripts\knowledge.exe label add-ordinals $SessionId $CaseId 22 35 48 --actor annotator-01
 .\.venv\Scripts\knowledge.exe label check $SessionId --strict
 .\.venv\Scripts\knowledge.exe label review-pack $SessionId .\workspace\evaluations\review.md --actor $Reviewer
+.\.venv\Scripts\knowledge.exe label apply-review-pack .\workspace\evaluations\review.md --actor $Reviewer
 .\.venv\Scripts\knowledge.exe label review-case $SessionId $CaseId approved --actor $Reviewer
 .\.venv\Scripts\knowledge.exe task enqueue faithful_pipeline --payload-file .\samples\faithful-task.json
 .\.venv\Scripts\knowledge.exe worker run-once --worker local-worker-1

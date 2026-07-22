@@ -71,6 +71,8 @@ if ($Ordinals.Count -lt 3) { throw "请先核对原文并填写至少3个候选�
 
 # 必须由另一人批准；也可以使用 reject --note 驳回
 .\.venv\Scripts\knowledge.exe label review-pack $SessionId .\workspace\evaluations\nas-pilot-v1.review.md --actor $Reviewer
+# 在 Obsidian 中逐用例勾选批准或驳回；驳回必须填写原因
+.\.venv\Scripts\knowledge.exe label apply-review-pack .\workspace\evaluations\nas-pilot-v1.review.md --actor $Reviewer
 .\.venv\Scripts\knowledge.exe label candidates $SessionId $CaseId --only-selected --full
 .\.venv\Scripts\knowledge.exe label review-case $SessionId $CaseId approved --actor $Reviewer
 .\.venv\Scripts\knowledge.exe label approve $SessionId --actor $Reviewer
@@ -82,6 +84,8 @@ if ($Ordinals.Count -lt 3) { throw "请先核对原文并填写至少3个候选�
 `add-ordinals` 只负责把当前处理运行中的短编号安全解析为正式 evidence ID，不会自动判断证据是否重要。编号不存在、资料已更新、处理运行已过期或操作者不是会话创建人时，整批选择都会失败且不会留下部分写入。仍可使用 `add-evidence` 直接提交实际 evidence ID。
 
 `annotation-pack` 默认包含各用例的全部当前候选、原文片段和定位，可直接用 Obsidian 打开。勾选本身不会修改 SQLite；保存后必须显式运行 `apply-annotation-pack`。应用操作是增量且幂等的：只添加已勾选项，不会因为取消勾选而删除已有选择；任一编号、证据 ID、来源版本或处理运行不匹配时整包回滚。包中包含非公开原文，只允许保存在当前 `workspace/evaluations/`，不能写入只读的 `workspace/raw/`，且不会覆盖同名文件。资料量很大时可增加 `--limit-per-case 200`，但被截断的工作包不能替代回到原文件进行完整核对。
+
+`review-pack` 在提交后由另一位人员生成，每个用例必须且只能勾选“批准”或“驳回”，驳回还必须填写原因。`apply-review-pack` 会先验证所有用例、证据与导出审计记录，再在一个事务中写入逐项决定；它不会自动执行会话最终批准。全部用例通过后，复核人仍须显式运行 `label approve`。
 
 标注会话支持 `list`、`remove-evidence`、`add-forbidden` 和 `remove-forbidden`。冲突、弃用或归档证据不能成为黄金证据；来源文件内容、密级、当前文件版本或当前处理运行变化后，旧会话不能提交、批准或导出。
 

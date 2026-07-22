@@ -858,14 +858,34 @@ def export_labeling_review_pack(
             (session_id,),
         ).fetchall()
         _ensure_labeling_output_allowed(paths, cases, output, "复核包")
+        generated_at = utc_now()
+        powershell_output = "'" + str(output).replace("'", "''") + "'"
         lines = [
+            "---",
+            "type: labeling-review-pack",
+            f"session_id: {session_id}",
+            f"reviewer: {actor}",
+            f"generated_at: {generated_at}",
+            "---",
+            "",
             f"# {session['name']}：复核包",
             "",
             f"- 会话ID：`{session_id}`",
             f"- 提交人：`{session['submitted_by']}`",
             f"- 复核人：`{actor}`",
-            f"- 生成时间：`{utc_now()}`",
+            f"- 生成时间：`{generated_at}`",
             "- 说明：本文件只用于人工回源复核，不代表已经批准。",
+            "",
+            "## 应用逐项复核",
+            "",
+            "每个用例必须且只能选择一个决定；驳回时必须填写原因。保存后运行：",
+            "",
+            "```powershell",
+            (
+                f'.\\.venv\\Scripts\\knowledge.exe --workspace .\\workspace '
+                f"label apply-review-pack {powershell_output} --actor {actor}"
+            ),
+            "```",
             "",
         ]
         evidence_count = 0
@@ -903,7 +923,7 @@ def export_labeling_review_pack(
             for row in evidence:
                 lines.extend(
                     [
-                        f"### [ ] #{row['run_ordinal']} `{row['id']}`",
+                        f"### #{row['run_ordinal']} `{row['id']}`",
                         "",
                         f"- 状态：`{row['status']}`",
                         f"- 定位：`{_markdown_code(row['locator_json'])}`",
@@ -917,6 +937,16 @@ def export_labeling_review_pack(
                 lines.extend(["### 禁止内容", ""])
                 for row in forbidden:
                     lines.extend([*_blockquote(row["value"]), ""])
+            lines.extend(
+                [
+                    "### 复核决定",
+                    "",
+                    "- [ ] 批准本用例",
+                    "- [ ] 驳回本用例",
+                    "- 驳回原因：",
+                    "",
+                ]
+            )
     content = "\n".join(lines).rstrip() + "\n"
     write_text_atomic(output, content)
     try:
@@ -938,6 +968,132 @@ def export_labeling_review_pack(
         output.unlink(missing_ok=True)
         raise
     return output
+
+
+def apply_labeling_review_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_path: Path,
+    *,
+    actor: str,
+) -> dict:
+    actor = _required_actor(actor)
+    pack_path = pack_path.expanduser().resolve()
+    if pack_path.suffix.lower() != ".md":
+        raise KnowledgeWorkbenchError("复核包必须使用 .md 文件")
+    try:
+        pack_path.relative_to(paths.evaluations)
+    except ValueError as exc:
+        raise KnowledgeWorkbenchError("复核包只能从当前 workspace/evaluations 读取") from exc
+    try:
+        content = pack_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise KnowledgeWorkbenchError(f"复核包不存在：{pack_path}") from exc
+    session_id, declared_reviewer, decisions = _parse_labeling_review_pack(content)
+    if declared_reviewer != actor:
+        raise KnowledgeWorkbenchError("复核包声明的复核人与当前 actor 不一致")
+
+    now = utc_now()
+    with database.transaction() as connection:
+        session = _get_session(connection, session_id)
+        if session["status"] != "reviewing":
+            raise InvalidTransitionError("只有 reviewing 标注集可以应用复核包")
+        if session["submitted_by"] == actor:
+            raise InvalidTransitionError("复核人必须与提交人不同")
+        provenance_rows = connection.execute(
+            """
+            SELECT details_json FROM audit_log
+            WHERE entity_id = ? AND event_type = ? AND actor = ?
+            """,
+            (session_id, "labeling_review_pack_exported", actor),
+        ).fetchall()
+        if not any(
+            json.loads(row["details_json"]).get("output_path") == str(pack_path)
+            for row in provenance_rows
+        ):
+            raise KnowledgeWorkbenchError("复核包没有匹配的系统导出审计记录")
+
+        cases = {
+            row["case_id"]: row
+            for row in connection.execute(
+                "SELECT * FROM labeling_cases WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+        missing_cases = sorted(set(cases) - set(decisions))
+        unknown_cases = sorted(set(decisions) - set(cases))
+        if missing_cases:
+            raise KnowledgeWorkbenchError(
+                "以下用例尚未填写复核决定：" + ", ".join(missing_cases)
+            )
+        if unknown_cases:
+            raise KnowledgeWorkbenchError(
+                "复核包包含未知用例：" + ", ".join(unknown_cases)
+            )
+
+        validated = {}
+        for case_id, case in cases.items():
+            _ensure_case_ready(connection, session, case)
+            decision = decisions[case_id]
+            checked_count = int(decision["approved"]) + int(decision["rejected"])
+            if checked_count != 1:
+                raise KnowledgeWorkbenchError(
+                    f"用例 {case_id} 必须且只能选择一个复核决定"
+                )
+            resolved = "approved" if decision["approved"] else "rejected"
+            note = decision["note"].strip() or None
+            if resolved == "rejected" and not note:
+                raise KnowledgeWorkbenchError(f"用例 {case_id} 驳回时必须填写原因")
+            validated[case_id] = (resolved, note)
+
+        for case_id, (decision, note) in validated.items():
+            connection.execute(
+                """
+                INSERT INTO labeling_case_reviews(
+                    case_row_id, reviewer, decision, note, reviewed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(case_row_id) DO UPDATE SET
+                    reviewer = excluded.reviewer,
+                    decision = excluded.decision,
+                    note = excluded.note,
+                    reviewed_at = excluded.reviewed_at
+                """,
+                (cases[case_id]["id"], actor, decision, note, now),
+            )
+        connection.execute(
+            "UPDATE labeling_sessions SET updated_at = ? WHERE id = ?",
+            (now, session_id),
+        )
+        record_event(
+            connection,
+            "labeling_review_pack_applied",
+            "labeling_session",
+            session_id,
+            actor=actor,
+            details={
+                "pack_path": str(pack_path),
+                "content_sha256": sha256_text(content),
+                "case_count": len(validated),
+                "decisions_by_case": {
+                    case_id: decision for case_id, (decision, _) in validated.items()
+                },
+                "note_sha256_by_case": {
+                    case_id: sha256_text(note)
+                    for case_id, (_, note) in validated.items()
+                    if note
+                },
+            },
+        )
+    return {
+        "session_id": session_id,
+        "case_count": len(validated),
+        "approved_count": sum(
+            decision == "approved" for decision, _ in validated.values()
+        ),
+        "rejected_count": sum(
+            decision == "rejected" for decision, _ in validated.values()
+        ),
+    }
 
 
 def export_labeling_dataset(
@@ -1495,6 +1651,64 @@ def _parse_labeling_annotation_pack(
                 raise KnowledgeWorkbenchError("已勾选任务缺少对应的候选证据标题")
             add_checked(*current_candidate)
     return session_id, checked
+
+
+def _parse_labeling_review_pack(
+    content: str,
+) -> tuple[str, str, dict[str, dict[str, bool | str]]]:
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise KnowledgeWorkbenchError("复核包缺少 YAML Frontmatter")
+    try:
+        frontmatter_end = next(
+            index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+        )
+    except StopIteration as exc:
+        raise KnowledgeWorkbenchError("复核包的 YAML Frontmatter 未闭合") from exc
+    metadata = {}
+    for line in lines[1:frontmatter_end]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            metadata[key.strip()] = value.strip()
+    if metadata.get("type") != "labeling-review-pack":
+        raise KnowledgeWorkbenchError("文件不是系统生成的复核包")
+    session_id = metadata.get("session_id", "")
+    reviewer = metadata.get("reviewer", "")
+    if not session_id or not reviewer:
+        raise KnowledgeWorkbenchError("复核包缺少 session_id 或 reviewer")
+
+    case_pattern = re.compile(r"^##\s+(.+?)\s*$")
+    approved_pattern = re.compile(r"^-\s+\[([ xX])\]\s+批准本用例\s*$")
+    rejected_pattern = re.compile(r"^-\s+\[([ xX])\]\s+驳回本用例\s*$")
+    note_pattern = re.compile(r"^-\s+驳回原因：(.*)$")
+    decisions: dict[str, dict[str, bool | str]] = {}
+    current_case: str | None = None
+
+    def current_decision() -> dict[str, bool | str]:
+        if current_case is None:
+            raise KnowledgeWorkbenchError("复核决定出现在用例标题之前")
+        return decisions.setdefault(
+            current_case,
+            {"approved": False, "rejected": False, "note": ""},
+        )
+
+    for line in lines[frontmatter_end + 1 :]:
+        case_match = case_pattern.match(line)
+        if case_match:
+            current_case = case_match.group(1)
+            continue
+        approved_match = approved_pattern.match(line)
+        if approved_match:
+            current_decision()["approved"] = approved_match.group(1).lower() == "x"
+            continue
+        rejected_match = rejected_pattern.match(line)
+        if rejected_match:
+            current_decision()["rejected"] = rejected_match.group(1).lower() == "x"
+            continue
+        note_match = note_pattern.match(line)
+        if note_match:
+            current_decision()["note"] = note_match.group(1).strip()
+    return session_id, reviewer, decisions
 
 
 def _relative_source_path(source: Path, output_parent: Path) -> str:

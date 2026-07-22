@@ -10,6 +10,7 @@ from knowledge_workbench.evaluation import evaluate_dataset
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.labeling import (
     apply_labeling_annotation_pack,
+    apply_labeling_review_pack,
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
@@ -532,6 +533,112 @@ class LabelingWorkflowTests(unittest.TestCase):
             self.assertIn(
                 "labeling_session_invalid",
                 {issue["code"] for issue in lint_report["issues"]},
+            )
+
+    def test_checked_review_pack_applies_all_case_decisions_atomically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("必须核对的证据。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+            result = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            template = _write_template(root / "template.json", source)
+            payload = json.loads(template.read_text(encoding="utf-8"))
+            second_case = {**payload["cases"][0], "case_id": "case-2"}
+            payload["cases"].append(second_case)
+            template.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            session_id = create_labeling_session(
+                database,
+                template,
+                actor="alice",
+                minimum_required_per_case=1,
+            )
+            with database.connect() as connection:
+                evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE document_version_id = ?",
+                    (result.version_id,),
+                ).fetchone()[0]
+            for case_id in ("case-1", "case-2"):
+                select_expected_evidence(
+                    database, session_id, case_id, evidence_id, actor="alice"
+                )
+            submit_labeling_session(database, session_id, actor="alice")
+            pack = paths.evaluations / "review.md"
+            export_labeling_review_pack(
+                database, paths, session_id, pack, actor="bob"
+            )
+            content = pack.read_text(encoding="utf-8")
+            self.assertEqual(content.count("- [ ] 批准本用例"), 2)
+            self.assertEqual(content.count("- [ ] 驳回本用例"), 2)
+
+            incomplete = content.replace(
+                "- [ ] 批准本用例", "- [x] 批准本用例", 1
+            )
+            pack.write_text(incomplete, encoding="utf-8")
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "只能选择一个"):
+                apply_labeling_review_pack(database, paths, pack, actor="bob")
+            with database.connect() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM labeling_case_reviews"
+                    ).fetchone()[0],
+                    0,
+                )
+
+            rejected_without_note = content.replace(
+                "- [ ] 驳回本用例", "- [x] 驳回本用例", 1
+            )
+            approve_marker = "- [ ] 批准本用例"
+            second_approve = rejected_without_note.find(
+                approve_marker,
+                rejected_without_note.find(approve_marker) + len(approve_marker),
+            )
+            rejected_without_note = (
+                rejected_without_note[:second_approve]
+                + "- [x] 批准本用例"
+                + rejected_without_note[second_approve + len(approve_marker) :]
+            )
+            pack.write_text(rejected_without_note, encoding="utf-8")
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "必须填写原因"):
+                apply_labeling_review_pack(database, paths, pack, actor="bob")
+            with database.connect() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM labeling_case_reviews"
+                    ).fetchone()[0],
+                    0,
+                )
+
+            approved_all = content.replace(
+                "- [ ] 批准本用例", "- [x] 批准本用例"
+            )
+            copied = paths.evaluations / "copied-review.md"
+            copied.write_text(approved_all, encoding="utf-8")
+            with self.assertRaisesRegex(KnowledgeWorkbenchError, "审计记录"):
+                apply_labeling_review_pack(database, paths, copied, actor="bob")
+
+            pack.write_text(approved_all, encoding="utf-8")
+            applied = apply_labeling_review_pack(
+                database, paths, pack, actor="bob"
+            )
+            repeated = apply_labeling_review_pack(
+                database, paths, pack, actor="bob"
+            )
+            self.assertEqual(applied["approved_count"], 2)
+            self.assertEqual(applied["rejected_count"], 0)
+            self.assertEqual(repeated["approved_count"], 2)
+            summary = labeling_session_summary(database, session_id)
+            self.assertEqual(summary["session"]["status"], "reviewing")
+            self.assertTrue(
+                all(case["review_decision"] == "approved" for case in summary["cases"])
+            )
+            approve_labeling_session(database, session_id, actor="bob")
+            self.assertEqual(
+                labeling_session_summary(database, session_id)["session"]["status"],
+                "approved",
             )
 
     def test_source_update_blocks_submission_of_stale_selected_evidence(self):

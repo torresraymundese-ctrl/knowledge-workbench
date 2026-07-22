@@ -24,6 +24,7 @@ from .linting import lint_workspace
 from .labeling import (
     add_forbidden_substring,
     apply_labeling_annotation_pack,
+    apply_labeling_review_pack,
     approve_labeling_session,
     create_labeling_session,
     export_labeling_dataset,
@@ -378,6 +379,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     label_apply_annotation_pack.add_argument("pack", type=Path)
     label_apply_annotation_pack.add_argument("--actor", required=True)
+    label_apply_review_pack = label_sub.add_parser(
+        "apply-review-pack", help="原子应用 Obsidian 复核包中的逐用例决定"
+    )
+    label_apply_review_pack.add_argument("pack", type=Path)
+    label_apply_review_pack.add_argument("--actor", required=True)
     return parser
 
 
@@ -1308,6 +1314,14 @@ def _handle_label(database, paths: WorkspacePaths, args) -> None:
         print(f"人工标注工作包已导出：{output}")
     elif command == "apply-annotation-pack":
         result = apply_labeling_annotation_pack(
+            database,
+            paths,
+            args.pack,
+            actor=args.actor,
+        )
+        _print_mapping(result)
+    elif command == "apply-review-pack":
+        result = apply_labeling_review_pack(
             database,
             paths,
             args.pack,
