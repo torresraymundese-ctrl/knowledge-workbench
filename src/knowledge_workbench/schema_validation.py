@@ -171,6 +171,68 @@ def validate_citation_evaluation_dataset(payload: dict) -> None:
         raise KnowledgeWorkbenchError("引用支撑评测数据集包含重复 case_id")
 
 
+def validate_graph_evaluation_dataset(payload: dict) -> None:
+    _validate(payload, "graph-evaluation-v1.json")
+    provenance = payload["provenance"]
+    if not payload["name"].strip():
+        raise KnowledgeWorkbenchError("图谱评测数据集名称不能为空")
+    annotator = provenance["annotator"].strip()
+    reviewer = provenance["reviewer"].strip()
+    if not annotator or not reviewer:
+        raise KnowledgeWorkbenchError("图谱评测标注人与复核人不能为空")
+    if annotator == reviewer:
+        raise KnowledgeWorkbenchError("图谱评测标注人与复核人必须不同")
+    cases = [*payload["relation_cases"], *payload["path_cases"]]
+    if not cases:
+        raise KnowledgeWorkbenchError("图谱评测数据集至少需要一个用例")
+    case_ids = [case["case_id"] for case in cases]
+    if len(case_ids) != len(set(case_ids)):
+        raise KnowledgeWorkbenchError("图谱评测数据集包含重复 case_id")
+    for case in payload["relation_cases"]:
+        if case["source_entity_id"] == case["target_entity_id"]:
+            raise KnowledgeWorkbenchError(
+                f"图谱关系用例 {case['case_id']} 的两个实体不能相同"
+            )
+    for case in payload["path_cases"]:
+        case_id = case["case_id"]
+        if case["source_entity_id"] == case["target_entity_id"]:
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 的起点和目标不能相同"
+            )
+        if not case["expected_reachable"]:
+            continue
+        entity_ids = case["expected_entity_ids"]
+        relation_keys = case["expected_relation_keys"]
+        directions = case["expected_traversal_directions"]
+        if entity_ids[0] != case["source_entity_id"]:
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 的期望路径起点不一致"
+            )
+        if entity_ids[-1] != case["target_entity_id"]:
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 的期望路径目标不一致"
+            )
+        if len(relation_keys) != len(entity_ids) - 1:
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 的关系数量必须比实体数量少 1"
+            )
+        if len(directions) != len(relation_keys):
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 的方向数量与关系数量不一致"
+            )
+        if len(relation_keys) > case["max_depth"]:
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 超出 max_depth"
+            )
+        if (
+            "reverse" in directions
+            and not case["include_inverse"]
+        ):
+            raise KnowledgeWorkbenchError(
+                f"图谱路径用例 {case_id} 包含反向遍历但未开启 include_inverse"
+            )
+
+
 def _looks_like_labeling_placeholder(value: str) -> bool:
     normalized = value.strip().casefold()
     return any(

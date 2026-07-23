@@ -59,6 +59,7 @@ from .entity_similarity import project_similar_entity_candidates
 from .entity_visibility import list_entity_visibility
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
+from .graph_evaluation import evaluate_graph_dataset
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -533,6 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
     citation_evaluate.add_argument("--output", type=Path)
     citation_evaluate.add_argument("--allow-failures", action="store_true")
 
+    graph_evaluate = subparsers.add_parser(
+        "graph-evaluate",
+        help="用双人复核黄金集评测业务关系、路径方向和证据覆盖",
+    )
+    graph_evaluate.add_argument("dataset", type=Path)
+    graph_evaluate.add_argument("--output", type=Path)
+    graph_evaluate.add_argument("--allow-failures", action="store_true")
+
     evaluate = subparsers.add_parser("evaluate", help="运行证据保真质量评测并生成 JSON 报告")
     evaluate.add_argument("dataset", type=Path)
     evaluate.add_argument("--output", type=Path)
@@ -746,6 +755,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _handle_conflict_evaluate(paths, args)
         elif args.command == "citation-evaluate":
             _handle_citation_evaluate(paths, args)
+        elif args.command == "graph-evaluate":
+            _handle_graph_evaluate(database, paths, args)
         elif args.command == "evaluate":
             _handle_evaluate(paths, args)
         elif args.command == "labeling-pack":
@@ -1685,6 +1696,29 @@ def _handle_citation_evaluate(paths: WorkspacePaths, args) -> None:
     _print_mapping(aggregate)
     if aggregate["pass_rate"] < 1.0 and not args.allow_failures:
         raise KnowledgeWorkbenchError("引用支撑评测未全部通过；报告已保存")
+
+
+def _handle_graph_evaluate(
+    database: Database, paths: WorkspacePaths, args
+) -> None:
+    report = evaluate_graph_dataset(database, args.dataset)
+    output = args.output
+    if output is None:
+        timestamp = report["evaluated_at"].replace(":", "").replace("+", "-")
+        output = paths.evaluations / f"graph-evaluation-{timestamp}.json"
+    output = output.expanduser().resolve()
+    write_text_atomic(
+        output,
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    aggregate = report["aggregate"]
+    print(f"图谱评测报告：{output}")
+    _print_mapping(aggregate)
+    if (
+        aggregate["pass_rate"] < 1.0
+        or not report["safety"]["passed"]
+    ) and not args.allow_failures:
+        raise KnowledgeWorkbenchError("图谱评测未全部通过；报告已保存")
 
 
 def _handle_labeling_pack(database, paths: WorkspacePaths, args) -> None:

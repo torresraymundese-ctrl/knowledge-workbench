@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledge-workbench.local/schemas/graph-evaluation-v1.json",
+  "title": "Entity business graph evaluation dataset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "provenance",
+    "relation_cases",
+    "path_cases"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "name": {"type": "string", "minLength": 1},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["annotator", "reviewer", "reviewed_at", "decision"],
+      "properties": {
+        "annotator": {"type": "string", "minLength": 1, "maxLength": 80},
+        "reviewer": {"type": "string", "minLength": 1, "maxLength": 80},
+        "reviewed_at": {"type": "string", "format": "date-time"},
+        "decision": {"const": "approved"}
+      }
+    },
+    "relation_cases": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/relationCase"}
+    },
+    "path_cases": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/pathCase"}
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "relationCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "source_entity_id",
+        "target_entity_id",
+        "relation_key",
+        "expected_present",
+        "expected_direction",
+        "expected_supporting_evidence_ids"
+      ],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/id"},
+        "source_entity_id": {"$ref": "#/$defs/id"},
+        "target_entity_id": {"$ref": "#/$defs/id"},
+        "relation_key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,62}$"
+        },
+        "expected_present": {"type": "boolean"},
+        "expected_direction": {
+          "type": ["string", "null"],
+          "enum": ["forward", "reverse", "undirected", null]
+        },
+        "expected_supporting_evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/id"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"expected_present": {"const": true}},
+            "required": ["expected_present"]
+          },
+          "then": {
+            "properties": {
+              "expected_direction": {"type": "string"},
+              "expected_supporting_evidence_ids": {"minItems": 1}
+            }
+          },
+          "else": {
+            "properties": {
+              "expected_direction": {"type": "null"},
+              "expected_supporting_evidence_ids": {"maxItems": 0}
+            }
+          }
+        }
+      ]
+    },
+    "pathCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "source_entity_id",
+        "target_entity_id",
+        "max_depth",
+        "include_inverse",
+        "expected_reachable",
+        "expected_entity_ids",
+        "expected_relation_keys",
+        "expected_traversal_directions",
+        "expected_supporting_evidence_ids"
+      ],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/id"},
+        "source_entity_id": {"$ref": "#/$defs/id"},
+        "target_entity_id": {"$ref": "#/$defs/id"},
+        "max_depth": {"type": "integer", "minimum": 1, "maximum": 4},
+        "include_inverse": {"type": "boolean"},
+        "expected_reachable": {"type": "boolean"},
+        "expected_entity_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/id"}
+        },
+        "expected_relation_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,62}$"
+          }
+        },
+        "expected_traversal_directions": {
+          "type": "array",
+          "items": {
+            "enum": ["forward", "reverse", "undirected"]
+          }
+        },
+        "expected_supporting_evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/id"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"expected_reachable": {"const": true}},
+            "required": ["expected_reachable"]
+          },
+          "then": {
+            "properties": {
+              "expected_entity_ids": {"minItems": 2},
+              "expected_relation_keys": {"minItems": 1},
+              "expected_traversal_directions": {"minItems": 1},
+              "expected_supporting_evidence_ids": {"minItems": 1}
+            }
+          },
+          "else": {
+            "properties": {
+              "expected_entity_ids": {"maxItems": 0},
+              "expected_relation_keys": {"maxItems": 0},
+              "expected_traversal_directions": {"maxItems": 0},
+              "expected_supporting_evidence_ids": {"maxItems": 0}
+            }
+          }
+        }
+      ]
+    }
+  }
+}
