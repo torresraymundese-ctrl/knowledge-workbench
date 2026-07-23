@@ -101,6 +101,12 @@ from .conflict_labeling_plan import (
     create_conflict_labeling_plan,
     inspect_conflict_labeling_plan,
 )
+from .conflict_batch_workpacks import (
+    apply_conflict_batch_annotation_pack,
+    apply_conflict_batch_review_pack,
+    export_conflict_batch_annotation_pack,
+    export_conflict_batch_review_pack,
+)
 from .conflict_evaluation import evaluate_conflict_dataset
 from .citation_evaluation import evaluate_citation_dataset
 from .model_pipeline import analyze_with_model, generate_wiki_with_model
@@ -540,6 +546,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="校验冲突标注批次计划并查看动态标注复核进度",
     )
     conflict_batch_status.add_argument("plan", type=Path)
+    conflict_batch_annotation_export = conflict_sub.add_parser(
+        "batch-annotation-export",
+        help="导出一个冲突批次的本地 Obsidian 标注工作包",
+    )
+    conflict_batch_annotation_export.add_argument("plan_id")
+    conflict_batch_annotation_export.add_argument("batch_id")
+    conflict_batch_annotation_export.add_argument("output", type=Path)
+    conflict_batch_annotation_export.add_argument("--actor", required=True)
+    conflict_batch_annotation_apply = conflict_sub.add_parser(
+        "batch-annotation-apply",
+        help="原子应用一个完整冲突批次的人工标签",
+    )
+    conflict_batch_annotation_apply.add_argument("pack", type=Path)
+    conflict_batch_annotation_apply.add_argument("--actor", required=True)
+    conflict_batch_review_export = conflict_sub.add_parser(
+        "batch-review-export",
+        help="由不同复核人导出一个冲突批次的本地复核工作包",
+    )
+    conflict_batch_review_export.add_argument("plan_id")
+    conflict_batch_review_export.add_argument("batch_id")
+    conflict_batch_review_export.add_argument("output", type=Path)
+    conflict_batch_review_export.add_argument("--actor", required=True)
+    conflict_batch_review_apply = conflict_sub.add_parser(
+        "batch-review-apply",
+        help="原子应用一个完整冲突批次的异人复核决定",
+    )
+    conflict_batch_review_apply.add_argument("pack", type=Path)
+    conflict_batch_review_apply.add_argument("--actor", required=True)
     conflict_submit = conflict_sub.add_parser(
         "submit-pack", help="提交候选包中的人工冲突标签并写入审计"
     )
@@ -1655,6 +1689,42 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
             database, paths, args.plan
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.conflict_command == "batch-annotation-export":
+        output = export_conflict_batch_annotation_pack(
+            database,
+            paths,
+            args.plan_id,
+            args.batch_id,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"冲突批次标注工作包：{output}")
+        return
+    if args.conflict_command == "batch-annotation-apply":
+        result = apply_conflict_batch_annotation_pack(
+            database, paths, args.pack, actor=args.actor
+        )
+        print("冲突批次标签已原子应用。")
+        _print_mapping(result)
+        return
+    if args.conflict_command == "batch-review-export":
+        output = export_conflict_batch_review_pack(
+            database,
+            paths,
+            args.plan_id,
+            args.batch_id,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"冲突批次复核工作包：{output}")
+        return
+    if args.conflict_command == "batch-review-apply":
+        result = apply_conflict_batch_review_pack(
+            database, paths, args.pack, actor=args.actor
+        )
+        print("冲突批次复核决定已原子应用。")
+        _print_mapping(result)
         return
     if args.conflict_command == "submit-pack":
         result = submit_cross_document_candidate_annotations(

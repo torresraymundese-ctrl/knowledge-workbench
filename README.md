@@ -88,9 +88,14 @@ Set-Location "D:\全新知识库"
 # 把未截断完整候选包分层为覆盖全部候选的不重叠人工批次
 .\.venv\Scripts\knowledge.exe conflict batch-plan .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor coordinator-01 --batch-size 60 --seed real-conflict-v1
 .\.venv\Scripts\knowledge.exe conflict batch-status .\workspace\evaluations\cross-document-conflict-labeling-plan-实际时间.json
-# 在 workspace/evaluations 中填写每个候选的 label，且暂不填写 review
+# 逐批导出 Obsidian 兼容工作包；填写全部勾选项、冲突类型和 JSON 字符串意见后原子回写
+.\.venv\Scripts\knowledge.exe conflict batch-annotation-export cplan_计划ID batch_001 .\workspace\evaluations\batch_001-annotation.md --actor annotator-01
+.\.venv\Scripts\knowledge.exe conflict batch-annotation-apply .\workspace\evaluations\batch_001-annotation.md --actor annotator-01
+# 完成全部批次后提交整包，标签随即锁定
 .\.venv\Scripts\knowledge.exe conflict submit-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor annotator-01
-# 由另一人填写 review 后固化；标注人与复核人必须不同
+# 由另一人逐批复核；全部批次完成后固化
+.\.venv\Scripts\knowledge.exe conflict batch-review-export cplan_计划ID batch_001 .\workspace\evaluations\batch_001-review.md --actor reviewer-01
+.\.venv\Scripts\knowledge.exe conflict batch-review-apply .\workspace\evaluations\batch_001-review.md --actor reviewer-01
 .\.venv\Scripts\knowledge.exe conflict finalize-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json .\workspace\evaluations\cross-document-conflict-v1.json --name "真实跨文档冲突基线" --reviewer reviewer-01
 .\.venv\Scripts\knowledge.exe conflict-evaluate .\evaluation\conflict-sample.json
 .\.venv\Scripts\knowledge.exe citation-evaluate .\evaluation\citation-support-sample.json
@@ -191,5 +196,7 @@ Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审�
 “跨文档冲突标注”按候选包安全发现并提供状态筛选、文本搜索和每页10条的证据对比。经审计的完整分层计划会作为可选批次范围出现；计划列表不返回候选 ID 或原文，选择批次后后端重新校验计划身份、审计路径、来源候选包不可变身份、当前证据来源和全量覆盖，再只投影该批候选。标注保存前会重查当前文件版本、当前处理运行、密级、原文和全部定位，并要求客户端提交所见文件的 SHA-256；文件被其他页面或人工编辑后会拒绝覆盖。批次页面不保存标签，所有决定仍写回原候选包；整包标签完整且未截断时才可提交，提交审计固定标签摘要和标注人，此后 Web 锁定标签；只有不同操作者可以逐项复核，驳回必须填写意见。页面不自动采用规则预测、不创建业务冲突，也不开放数据集固化，最终 `finalize-pack` 继续由 CLI 执行。批次切换使用请求序号门禁，较慢的旧请求不能覆盖最后一次选择。
 
 `conflict batch-plan` 不抽样、不复制证据原文，也不建立第二套标签文件。它只接受未截断且来源仍有效的完整候选包，按“预测类型 × 高/中/低相似度”将每个候选 ID 确定性分配到一个且仅一个小批次；相同 seed 得到相同分配。计划只能新增到 `workspace/evaluations/`，内容哈希、路径、来源包不可变身份和 seed 哈希写入审计。`batch-status` 重验计划身份、生成审计、来源当前性和全量覆盖，再从原候选包动态统计每批标注与异人复核进度，因此人工决定仍只有原候选包这一套真相源。
+
+`batch-annotation-export/apply` 和 `batch-review-export/apply` 把一个经审计批次导出为本地 Obsidian 兼容 Markdown，内含左右证据原文、定位、规则预测以及必须人工填写的决定。工作包只能位于当前 `workspace/evaluations/`，禁止覆盖，并绑定计划、批次、actor、导出路径、来源候选包 ID 与完整 SHA-256；复制文件、跨 actor 应用、遗漏或重复字段、候选增删换序以及来源包并发变化都会整体阻断。应用以单次原子替换写回原候选包，任一候选无效时本批零写入；审计只记录候选 ID、计数、工作包哈希和意见哈希，不保存原文或意见正文。由于每次应用都会改变来源候选包哈希，工作包必须逐个串行应用（批次编号次序不限）：其他批次已保存后，旧工作包应使用新路径重新导出。规则预测只用于召回和排序，不能代替人工回源判断。
 
 Web 写操作必须填写 `actor`，使用进程级 CSRF 令牌、同源与 Host 校验，并继续调用既有证据、冲突、Wiki 修订、实体候选、实体合并、人工业务关系或冲突候选业务服务写入审计日志。Web 层不直接执行状态 SQL；正式发布、实体合并和业务关系登记/撤销仍由核心状态机执行原子更新与审计。关系类型管理、冲突候选固化及其他高影响写操作尚未开放。

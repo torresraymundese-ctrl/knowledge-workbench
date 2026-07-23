@@ -185,6 +185,73 @@ def update_cross_document_candidate_label(
     )
 
 
+def apply_cross_document_candidate_label_batch(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    labels: list[dict[str, Any]],
+    *,
+    expected_content_sha256: str,
+    plan_id: str,
+    batch_id: str,
+    work_pack_path: str,
+    work_pack_sha256: str,
+    actor: str,
+) -> dict[str, Any]:
+    actor = _required_actor(actor)
+    plan_id = _required_work_scope_id(plan_id, "plan_id")
+    batch_id = _required_work_scope_id(batch_id, "batch_id")
+    work_pack_path = _required_audit_text(
+        work_pack_path, "work_pack_path", maximum=500
+    )
+    work_pack_sha256 = _required_sha256(
+        work_pack_sha256, "work_pack_sha256"
+    )
+    normalized = _normalized_candidate_labels(labels)
+
+    def mutate(pack: dict[str, Any]) -> dict[str, Any]:
+        submission, drifted = _candidate_submission_state(database, pack)
+        if submission or drifted:
+            raise KnowledgeWorkbenchError("候选标签已提交，不能继续修改")
+        for item in normalized:
+            candidate = _candidate_by_id(pack, item["candidate_id"])
+            candidate["label"] = {
+                "expected_conflict": item["expected_conflict"],
+                "expected_type": item["expected_type"],
+                "note": item["note"],
+            }
+        return {
+            "event_type": "conflict_candidate_label_batch_applied",
+            "details": {
+                "candidate_ids": [
+                    item["candidate_id"] for item in normalized
+                ],
+                "plan_id": plan_id,
+                "batch_id": batch_id,
+                "work_pack_path": work_pack_path,
+                "work_pack_sha256": work_pack_sha256,
+                "candidate_count": len(normalized),
+                "conflict_count": sum(
+                    item["expected_conflict"] for item in normalized
+                ),
+                "note_sha256_by_candidate": {
+                    item["candidate_id"]: sha256_text(item["note"])
+                    for item in normalized
+                    if item["note"]
+                },
+            },
+        }
+
+    return _mutate_candidate_pack(
+        database,
+        paths,
+        pack_id,
+        expected_content_sha256=expected_content_sha256,
+        actor=actor,
+        mutate=mutate,
+    )
+
+
 def submit_cross_document_candidate_annotations_by_id(
     database: Database,
     paths: WorkspacePaths,
@@ -245,6 +312,84 @@ def update_cross_document_candidate_review(
                 "decision": decision,
                 "annotator": submission["actor"],
                 "note_sha256": sha256_text(note) if note else None,
+            },
+        }
+
+    return _mutate_candidate_pack(
+        database,
+        paths,
+        pack_id,
+        expected_content_sha256=expected_content_sha256,
+        actor=actor,
+        mutate=mutate,
+    )
+
+
+def apply_cross_document_candidate_review_batch(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    decisions: list[dict[str, Any]],
+    *,
+    expected_content_sha256: str,
+    plan_id: str,
+    batch_id: str,
+    work_pack_path: str,
+    work_pack_sha256: str,
+    actor: str,
+) -> dict[str, Any]:
+    actor = _required_actor(actor)
+    plan_id = _required_work_scope_id(plan_id, "plan_id")
+    batch_id = _required_work_scope_id(batch_id, "batch_id")
+    work_pack_path = _required_audit_text(
+        work_pack_path, "work_pack_path", maximum=500
+    )
+    work_pack_sha256 = _required_sha256(
+        work_pack_sha256, "work_pack_sha256"
+    )
+    normalized = _normalized_candidate_reviews(decisions)
+
+    def mutate(pack: dict[str, Any]) -> dict[str, Any]:
+        submission, drifted = _candidate_submission_state(database, pack)
+        if drifted:
+            raise KnowledgeWorkbenchError(
+                "候选包标签在提交审计后发生变化"
+            )
+        if not submission:
+            raise KnowledgeWorkbenchError("候选标签尚未提交，不能复核")
+        if submission["actor"] == actor:
+            raise KnowledgeWorkbenchError("标注人与复核人必须不同")
+        for item in normalized:
+            candidate = _candidate_by_id(pack, item["candidate_id"])
+            candidate["review"] = {
+                "decision": item["decision"],
+                "note": item["note"],
+            }
+        return {
+            "event_type": "conflict_candidate_review_batch_applied",
+            "details": {
+                "candidate_ids": [
+                    item["candidate_id"] for item in normalized
+                ],
+                "plan_id": plan_id,
+                "batch_id": batch_id,
+                "work_pack_path": work_pack_path,
+                "work_pack_sha256": work_pack_sha256,
+                "candidate_count": len(normalized),
+                "approved_count": sum(
+                    item["decision"] == "approved"
+                    for item in normalized
+                ),
+                "rejected_count": sum(
+                    item["decision"] == "rejected"
+                    for item in normalized
+                ),
+                "annotator": submission["actor"],
+                "note_sha256_by_candidate": {
+                    item["candidate_id"]: sha256_text(item["note"])
+                    for item in normalized
+                    if item["note"]
+                },
             },
         }
 
@@ -655,6 +800,123 @@ def _candidate_note(value: str | None, *, required: bool) -> str | None:
     return note or None
 
 
+def _required_work_scope_id(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise KnowledgeWorkbenchError(f"{name} 不能为空")
+    normalized = value.strip()
+    if len(normalized) > 100:
+        raise KnowledgeWorkbenchError(f"{name} 不能超过 100 个字符")
+    return normalized
+
+
+def _required_audit_text(
+    value: str, name: str, *, maximum: int
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise KnowledgeWorkbenchError(f"{name} 不能为空")
+    normalized = value.strip()
+    if len(normalized) > maximum:
+        raise KnowledgeWorkbenchError(
+            f"{name} 不能超过 {maximum} 个字符"
+        )
+    return normalized
+
+
+def _required_sha256(value: str, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise KnowledgeWorkbenchError(f"{name} 必须是小写 SHA-256")
+    return value
+
+
+def _normalized_candidate_labels(
+    labels: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(labels, list) or not labels:
+        raise KnowledgeWorkbenchError("批次标签不能为空")
+    if len(labels) > 200:
+        raise KnowledgeWorkbenchError("单批次标签不能超过 200 条")
+    normalized = []
+    seen: set[str] = set()
+    for item in labels:
+        if not isinstance(item, dict):
+            raise KnowledgeWorkbenchError("批次标签必须是对象")
+        candidate_id = item.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise KnowledgeWorkbenchError("批次标签缺少 candidate_id")
+        if candidate_id in seen:
+            raise KnowledgeWorkbenchError(
+                f"批次标签包含重复候选：{candidate_id}"
+            )
+        seen.add(candidate_id)
+        expected_conflict = item.get("expected_conflict")
+        expected_type = item.get("expected_type")
+        if not isinstance(expected_conflict, bool):
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate_id} 必须明确标注冲突或非冲突"
+            )
+        if expected_conflict and expected_type not in _CONFLICT_TYPES:
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate_id} 标记冲突时必须指定有效类型"
+            )
+        if not expected_conflict and expected_type is not None:
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate_id} 标记非冲突时类型必须为 null"
+            )
+        normalized.append(
+            {
+                "candidate_id": candidate_id,
+                "expected_conflict": expected_conflict,
+                "expected_type": expected_type,
+                "note": _candidate_note(
+                    item.get("note"), required=False
+                ),
+            }
+        )
+    return normalized
+
+
+def _normalized_candidate_reviews(
+    decisions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(decisions, list) or not decisions:
+        raise KnowledgeWorkbenchError("批次复核决定不能为空")
+    if len(decisions) > 200:
+        raise KnowledgeWorkbenchError("单批次复核不能超过 200 条")
+    normalized = []
+    seen: set[str] = set()
+    for item in decisions:
+        if not isinstance(item, dict):
+            raise KnowledgeWorkbenchError("批次复核决定必须是对象")
+        candidate_id = item.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise KnowledgeWorkbenchError("批次复核缺少 candidate_id")
+        if candidate_id in seen:
+            raise KnowledgeWorkbenchError(
+                f"批次复核包含重复候选：{candidate_id}"
+            )
+        seen.add(candidate_id)
+        decision = item.get("decision")
+        if decision not in {"approved", "rejected"}:
+            raise KnowledgeWorkbenchError(
+                f"候选 {candidate_id} 必须选择批准或驳回"
+            )
+        normalized.append(
+            {
+                "candidate_id": candidate_id,
+                "decision": decision,
+                "note": _candidate_note(
+                    item.get("note"),
+                    required=decision == "rejected",
+                ),
+            }
+        )
+    return normalized
+
+
 def _require_content_sha256(path: Path, expected: str) -> None:
     if not isinstance(expected, str) or len(expected) != 64:
         raise KnowledgeWorkbenchError("expected_content_sha256 无效")
@@ -729,15 +991,18 @@ def _mutate_candidate_pack(
             write_text_atomic(path, original_content)
             raise
         submission, drifted = _candidate_submission_state(database, pack)
-        return {
+        result = {
             "pack_id": pack_id,
-            "candidate_id": event["details"]["candidate_id"],
             "content_sha256": after_sha256,
             "phase": _candidate_pack_phase(
                 submission, drifted, _candidate_counts(pack)
             ),
             "actor": actor,
         }
+        for key in ("candidate_id", "candidate_ids", "plan_id", "batch_id"):
+            if key in event["details"]:
+                result[key] = event["details"][key]
+        return result
 
 
 def _validated_labels(pack: dict[str, Any]) -> list[dict[str, Any]]:
