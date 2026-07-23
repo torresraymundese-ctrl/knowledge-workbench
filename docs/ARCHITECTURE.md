@@ -38,6 +38,7 @@
 | `entity_relationships.py` | 人工业务关系类型、证据支撑关系、撤销历史和安全图谱投影 |
 | `graph_projection.py` | 当前非受限证据上的只读实体共现节点、边和支持证据投影 |
 | `graph_evaluation.py` | 双人复核图谱黄金集的关系方向、证据覆盖、路径和 restricted 泄漏评测 |
+| `graph_pilot.py` | 从 approved 黄金证据选择生成受控试点快照，不自动审核或写入实体图谱 |
 | `ingest.py` | 事务化导入、文件版本、派生重处理、证据、草稿和审计 |
 | `review.py` | 证据与页面修订状态机 |
 | `tasks.py` | 持久化任务、租约所有权与续租、指数退避、幂等和宕机恢复 |
@@ -82,6 +83,7 @@
 - Schema v12 以 `entity_relation_types`、`entity_relationships` 和 `entity_relationship_evidence` 保存人工定义的业务关系真相。关系类型明确有向/无向；登记关系必须引用至少一条当前 verified 证据，且每条证据都已通过 `evidence_entity_mentions` 人工确认同时逐字提及两个 active 端点。无向端点按 ID 规范化，active 关系按类型与方向唯一；关系只允许 `active → retracted`，撤销不删除证据或历史，登记与撤销说明只保存 SHA-256。模型候选、共现投影和相似度候选均不能自动写入业务关系。
 - `manual-business-relationships-v1` 是业务关系的只读安全投影，只返回仍有当前 verified 非 restricted 支撑的 active 边及证据 ID，不返回原文。文件版本或证据状态变化会让过期支撑退出投影而不改写历史；Lint 对没有当前 verified 支撑的 active 关系给出待复核警告，并校验所有历史支撑仍同时关联两个端点。为避免语义被无声改写，已被任何关系历史引用的端点提及不可解除；实体合并在源实体存在任何业务关系历史时阻断，而不是迁移或重写旧关系。
 - 图谱黄金评测只接受异人复核批准的数据集，数据集不保存原文。评测前逐项确认实体仍为 active，黄金证据仍是当前 verified 非 restricted；任何来源漂移都会整体阻断。报告分别计算关系存在性、方向、证据覆盖和受限深度路径指标，并独立报告 restricted 支撑泄漏数；多跳路径只按明确标注的实体、关系和遍历方向匹配，不将可达性提升为业务事实。
+- 图谱试点证据包只从 approved 黄金标注会话的必要证据构建，要求每个来源用例已经异人批准，文件版本、处理运行和密级仍与标注时一致；restricted 逐条排除。包内原文和定位只能保存在 `workspace/evaluations/`，禁止覆盖，审计只记录内容哈希、相对路径和计数。试点包没有写回入口，不会自动转换证据状态、创建实体或登记关系。
 - `draft` 证据不能跳过 `reviewing` 直接变成 `verified`。
 - 页面发布前必须至少引用一条证据，且所有引用证据都是 `verified`；核心发布函数在事务内再次校验 Markdown 路径和内容哈希。
 - 已发布页面的新资料生成新修订，不覆盖当前已验证修订。

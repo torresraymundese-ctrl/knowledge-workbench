@@ -60,6 +60,7 @@ from .entity_visibility import list_entity_visibility
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
 from .graph_evaluation import evaluate_graph_dataset
+from .graph_pilot import build_graph_pilot_pack
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -356,6 +357,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="显式允许反向遍历有向关系",
     )
     graph_paths.add_argument("--limit", type=int, default=50)
+    graph_pilot = graph_sub.add_parser(
+        "pilot-pack",
+        help="从 approved 黄金标注会话生成只读图谱试点证据包",
+    )
+    graph_pilot.add_argument("session_id")
+    graph_pilot.add_argument("--actor", required=True)
+    graph_pilot.add_argument("--output", type=Path)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -730,7 +738,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "relation":
             _handle_relation(args, database)
         elif args.command == "graph":
-            _handle_graph(args, database)
+            _handle_graph(args, database, paths)
         elif args.command == "page":
             _handle_page(args, database, paths)
         elif args.command == "search":
@@ -1082,7 +1090,9 @@ def _handle_entity(args, database) -> None:
         )
 
 
-def _handle_graph(args, database) -> None:
+def _handle_graph(
+    args, database: Database, paths: WorkspacePaths
+) -> None:
     if args.graph_command == "project":
         payload = project_entity_graph(
             database,
@@ -1110,6 +1120,23 @@ def _handle_graph(args, database) -> None:
             limit=args.limit,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.graph_command == "pilot-pack":
+        output = args.output
+        if output is None:
+            output = (
+                paths.evaluations
+                / f"graph-pilot-{args.session_id}.json"
+            )
+        pack = build_graph_pilot_pack(
+            database,
+            paths,
+            args.session_id,
+            output,
+            actor=args.actor,
+        )
+        print(f"图谱试点证据包：{output.expanduser().resolve()}")
+        _print_mapping(pack["statistics"])
 
 
 def _handle_relation(args, database) -> None:

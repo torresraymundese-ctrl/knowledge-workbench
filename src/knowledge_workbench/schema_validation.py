@@ -233,6 +233,29 @@ def validate_graph_evaluation_dataset(payload: dict) -> None:
             )
 
 
+def validate_graph_pilot_pack(payload: dict) -> None:
+    _validate(payload, "graph-pilot-pack-v1.json")
+    evidence_ids = [
+        candidate["evidence_id"] for candidate in payload["candidates"]
+    ]
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise KnowledgeWorkbenchError("图谱试点证据包包含重复 evidence_id")
+    exported_count = payload["statistics"]["exported_evidence_count"]
+    if exported_count != len(evidence_ids):
+        raise KnowledgeWorkbenchError("图谱试点证据包导出计数不一致")
+    selected_count = payload["statistics"]["selected_evidence_count"]
+    restricted_count = payload["statistics"][
+        "restricted_evidence_excluded"
+    ]
+    if selected_count != exported_count + restricted_count:
+        raise KnowledgeWorkbenchError("图谱试点证据包选择与排除计数不一致")
+    status_total = sum(
+        payload["statistics"]["status_counts"].values()
+    )
+    if status_total != exported_count:
+        raise KnowledgeWorkbenchError("图谱试点证据包状态计数不一致")
+
+
 def _looks_like_labeling_placeholder(value: str) -> bool:
     normalized = value.strip().casefold()
     return any(
