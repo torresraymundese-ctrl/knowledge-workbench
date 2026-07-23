@@ -8,7 +8,9 @@ from knowledge_workbench.database import Database
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.graph_pilot import (
     build_graph_pilot_pack,
+    graph_pilot_pack_page,
     inspect_graph_pilot_pack,
+    list_graph_pilot_packs,
 )
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.labeling import (
@@ -19,6 +21,11 @@ from knowledge_workbench.labeling import (
     submit_labeling_session,
 )
 from knowledge_workbench.models import Classification
+from knowledge_workbench.web_service import (
+    WorkbenchActionService,
+    WorkbenchReadService,
+)
+from knowledge_workbench.webapp import WorkbenchWebApplication
 
 
 class GraphPilotPackTests(unittest.TestCase):
@@ -178,6 +185,94 @@ class GraphPilotPackTests(unittest.TestCase):
                 "甲公司负责平台建设",
                 json.dumps(status, ensure_ascii=False),
             )
+            listing = list_graph_pilot_packs(database, paths)
+            self.assertEqual(listing["total"], 1)
+            self.assertEqual(listing["invalid_pack_count"], 0)
+            page = graph_pilot_pack_page(
+                database, paths, pack["pack_id"], limit=1
+            )
+            self.assertEqual(page["total"], 1)
+            self.assertEqual(page["items"][0]["status"], "draft")
+            self.assertNotIn(
+                "excerpt", json.dumps(page, ensure_ascii=False)
+            )
+
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+            packs_response = application.handle(
+                "GET", "/api/v1/graph-pilot-packs"
+            )
+            self.assertEqual(packs_response.status, 200)
+            self.assertNotIn(
+                "甲公司负责平台建设",
+                packs_response.body.decode("utf-8"),
+            )
+            page_response = application.handle(
+                "GET",
+                f"/api/v1/graph-pilot-packs/{pack['pack_id']}?status=draft",
+            )
+            self.assertEqual(page_response.status, 200)
+            self.assertNotIn(
+                "甲公司负责平台建设",
+                page_response.body.decode("utf-8"),
+            )
+            invalid_filter = application.handle(
+                "GET",
+                f"/api/v1/graph-pilot-packs/{pack['pack_id']}?status=pending",
+            )
+            self.assertEqual(invalid_filter.status, 400)
+            invalid_limit = application.handle(
+                "GET",
+                f"/api/v1/graph-pilot-packs/{pack['pack_id']}?limit=51",
+            )
+            self.assertEqual(invalid_limit.status, 400)
+            transition_route = (
+                f"/api/v1/evidence/{internal_evidence}/transition"
+            )
+            transition_body = json.dumps(
+                {"target": "reviewing", "actor": "reviewer-03"}
+            ).encode("utf-8")
+            missing_csrf = application.handle(
+                "POST",
+                transition_route,
+                body=transition_body,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(missing_csrf.status, 403)
+            headers = {
+                "Content-Type": "application/json",
+                "X-Workbench-CSRF": "csrf",
+            }
+            transitioned = application.handle(
+                "POST",
+                transition_route,
+                body=transition_body,
+                headers=headers,
+            )
+            self.assertEqual(transitioned.status, 200)
+            verified = application.handle(
+                "POST",
+                transition_route,
+                body=json.dumps(
+                    {"target": "verified", "actor": "reviewer-04"}
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(verified.status, 200)
+            verified_page = graph_pilot_pack_page(
+                database,
+                paths,
+                pack["pack_id"],
+                status="verified",
+            )
+            self.assertEqual(verified_page["total"], 1)
+            self.assertEqual(
+                verified_page["summary"]["verified_evidence_coverage"],
+                1.0,
+            )
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "不允许静默覆盖"
             ):
@@ -194,6 +289,11 @@ class GraphPilotPackTests(unittest.TestCase):
                 KnowledgeWorkbenchError, "审计记录"
             ):
                 inspect_graph_pilot_pack(database, paths, copied)
+            listing_with_copy = list_graph_pilot_packs(database, paths)
+            self.assertEqual(listing_with_copy["total"], 1)
+            self.assertEqual(
+                listing_with_copy["invalid_pack_count"], 1
+            )
 
     def test_requires_approved_session_and_workspace_output(self):
         with tempfile.TemporaryDirectory() as temporary:

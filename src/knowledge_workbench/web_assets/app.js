@@ -38,6 +38,7 @@ const eventLabels = {
   entity_relation_type_created: "业务关系类型已登记",
   entity_relationship_created: "业务关系已登记",
   entity_relationship_retracted: "业务关系已撤销",
+  graph_pilot_pack_created: "图谱试点证据包已生成",
   worker_started: "后台工作器已启动",
   worker_stopped: "后台工作器已停止",
   labeling_session_created: "黄金标注已创建",
@@ -65,6 +66,13 @@ const candidateState = {
   state: "all",
   query: "",
   contentSha256: "",
+};
+const graphPilotState = {
+  limit: 10,
+  offset: 0,
+  packId: "",
+  status: "all",
+  query: "",
 };
 const entityCandidateState = {
   limit: 10,
@@ -1369,6 +1377,142 @@ async function loadCandidatePacks() {
   await loadCandidatePage();
 }
 
+function graphPilotProgress(label, value, detail, tone = "") {
+  const card = element("article", `graph-pilot-progress ${tone}`.trim());
+  card.append(
+    element("span", "", label),
+    element("strong", "", value),
+    element("small", "", detail),
+  );
+  return card;
+}
+
+function renderGraphPilotPage(page) {
+  const summary = page.summary;
+  document.querySelector("#graph-pilot-count").textContent = `${page.total} / ${summary.candidate_count} 条`;
+  const summaryRoot = document.querySelector("#graph-pilot-summary");
+  summaryRoot.replaceChildren(
+    graphPilotProgress(
+      "来源快照",
+      `${summary.snapshot_valid_count}/${summary.candidate_count}`,
+      summary.source_snapshot_passed ? "正文、定位、版本与运行一致" : `${summary.snapshot_invalid_count} 条失效`,
+      summary.source_snapshot_passed ? "ok" : "danger",
+    ),
+    graphPilotProgress(
+      "证据审核",
+      `${Math.round(summary.verified_evidence_coverage * 100)}%`,
+      `${summary.verified_evidence_count} 条 verified · ${summary.status_counts.draft || 0} 条 draft`,
+      summary.evidence_review_complete ? "ok" : "warn",
+    ),
+    graphPilotProgress(
+      "实体绑定",
+      `${summary.verified_with_two_entities_count}`,
+      `${summary.verified_with_entity_count} 条有实体 · ${summary.relationship_ready_evidence_count} 条关系就绪`,
+    ),
+    graphPilotProgress(
+      "关系与黄金集",
+      summary.graph_gold_prerequisites_met ? "可开始" : "未就绪",
+      `${summary.verified_with_active_relationship_count} 条已有 active 关系`,
+      summary.graph_gold_prerequisites_met ? "ok" : "warn",
+    ),
+  );
+
+  const list = document.querySelector("#graph-pilot-list");
+  list.replaceChildren();
+  if (!page.items.length) {
+    list.append(element("div", "panel empty", "当前筛选下没有试点证据"));
+  } else {
+    page.items.forEach((item) => {
+      const card = element("article", "panel graph-pilot-card");
+      const heading = element("div", "graph-pilot-card-heading");
+      const identity = element("div");
+      identity.append(
+        element("h3", "", item.document_name),
+        element("small", "", `${shortId(item.evidence_id)} · #${item.ordinal} · ${item.case_ids.join("、")}`),
+      );
+      heading.append(
+        identity,
+        element("span", `tag ${item.classification}`, item.classification),
+        element("span", `state ${item.status === "verified" ? "ok" : "warn"}`, statusLabels[item.status] || item.status),
+      );
+      const metadata = element("div", "graph-pilot-card-meta");
+      metadata.append(
+        element("span", "", `${item.location_count} 个定位`),
+        element("span", "", `${item.active_entity_count} 个 active 实体`),
+        element("span", "", `${item.active_relationship_count} 条 active 关系`),
+        element("span", item.ready_for_relationship_registration ? "state ok" : "state", item.ready_for_relationship_registration ? "可登记关系" : "尚未满足关系登记条件"),
+      );
+      const actions = element("div", "queue-actions");
+      actions.append(button("查看并审核", "primary", () => openEvidence(item.evidence_id)));
+      card.append(heading, metadata, actions);
+      list.append(card);
+    });
+  }
+
+  const pagination = document.querySelector("#graph-pilot-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    graphPilotState.offset = Math.max(0, page.offset - page.limit);
+    await loadGraphPilotPage();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    graphPilotState.offset = page.offset + page.limit;
+    await loadGraphPilotPage();
+  });
+  next.disabled = !page.has_next;
+  pagination.replaceChildren(
+    previous,
+    element("span", "", `第 ${pageNumber}/${pageCount} 页 · ${page.total} 项`),
+    next,
+  );
+}
+
+async function loadGraphPilotPage() {
+  if (!graphPilotState.packId) return;
+  const parameters = new URLSearchParams({
+    limit: String(graphPilotState.limit),
+    offset: String(graphPilotState.offset),
+    status: graphPilotState.status,
+  });
+  if (graphPilotState.query) parameters.set("q", graphPilotState.query);
+  const response = await fetch(`/api/v1/graph-pilot-packs/${encodeURIComponent(graphPilotState.packId)}?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `图谱试点包读取失败（HTTP ${response.status}）`);
+  renderGraphPilotPage(page);
+}
+
+async function loadGraphPilotPacks() {
+  const response = await fetch("/api/v1/graph-pilot-packs", { headers: { Accept: "application/json" } });
+  const listing = await response.json();
+  if (!response.ok) throw new Error(listing.error || `图谱试点包列表读取失败（HTTP ${response.status}）`);
+  const selector = document.querySelector("#graph-pilot-pack");
+  const previous = graphPilotState.packId;
+  selector.replaceChildren();
+  listing.items.forEach((item) => {
+    const summary = item.summary;
+    const option = element("option", "", `${item.source_labeling_session_name} · verified ${summary.verified_evidence_count}/${summary.candidate_count}`);
+    option.value = item.pack_id;
+    selector.append(option);
+  });
+  graphPilotState.packId = listing.items.some((item) => item.pack_id === previous)
+    ? previous
+    : listing.items[0]?.pack_id || "";
+  selector.value = graphPilotState.packId;
+  if (!graphPilotState.packId) {
+    const message = listing.invalid_pack_count
+      ? `没有有效试点包；${listing.invalid_pack_count} 个文件校验失败`
+      : "尚无有效图谱试点证据包";
+    document.querySelector("#graph-pilot-count").textContent = "0 个";
+    document.querySelector("#graph-pilot-summary").replaceChildren(element("div", "empty", message));
+    document.querySelector("#graph-pilot-list").replaceChildren();
+    document.querySelector("#graph-pilot-pagination").replaceChildren();
+    return;
+  }
+  await loadGraphPilotPage();
+}
+
 function renderEvaluations(reports) {
   const root = document.querySelector("#evaluations");
   root.replaceChildren();
@@ -1429,6 +1573,13 @@ async function loadDashboard() {
       document.querySelector("#candidate-pagination").replaceChildren();
       showBanner(message);
     });
+    const graphPilotLoad = loadGraphPilotPacks().catch((cause) => {
+      const message = cause instanceof Error ? cause.message : "图谱试点包读取失败";
+      document.querySelector("#graph-pilot-summary").replaceChildren(element("div", "empty", message));
+      document.querySelector("#graph-pilot-list").replaceChildren();
+      document.querySelector("#graph-pilot-pagination").replaceChildren();
+      showBanner(message);
+    });
     const entityCandidateLoad = loadEntityCandidates().catch((cause) => {
       const message = cause instanceof Error ? cause.message : "实体候选读取失败";
       document.querySelector("#entity-candidate-list").replaceChildren(element("div", "panel empty", message));
@@ -1447,7 +1598,7 @@ async function loadDashboard() {
       document.querySelector("#entity-relationship-pagination").replaceChildren();
       showBanner(message);
     });
-    await Promise.all([loadReviewQueues(), candidateLoad, entityCandidateLoad, entityMergeLoad, entityRelationshipLoad]);
+    await Promise.all([loadReviewQueues(), graphPilotLoad, candidateLoad, entityCandidateLoad, entityMergeLoad, entityRelationshipLoad]);
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -1485,6 +1636,33 @@ document.querySelector("#clear-review-filters").addEventListener("click", async 
   reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
   reviewState.historyOffset = 0;
   await refreshReviewQueues();
+});
+document.querySelector("#graph-pilot-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  graphPilotState.packId = document.querySelector("#graph-pilot-pack").value;
+  graphPilotState.status = document.querySelector("#graph-pilot-status").value;
+  graphPilotState.query = document.querySelector("#graph-pilot-query").value.trim();
+  graphPilotState.offset = 0;
+  try { await loadGraphPilotPage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "图谱试点包读取失败");
+  }
+});
+document.querySelector("#graph-pilot-pack").addEventListener("change", async (event) => {
+  graphPilotState.packId = event.target.value;
+  graphPilotState.offset = 0;
+  try { await loadGraphPilotPage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "图谱试点包读取失败");
+  }
+});
+document.querySelector("#clear-graph-pilot-filters").addEventListener("click", async () => {
+  document.querySelector("#graph-pilot-status").value = "all";
+  document.querySelector("#graph-pilot-query").value = "";
+  graphPilotState.status = "all";
+  graphPilotState.query = "";
+  graphPilotState.offset = 0;
+  try { await loadGraphPilotPage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "图谱试点包读取失败");
+  }
 });
 document.querySelector("#entity-candidate-filters").addEventListener("submit", async (event) => {
   event.preventDefault();

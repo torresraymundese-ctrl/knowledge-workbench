@@ -28,6 +28,7 @@ from .entity_relationships import (
 )
 from .entity_visibility import get_entity_visibility, list_entity_visibility
 from .errors import KnowledgeWorkbenchError
+from .graph_pilot import graph_pilot_pack_page, list_graph_pilot_packs
 from .models import ConflictStatus, EvidenceStatus
 from .review import (
     publish_revision,
@@ -63,6 +64,28 @@ class WorkbenchReadService:
 
     def conflict_candidate_packs(self) -> dict[str, Any]:
         return list_cross_document_candidate_packs(self.database, self.paths)
+
+    def graph_pilot_packs(self) -> dict[str, Any]:
+        return list_graph_pilot_packs(self.database, self.paths)
+
+    def graph_pilot_pack_page(
+        self,
+        pack_id: str,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        status: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        return graph_pilot_pack_page(
+            self.database,
+            self.paths,
+            pack_id,
+            limit=limit,
+            offset=offset,
+            status=status,
+            query=query,
+        )
 
     def conflict_candidate_page(
         self,

@@ -13,6 +13,167 @@ from .utils import sha256_text, utc_now
 from .wiki import write_text_atomic
 
 
+PILOT_EVIDENCE_STATUSES = frozenset(
+    {
+        "draft",
+        "reviewing",
+        "verified",
+        "conflicted",
+        "deprecated",
+        "archived",
+    }
+)
+
+
+def list_graph_pilot_packs(
+    database: Database,
+    paths: WorkspacePaths,
+) -> dict:
+    items = []
+    invalid_pack_count = 0
+    seen: set[str] = set()
+    for pack_path in sorted(paths.evaluations.glob("*.json")):
+        try:
+            raw = json.loads(pack_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(raw, dict)
+            or raw.get("kind") != "graph-pilot-evidence-pack"
+        ):
+            continue
+        try:
+            status = inspect_graph_pilot_pack(
+                database, paths, pack_path
+            )
+            _, _, pack = _read_pack(paths, pack_path)
+        except KnowledgeWorkbenchError:
+            invalid_pack_count += 1
+            continue
+        if pack["pack_id"] in seen:
+            invalid_pack_count += 1
+            continue
+        seen.add(pack["pack_id"])
+        items.append(
+            {
+                "pack_id": pack["pack_id"],
+                "generated_at": pack["generated_at"],
+                "generated_by": pack["generated_by"],
+                "source_labeling_session_id": pack[
+                    "source_labeling_session"
+                ]["session_id"],
+                "source_labeling_session_name": pack[
+                    "source_labeling_session"
+                ]["name"],
+                "summary": status["summary"],
+            }
+        )
+    items.sort(
+        key=lambda item: (item["generated_at"], item["pack_id"]),
+        reverse=True,
+    )
+    return {
+        "items": items,
+        "total": len(items),
+        "invalid_pack_count": invalid_pack_count,
+    }
+
+
+def graph_pilot_pack_page(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_id: str,
+    *,
+    limit: int = 10,
+    offset: int = 0,
+    status: str | None = None,
+    query: str | None = None,
+) -> dict:
+    limit, offset = _pagination(limit, offset)
+    normalized_status = (status or "all").strip().casefold()
+    if (
+        normalized_status != "all"
+        and normalized_status not in PILOT_EVIDENCE_STATUSES
+    ):
+        raise ValueError("图谱试点证据状态筛选无效")
+    normalized_query = (query or "").strip()
+    if len(normalized_query) > 120:
+        raise ValueError("图谱试点搜索不能超过 120 个字符")
+    pack_path = _find_pack_path(paths, pack_id)
+    pack_path, _, pack = _read_pack(paths, pack_path)
+    status_report = inspect_graph_pilot_pack(
+        database, paths, pack_path
+    )
+    summary = status_report["summary"]
+    if (
+        not summary["source_snapshot_passed"]
+        or not summary["classification_boundary_passed"]
+    ):
+        raise KnowledgeWorkbenchError(
+            "图谱试点证据包来源快照或密级边界已失效"
+        )
+    current_by_id = {
+        item["evidence_id"]: item for item in status_report["items"]
+    }
+    query_folded = normalized_query.casefold()
+    items = []
+    for candidate in pack["candidates"]:
+        current = current_by_id[candidate["evidence_id"]]
+        if (
+            normalized_status != "all"
+            and current["status"] != normalized_status
+        ):
+            continue
+        searchable = (
+            candidate["evidence_id"],
+            candidate["document_name"],
+            str(candidate["run_ordinal"]),
+            *candidate["case_ids"],
+        )
+        if query_folded and not any(
+            query_folded in value.casefold() for value in searchable
+        ):
+            continue
+        items.append(
+            {
+                "evidence_id": candidate["evidence_id"],
+                "case_ids": candidate["case_ids"],
+                "status": current["status"],
+                "ordinal": candidate["run_ordinal"],
+                "document_name": candidate["document_name"],
+                "classification": candidate["classification"],
+                "locator": candidate["locators"][0],
+                "location_count": len(candidate["locators"]),
+                "active_entity_count": current["active_entity_count"],
+                "active_relationship_count": current[
+                    "active_relationship_count"
+                ],
+                "ready_for_relationship_registration": current[
+                    "ready_for_relationship_registration"
+                ],
+            }
+        )
+    total = len(items)
+    returned = items[offset : offset + limit]
+    return {
+        "pack_id": pack["pack_id"],
+        "source_labeling_session_id": pack[
+            "source_labeling_session"
+        ]["session_id"],
+        "summary": summary,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_previous": offset > 0,
+        "has_next": offset + len(returned) < total,
+        "filters": {
+            "status": normalized_status,
+            "query": normalized_query or None,
+        },
+        "items": returned,
+    }
+
+
 def inspect_graph_pilot_pack(
     database: Database,
     paths: WorkspacePaths,
@@ -435,6 +596,29 @@ def _read_pack(
     return pack_path, content, pack
 
 
+def _find_pack_path(paths: WorkspacePaths, pack_id: str) -> Path:
+    pack_id = pack_id.strip()
+    if not pack_id:
+        raise KnowledgeWorkbenchError("图谱试点证据包 ID 不能为空")
+    matched = []
+    for pack_path in sorted(paths.evaluations.glob("*.json")):
+        try:
+            raw = json.loads(pack_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(raw, dict)
+            and raw.get("kind") == "graph-pilot-evidence-pack"
+            and raw.get("pack_id") == pack_id
+        ):
+            matched.append(pack_path)
+    if not matched:
+        raise KnowledgeWorkbenchError("图谱试点证据包不存在")
+    if len(matched) > 1:
+        raise KnowledgeWorkbenchError("图谱试点证据包 ID 重复，无法安全读取")
+    return matched[0]
+
+
 def _pack_id(pack: dict) -> str:
     identity = {
         key: value for key, value in pack.items() if key != "pack_id"
@@ -486,6 +670,14 @@ def _validate_pack_audit(
 
 def _coverage(numerator: int, denominator: int) -> float:
     return round(0.0 if denominator == 0 else numerator / denominator, 6)
+
+
+def _pagination(limit: int, offset: int) -> tuple[int, int]:
+    if limit <= 0 or limit > 50:
+        raise ValueError("图谱试点分页 limit 必须在 1 到 50 之间")
+    if offset < 0:
+        raise ValueError("图谱试点分页 offset 不能为负数")
+    return limit, offset
 
 
 def _required_actor(value: str) -> str:

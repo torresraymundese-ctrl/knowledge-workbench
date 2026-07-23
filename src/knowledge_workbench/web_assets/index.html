@@ -19,12 +19,13 @@
         <a class="nav-item active" href="#overview"><span>总览</span><kbd>1</kbd></a>
         <a class="nav-item" href="#documents"><span>资料</span><kbd>2</kbd></a>
         <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
-        <a class="nav-item" href="#entity-candidates"><span>实体候选</span><kbd>4</kbd></a>
-        <a class="nav-item" href="#entity-merges"><span>实体合并</span><kbd>5</kbd></a>
-        <a class="nav-item" href="#entity-relationships"><span>业务关系</span><kbd>6</kbd></a>
-        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>7</kbd></a>
-        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>8</kbd></a>
-        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>9</kbd></a>
+        <a class="nav-item" href="#graph-pilot"><span>图谱试点</span><kbd>4</kbd></a>
+        <a class="nav-item" href="#entity-candidates"><span>实体候选</span><kbd>5</kbd></a>
+        <a class="nav-item" href="#entity-merges"><span>实体合并</span><kbd>6</kbd></a>
+        <a class="nav-item" href="#entity-relationships"><span>业务关系</span><kbd>7</kbd></a>
+        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>8</kbd></a>
+        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>9</kbd></a>
+        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>10</kbd></a>
       </nav>
       <div class="local-lock">
         <span class="status-dot" aria-hidden="true"></span>
@@ -143,6 +144,43 @@
           <span id="rejected-history-count" class="count-pill">—</span>
         </div>
         <div id="rejected-history" class="rejected-history panel"></div>
+      </section>
+
+      <section id="graph-pilot" aria-labelledby="graph-pilot-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">GRAPH PILOT</p><h2 id="graph-pilot-title">真实图谱试点审核</h2></div>
+          <span id="graph-pilot-count" class="count-pill">—</span>
+        </div>
+        <form id="graph-pilot-filters" class="candidate-toolbar graph-pilot-toolbar" role="search">
+          <label>
+            <span>试点包</span>
+            <select id="graph-pilot-pack"></select>
+          </label>
+          <label>
+            <span>证据状态</span>
+            <select id="graph-pilot-status">
+              <option value="all">全部状态</option>
+              <option value="draft">草稿</option>
+              <option value="reviewing">审核中</option>
+              <option value="verified">已验证</option>
+              <option value="conflicted">有冲突</option>
+              <option value="deprecated">已弃用</option>
+              <option value="archived">已归档</option>
+            </select>
+          </label>
+          <label>
+            <span>搜索</span>
+            <input id="graph-pilot-query" type="search" maxlength="120" placeholder="资料名、证据 ID、黄金用例 ID 或序号">
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">查询</button>
+            <button id="clear-graph-pilot-filters" type="button">清除</button>
+          </div>
+        </form>
+        <p class="entity-candidate-boundary">列表不批量返回证据原文；显式打开后仍复用现有证据详情与状态机。包本身不能修改证据、创建实体或登记关系。</p>
+        <div id="graph-pilot-summary" class="graph-pilot-summary panel"></div>
+        <div id="graph-pilot-list" class="graph-pilot-list" aria-live="polite"></div>
+        <div id="graph-pilot-pagination" class="candidate-pagination panel"></div>
       </section>
 
       <section id="entity-candidates" aria-labelledby="entity-candidates-title">
