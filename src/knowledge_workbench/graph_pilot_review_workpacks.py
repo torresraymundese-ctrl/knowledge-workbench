@@ -434,6 +434,219 @@ def apply_graph_pilot_verification_work_pack(
     }
 
 
+def inspect_graph_pilot_review_work_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    work_pack_path: Path,
+) -> dict[str, Any]:
+    """Inspect a triage or verification work pack without changing state."""
+    work_pack_path, content = _read_work_pack(
+        paths, work_pack_path, "图谱试点证据审核工作包"
+    )
+    relative_path = work_pack_path.relative_to(
+        paths.root.resolve()
+    ).as_posix()
+    base = {
+        "schema_version": "1.0",
+        "kind": "graph-pilot-review-work-pack-status",
+        "work_pack_path": relative_path,
+        "content_sha256": sha256_text(content),
+    }
+    try:
+        metadata, lines, start = _parse_frontmatter(content, None)
+        pack_type = metadata.get("type")
+        if pack_type == _TRIAGE_PACK_TYPE:
+            role_key = "curator"
+            event_type = "graph_pilot_triage_pack_exported"
+            first_label = "提交复核"
+            second_label = "暂缓"
+            note_label = "决策依据 JSON"
+            first_key = "submit"
+            second_key = "hold"
+        elif pack_type == _VERIFICATION_PACK_TYPE:
+            role_key = "reviewer"
+            event_type = "graph_pilot_verification_pack_exported"
+            first_label = "验证通过"
+            second_label = "退回草稿"
+            note_label = "复核意见 JSON"
+            first_key = "approve"
+            second_key = "return"
+        else:
+            raise KnowledgeWorkbenchError(
+                "文件不是预期的图谱试点证据审核工作包"
+            )
+        _require_metadata(metadata, (role_key,))
+        actor = _required_actor(metadata[role_key])
+        records = _parse_sections(
+            lines,
+            start,
+            first_label=first_label,
+            second_label=second_label,
+            note_label=note_label,
+        )
+    except KnowledgeWorkbenchError as exc:
+        return {
+            **base,
+            "work_pack_type": "unknown",
+            "integrity_valid": False,
+            "apply_ready": False,
+            "issue_codes": ["invalid_work_pack_format"],
+            "error": str(exc),
+        }
+
+    first_only = [
+        item for item in records if item["first"] and not item["second"]
+    ]
+    second_only = [
+        item for item in records if item["second"] and not item["first"]
+    ]
+    undecided = [
+        item for item in records if not item["first"] and not item["second"]
+    ]
+    conflicting = [
+        item for item in records if item["first"] and item["second"]
+    ]
+    missing_note = [item for item in second_only if not item["note"]]
+    complete_ids = {
+        item["evidence_id"] for item in first_only
+    } | {
+        item["evidence_id"]
+        for item in second_only
+        if item["note"]
+    }
+    unresolved_ids = [
+        item["evidence_id"]
+        for item in records
+        if item["evidence_id"] not in complete_ids
+    ]
+
+    integrity_valid = True
+    integrity_error = None
+    source_pack = None
+    try:
+        _, source_pack, _ = _validate_work_pack(
+            database,
+            paths,
+            work_pack_path,
+            content,
+            metadata,
+            records,
+            actor=actor,
+            event_type=event_type,
+        )
+    except KnowledgeWorkbenchError as exc:
+        integrity_valid = False
+        integrity_error = str(exc)
+
+    snapshot_invalid_ids: list[str] = []
+    actor_separation_conflict_ids: list[str] = []
+    submitter_audit_invalid_ids: list[str] = []
+    if integrity_valid and source_pack is not None:
+        candidates = _candidates_by_id(source_pack)
+        with database.connect() as connection:
+            for record in records:
+                candidate = candidates.get(record["evidence_id"])
+                if candidate is None:
+                    snapshot_invalid_ids.append(record["evidence_id"])
+                    continue
+                try:
+                    _validate_candidate_snapshot(
+                        connection,
+                        candidate,
+                        expected_status=record["expected_status"],
+                    )
+                except KnowledgeWorkbenchError:
+                    snapshot_invalid_ids.append(record["evidence_id"])
+                    continue
+                if pack_type != _VERIFICATION_PACK_TYPE:
+                    continue
+                try:
+                    submitter = _reviewing_submitter(
+                        connection, record["evidence_id"]
+                    )
+                except KnowledgeWorkbenchError:
+                    submitter_audit_invalid_ids.append(
+                        record["evidence_id"]
+                    )
+                    continue
+                if submitter == actor:
+                    actor_separation_conflict_ids.append(
+                        record["evidence_id"]
+                    )
+
+    issue_codes = []
+    if not integrity_valid:
+        issue_codes.append("integrity_invalid")
+    if undecided:
+        issue_codes.append("decision_missing")
+    if conflicting:
+        issue_codes.append("decision_conflicting")
+    if missing_note:
+        issue_codes.append("required_note_missing")
+    if snapshot_invalid_ids:
+        issue_codes.append("source_or_status_drift")
+    if submitter_audit_invalid_ids:
+        issue_codes.append("submitter_audit_missing")
+    if actor_separation_conflict_ids:
+        issue_codes.append("actor_separation_conflict")
+
+    apply_ready = (
+        integrity_valid
+        and not unresolved_ids
+        and not snapshot_invalid_ids
+        and not submitter_audit_invalid_ids
+        and not actor_separation_conflict_ids
+    )
+    payload = {
+        **base,
+        "work_pack_type": (
+            "triage"
+            if pack_type == _TRIAGE_PACK_TYPE
+            else "verification"
+        ),
+        "graph_pilot_pack_id": metadata["graph_pilot_pack_id"],
+        "actor_role": role_key,
+        "actor": actor,
+        "evidence_count": len(records),
+        "decision_counts": {
+            first_key: len(first_only),
+            second_key: len(second_only),
+            "undecided": len(undecided),
+            "conflicting": len(conflicting),
+        },
+        "complete_decision_count": len(complete_ids),
+        "remaining_decision_count": len(unresolved_ids),
+        "missing_required_note_count": len(missing_note),
+        "integrity_valid": integrity_valid,
+        "source_snapshot_valid": (
+            integrity_valid and not snapshot_invalid_ids
+        ),
+        "snapshot_invalid_count": len(snapshot_invalid_ids),
+        "submitter_audit_invalid_count": len(
+            submitter_audit_invalid_ids
+        ),
+        "actor_separation_valid": (
+            pack_type != _VERIFICATION_PACK_TYPE
+            or (
+                integrity_valid
+                and not submitter_audit_invalid_ids
+                and not actor_separation_conflict_ids
+            )
+        ),
+        "actor_separation_conflict_count": len(
+            actor_separation_conflict_ids
+        ),
+        "next_unresolved_evidence_id": (
+            unresolved_ids[0] if unresolved_ids else None
+        ),
+        "issue_codes": issue_codes,
+        "apply_ready": apply_ready,
+    }
+    if integrity_error is not None:
+        payload["integrity_error"] = integrity_error
+    return payload
+
+
 def _frontmatter(
     pack_type: str,
     source_pack: dict,
@@ -538,7 +751,7 @@ def _parse_verification_pack(
 
 
 def _parse_frontmatter(
-    content: str, expected_type: str
+    content: str, expected_type: str | None
 ) -> tuple[dict[str, str], list[str], int]:
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -558,7 +771,7 @@ def _parse_frontmatter(
         if ":" in line:
             key, value = line.split(":", 1)
             metadata[key.strip()] = value.strip()
-    if metadata.get("type") != expected_type:
+    if expected_type is not None and metadata.get("type") != expected_type:
         raise KnowledgeWorkbenchError("文件不是预期的图谱试点工作包")
     return metadata, lines, end + 1
 

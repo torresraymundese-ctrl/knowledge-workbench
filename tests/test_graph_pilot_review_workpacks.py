@@ -18,6 +18,7 @@ from knowledge_workbench.graph_pilot_review_workpacks import (
     apply_graph_pilot_verification_work_pack,
     export_graph_pilot_triage_work_pack,
     export_graph_pilot_verification_work_pack,
+    inspect_graph_pilot_review_work_pack,
 )
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.labeling import (
@@ -218,6 +219,172 @@ class GraphPilotReviewWorkPackTests(unittest.TestCase):
                 )
             )
 
+    def test_review_work_pack_status_is_read_only_and_reports_readiness(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, database, source_pack_path, source_pack = (
+                self._build_pilot(root)
+            )
+            evidence_ids = [
+                item["evidence_id"]
+                for item in source_pack["candidates"]
+            ]
+            triage_path = paths.evaluations / "triage-status.md"
+            export_graph_pilot_triage_work_pack(
+                database,
+                paths,
+                source_pack_path,
+                triage_path,
+                actor="curator-status",
+            )
+            original = triage_path.read_text(encoding="utf-8")
+            with database.connect() as connection:
+                audit_count_before = connection.execute(
+                    "SELECT COUNT(*) FROM audit_log"
+                ).fetchone()[0]
+
+            blank = inspect_graph_pilot_review_work_pack(
+                database, paths, triage_path
+            )
+            self.assertEqual(blank["work_pack_type"], "triage")
+            self.assertEqual(blank["evidence_count"], 3)
+            self.assertEqual(
+                blank["decision_counts"],
+                {
+                    "submit": 0,
+                    "hold": 0,
+                    "undecided": 3,
+                    "conflicting": 0,
+                },
+            )
+            self.assertTrue(blank["integrity_valid"])
+            self.assertTrue(blank["source_snapshot_valid"])
+            self.assertFalse(blank["apply_ready"])
+            self.assertEqual(
+                blank["next_unresolved_evidence_id"],
+                evidence_ids[0],
+            )
+
+            partial = self._fill_triage(
+                original,
+                submit_ids={evidence_ids[0]},
+                hold_ids={evidence_ids[1]},
+            ).replace(
+                "- 决策依据 JSON："
+                + json.dumps("来源定位待补充", ensure_ascii=False),
+                '- 决策依据 JSON：""',
+                1,
+            )
+            triage_path.write_text(partial, encoding="utf-8")
+            partial_status = inspect_graph_pilot_review_work_pack(
+                database, paths, triage_path
+            )
+            self.assertEqual(
+                partial_status["decision_counts"],
+                {
+                    "submit": 1,
+                    "hold": 1,
+                    "undecided": 1,
+                    "conflicting": 0,
+                },
+            )
+            self.assertEqual(
+                partial_status["missing_required_note_count"], 1
+            )
+            self.assertEqual(
+                partial_status["remaining_decision_count"], 2
+            )
+            self.assertFalse(partial_status["apply_ready"])
+
+            complete = self._fill_triage(
+                original,
+                submit_ids=set(evidence_ids),
+                hold_ids=set(),
+            )
+            triage_path.write_text(complete, encoding="utf-8")
+            ready = inspect_graph_pilot_review_work_pack(
+                database, paths, triage_path
+            )
+            self.assertEqual(ready["complete_decision_count"], 3)
+            self.assertEqual(ready["remaining_decision_count"], 0)
+            self.assertEqual(ready["issue_codes"], [])
+            self.assertTrue(ready["apply_ready"])
+
+            triage_path.write_text(
+                complete.replace("甲项目第", "伪造项目第", 1),
+                encoding="utf-8",
+            )
+            tampered = inspect_graph_pilot_review_work_pack(
+                database, paths, triage_path
+            )
+            self.assertFalse(tampered["integrity_valid"])
+            self.assertIn("integrity_invalid", tampered["issue_codes"])
+            self.assertFalse(tampered["apply_ready"])
+
+            triage_path.write_text(complete, encoding="utf-8")
+            apply_graph_pilot_triage_work_pack(
+                database,
+                paths,
+                triage_path,
+                actor="curator-status",
+            )
+            verification_path = paths.evaluations / "verification-status.md"
+            export_graph_pilot_verification_work_pack(
+                database,
+                paths,
+                source_pack_path,
+                verification_path,
+                actor="reviewer-status",
+            )
+            verification = self._fill_verification(
+                verification_path.read_text(encoding="utf-8"),
+                approve_ids=set(evidence_ids[:2]),
+                return_ids={evidence_ids[2]},
+            )
+            verification_path.write_text(
+                verification, encoding="utf-8"
+            )
+            verification_ready = inspect_graph_pilot_review_work_pack(
+                database, paths, verification_path
+            )
+            self.assertEqual(
+                verification_ready["decision_counts"],
+                {
+                    "approve": 2,
+                    "return": 1,
+                    "undecided": 0,
+                    "conflicting": 0,
+                },
+            )
+            self.assertTrue(
+                verification_ready["actor_separation_valid"]
+            )
+            self.assertTrue(verification_ready["apply_ready"])
+
+            verification_path.write_text(
+                verification.replace(
+                    "- 复核意见 JSON："
+                    + json.dumps("原子边界需调整", ensure_ascii=False),
+                    '- 复核意见 JSON：""',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            missing_note = inspect_graph_pilot_review_work_pack(
+                database, paths, verification_path
+            )
+            self.assertEqual(
+                missing_note["missing_required_note_count"], 1
+            )
+            self.assertFalse(missing_note["apply_ready"])
+            with database.connect() as connection:
+                audit_count_after = connection.execute(
+                    "SELECT COUNT(*) FROM audit_log"
+                ).fetchone()[0]
+            self.assertEqual(audit_count_after, audit_count_before + 5)
+
     def test_paths_duplicates_and_status_drift_are_strict(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -305,6 +472,16 @@ class GraphPilotReviewWorkPackTests(unittest.TestCase):
                 EvidenceStatus.ARCHIVED,
                 actor="external-reviewer",
             )
+            drift_status = inspect_graph_pilot_review_work_pack(
+                database, paths, output
+            )
+            self.assertTrue(drift_status["integrity_valid"])
+            self.assertFalse(drift_status["source_snapshot_valid"])
+            self.assertEqual(drift_status["snapshot_invalid_count"], 1)
+            self.assertIn(
+                "source_or_status_drift", drift_status["issue_codes"]
+            )
+            self.assertFalse(drift_status["apply_ready"])
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "来源或状态已变化"
             ):

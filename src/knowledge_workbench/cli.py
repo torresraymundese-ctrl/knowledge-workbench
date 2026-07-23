@@ -66,6 +66,7 @@ from .graph_pilot_review_workpacks import (
     apply_graph_pilot_verification_work_pack,
     export_graph_pilot_triage_work_pack,
     export_graph_pilot_verification_work_pack,
+    inspect_graph_pilot_review_work_pack,
 )
 from .graph_pilot_entity_workpacks import (
     apply_graph_pilot_entity_curation_work_pack,
@@ -404,6 +405,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="校验图谱试点包并显示证据审核、实体和关系覆盖进度",
     )
     graph_pilot_status.add_argument("pack", type=Path)
+    graph_pilot_review_status = graph_sub.add_parser(
+        "pilot-review-status",
+        help="只读检查图谱试点初审或异人复核工作包进度",
+    )
+    graph_pilot_review_status.add_argument("work_pack", type=Path)
     graph_pilot_triage_export = graph_sub.add_parser(
         "pilot-triage-export",
         help="导出图谱试点证据的本地初审工作包",
@@ -1338,6 +1344,12 @@ def _handle_graph(
         return
     if args.graph_command == "pilot-status":
         payload = inspect_graph_pilot_pack(database, paths, args.pack)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.graph_command == "pilot-review-status":
+        payload = inspect_graph_pilot_review_work_pack(
+            database, paths, args.work_pack
+        )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return
     if args.graph_command == "pilot-triage-export":

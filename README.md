@@ -73,9 +73,11 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe graph pilot-status .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json
 # 初审人逐条核对后提交复核；未通过项选择“暂缓”并填写原因
 .\.venv\Scripts\knowledge.exe graph pilot-triage-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-triage.md --actor curator-01
+.\.venv\Scripts\knowledge.exe graph pilot-review-status .\workspace\evaluations\graph-pilot-triage.md
 .\.venv\Scripts\knowledge.exe graph pilot-triage-apply .\workspace\evaluations\graph-pilot-triage.md --actor curator-01
 # 只能由不同 actor 对 reviewing 证据验证通过或退回草稿
 .\.venv\Scripts\knowledge.exe graph pilot-verification-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-verification.md --actor reviewer-01
+.\.venv\Scripts\knowledge.exe graph pilot-review-status .\workspace\evaluations\graph-pilot-verification.md
 .\.venv\Scripts\knowledge.exe graph pilot-verification-apply .\workspace\evaluations\graph-pilot-verification.md --actor reviewer-01
 # verified 证据进入实体裁决；每条必须明确登记实体或说明当前无实体
 .\.venv\Scripts\knowledge.exe graph pilot-entity-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-entity-curation.md --actor entity-curator-01
@@ -182,7 +184,7 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 
 `graph pilot-status` 只读取系统生成且内容哈希、包身份、保存路径均与审计匹配的试点包，然后逐条重查数据库快照。输出不回显原文，只报告来源失效、密级泄漏、证据状态、verified 覆盖、active 实体提及、双实体关系资格和 active 关系覆盖，并明确给出证据审核是否完成、是否已经具备图谱黄金集前置条件。复制或修改包文件不能通过状态检查。
 
-`graph pilot-triage-export/apply` 将仍为 `draft` 或 `conflicted` 的试点证据导出为本地 Markdown 初审包。初审人必须逐条选择“提交复核”或“暂缓”，暂缓原因必填；提交项只进入 `reviewing`，不会直接验证、归档、创建实体或关系。`pilot-verification-export/apply` 只导出当前复核人未亲自提交的 `reviewing` 证据，由异人选择“验证通过”或“退回草稿”，退回意见必填。两阶段工作包均绑定原试点包身份和哈希、actor、导出路径、证据范围与导出状态；只有勾选框和对应 JSON 意见是可编辑字段，修改展示的原文、定位、提交人或其他受保护内容也会被模板哈希阻断。复制、删改范围、重复字段、状态或来源漂移同样使整批零写入。状态变更和批次结果在同一 SQLite 事务内完成，审计保存证据 ID、决定、计数及意见/工作包哈希，不保存正文或意见明文。
+`graph pilot-triage-export/apply` 将仍为 `draft` 或 `conflicted` 的试点证据导出为本地 Markdown 初审包。初审人必须逐条选择“提交复核”或“暂缓”，暂缓原因必填；提交项只进入 `reviewing`，不会直接验证、归档、创建实体或关系。`pilot-verification-export/apply` 只导出当前复核人未亲自提交的 `reviewing` 证据，由异人选择“验证通过”或“退回草稿”，退回意见必填。两阶段工作包均绑定原试点包身份和哈希、actor、导出路径、证据范围与导出状态；只有勾选框和对应 JSON 意见是可编辑字段，修改展示的原文、定位、提交人或其他受保护内容也会被模板哈希阻断。复制、删改范围、重复字段、状态或来源漂移同样使整批零写入。`pilot-review-status` 是不写数据库也不新增审计的预检入口，同时支持两类工作包；它报告已完成/剩余决定、冲突勾选、退回或暂缓意见缺失、来源与状态漂移、异人职责分离以及最终 `apply_ready`，但绝不规范化勾选符号或代填人工决定。状态变更和批次结果在同一 SQLite 事务内完成，审计保存证据 ID、决定、计数及意见/工作包哈希，不保存正文或意见明文。
 
 Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审计路径和当前来源快照校验的试点包。列表按试点包内的证据 ID、资料名、序号和黄金用例 ID 搜索并独立分页，只返回定位摘要、状态与实体/关系进度，不批量返回原文；用户必须显式打开单条证据才能查看内容。证据审核继续复用既有 CSRF、actor、密级边界及 `draft → reviewing → verified` 核心状态机，已验证证据仍保留在试点进度中。被篡改、复制、来源过期或密级越界的包不会进入可操作视图。
 
