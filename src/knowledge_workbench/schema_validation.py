@@ -164,6 +164,35 @@ def validate_conflict_candidate_pack(payload: dict) -> None:
             )
 
 
+def validate_conflict_labeling_plan(payload: dict) -> None:
+    _validate(payload, "conflict-labeling-plan-v1.json")
+    batch_ids = [item["batch_id"] for item in payload["batches"]]
+    if len(batch_ids) != len(set(batch_ids)):
+        raise KnowledgeWorkbenchError("跨文档冲突标注计划包含重复 batch_id")
+    candidate_ids = [
+        candidate_id
+        for batch in payload["batches"]
+        for candidate_id in batch["candidate_ids"]
+    ]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise KnowledgeWorkbenchError("跨文档冲突标注计划重复分配了候选")
+    if len(candidate_ids) != payload["source_pack"]["candidate_count"]:
+        raise KnowledgeWorkbenchError("跨文档冲突标注计划未完整覆盖来源候选")
+    for expected_ordinal, batch in enumerate(payload["batches"], start=1):
+        if batch["ordinal"] != expected_ordinal:
+            raise KnowledgeWorkbenchError("跨文档冲突标注批次序号必须连续")
+        if len(batch["candidate_ids"]) > payload["batch_size"]:
+            raise KnowledgeWorkbenchError(
+                f"标注批次 {batch['batch_id']} 超过 batch_size"
+            )
+        if sum(batch["stratum_counts"].values()) != len(
+            batch["candidate_ids"]
+        ):
+            raise KnowledgeWorkbenchError(
+                f"标注批次 {batch['batch_id']} 的分层计数不一致"
+            )
+
+
 def validate_citation_evaluation_dataset(payload: dict) -> None:
     _validate(payload, "citation-evaluation-v1.json")
     case_ids = [case["case_id"] for case in payload["cases"]]

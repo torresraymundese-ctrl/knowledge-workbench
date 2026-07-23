@@ -85,6 +85,9 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe task list
 .\.venv\Scripts\knowledge.exe conflict list --status pending
 .\.venv\Scripts\knowledge.exe conflict candidate-pack --actor pack-builder
+# 把未截断完整候选包分层为覆盖全部候选的不重叠人工批次
+.\.venv\Scripts\knowledge.exe conflict batch-plan .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor coordinator-01 --batch-size 60 --seed real-conflict-v1
+.\.venv\Scripts\knowledge.exe conflict batch-status .\workspace\evaluations\cross-document-conflict-labeling-plan-实际时间.json
 # 在 workspace/evaluations 中填写每个候选的 label，且暂不填写 review
 .\.venv\Scripts\knowledge.exe conflict submit-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor annotator-01
 # 由另一人填写 review 后固化；标注人与复核人必须不同
@@ -186,5 +189,7 @@ Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审�
 然后打开 `http://127.0.0.1:8765/`。当前页面提供工作区总览、当前资料、审核队列、图谱试点执行区、实体候选审核、实体合并复核、人工业务关系、跨文档冲突标注、质量评测、脱敏审计动态，以及受控的证据审核、冲突处理和 Wiki 草稿提交复核。审核队列支持按密级和安全元数据搜索，证据、冲突和 Wiki 修订分别使用自身有效的状态筛选与独立分页；后端会拒绝队列类型与状态不匹配的请求，不再静默返回空结果。`restricted` 资料不能通过原文件名或页面标题搜索。实体候选区只投影非 `restricted` 候选元数据，支持 `pending`、`accepted`、`rejected` 独立分页和安全搜索；人工接受时必须显式选择已存在的 active 规范实体，非逐字候选、过期来源和别名冲突仍由核心状态机阻断，Web 不自动创建实体或直接写实体表。驳回意见必填，接受与驳回都是不可重复裁决的终态。实体合并区只允许从 Web 可见、同类型 active 实体中人工选择有方向的“源 → 目标”，说明与复核意见只以哈希进入审计；请求提交后必须由不同 actor 批准或驳回。批准还必须输入绑定请求 ID 的确认短语，列表过滤和写接口都会重新计算两个实体的全部历史证据最高密级，手工构造 restricted、unclassified 或 archived 实体 ID 会被阻断；最终合并仍由核心事务原子迁移别名、证据提及与已接受候选并归档源实体。人工业务关系区只使用 CLI 已登记的 active 关系类型；用户选择两个 Web 可见实体后，页面仅列出同时关联两端的当前 verified 非受限证据元数据，不批量返回原文。登记要求至少一条证据、必填说明和绑定关系类型及两个实体 ID 的确认短语；撤销要求必填说明和绑定关系 ID 的确认短语。列表和写接口都会重算实体可见性与证据资格，伪造 restricted、过期或未验证证据 ID 会被阻断，最终写入继续委托 Schema v12 核心服务。非受限 Wiki 修订可在显式打开后查看元数据、引用证据状态和受限长度的 Markdown 预览；只有内容哈希与数据库一致的当前 `draft` 修订才能提交为 `reviewing`。`reviewing` 修订可填写必需复核意见后驳回为不可变的 `rejected`，旧正式修订继续生效；也可在至少引用一条证据、全部引用证据为 `verified`、内容哈希一致且 Web 已展示全文时，输入绑定修订 ID 的确认短语并再次确认后正式发布。已驳回修订另在只读历史中显示复核意见、操作者、时间和来源是否仍为当前版本，不重新占用审核队列或开放状态流转；`restricted` 历史标题和意见继续脱敏。预览被截断的长修订只能回到 Obsidian 核对全文并通过 CLI 发布。服务只允许绑定 `127.0.0.1` 或 `localhost`，不暴露来源路径、评测集路径或通用审计详情；列表接口不批量返回证据原文，只有明确打开非 `restricted` 证据时才返回单条详情，`restricted` 名称、定位、原文和 Web 写操作始终被阻断。
 
 “跨文档冲突标注”按候选包安全发现并提供状态筛选、文本搜索和每页10条的证据对比。标注保存前会重查当前文件版本、当前处理运行、密级、原文和全部定位，并要求客户端提交所见文件的 SHA-256；文件被其他页面或人工编辑后会拒绝覆盖。整包标签完整且未截断时才可提交，提交审计固定标签摘要和标注人，此后 Web 锁定标签；只有不同操作者可以逐项复核，驳回必须填写意见。页面不自动采用规则预测、不创建业务冲突，也不开放数据集固化，最终 `finalize-pack` 继续由 CLI 执行。
+
+`conflict batch-plan` 不抽样、不复制证据原文，也不建立第二套标签文件。它只接受未截断且来源仍有效的完整候选包，按“预测类型 × 高/中/低相似度”将每个候选 ID 确定性分配到一个且仅一个小批次；相同 seed 得到相同分配。计划只能新增到 `workspace/evaluations/`，内容哈希、路径、来源包不可变身份和 seed 哈希写入审计。`batch-status` 重验计划身份、生成审计、来源当前性和全量覆盖，再从原候选包动态统计每批标注与异人复核进度，因此人工决定仍只有原候选包这一套真相源。
 
 Web 写操作必须填写 `actor`，使用进程级 CSRF 令牌、同源与 Host 校验，并继续调用既有证据、冲突、Wiki 修订、实体候选、实体合并、人工业务关系或冲突候选业务服务写入审计日志。Web 层不直接执行状态 SQL；正式发布、实体合并和业务关系登记/撤销仍由核心状态机执行原子更新与审计。关系类型管理、冲突候选固化及其他高影响写操作尚未开放。

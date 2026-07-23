@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledge-workbench.local/schemas/conflict-labeling-plan-v1.json",
+  "title": "Cross-document conflict labeling batch plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "plan_id", "generated_at", "generated_by",
+    "source_pack", "batch_size", "seed", "strata", "batches"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "kind": {"const": "cross-document-conflict-labeling-plan"},
+    "plan_id": {"type": "string", "pattern": "^cplan_[a-f0-9]{24}$"},
+    "generated_at": {"type": "string", "minLength": 1},
+    "generated_by": {"type": "string", "minLength": 1},
+    "source_pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pack_id", "identity_sha256", "candidate_count"],
+      "properties": {
+        "pack_id": {"type": "string", "pattern": "^cpack_[a-f0-9]{24}$"},
+        "identity_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "candidate_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "batch_size": {"type": "integer", "minimum": 10, "maximum": 200},
+    "seed": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,80}$"
+    },
+    "strata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["similarity_bands", "dimensions"],
+      "properties": {
+        "similarity_bands": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["high", "medium", "low"],
+          "properties": {
+            "high": {"const": "similarity >= 0.85"},
+            "medium": {"const": "0.70 <= similarity < 0.85"},
+            "low": {"const": "similarity < 0.70"}
+          }
+        },
+        "dimensions": {
+          "type": "array",
+          "const": ["predicted_type", "similarity_band"]
+        }
+      }
+    },
+    "batches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["batch_id", "ordinal", "candidate_ids", "stratum_counts"],
+        "properties": {
+          "batch_id": {"type": "string", "pattern": "^batch_[0-9]{3,}$"},
+          "ordinal": {"type": "integer", "minimum": 1},
+          "candidate_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "pattern": "^xdoc_[a-f0-9]{20}$"}
+          },
+          "stratum_counts": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^(value_change|polarity_change|none):(high|medium|low)$"
+            },
+            "additionalProperties": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    }
+  }
+}

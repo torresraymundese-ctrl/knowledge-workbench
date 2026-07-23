@@ -97,6 +97,10 @@ from .conflict_candidates import (
     finalize_cross_document_candidate_pack,
     submit_cross_document_candidate_annotations,
 )
+from .conflict_labeling_plan import (
+    create_conflict_labeling_plan,
+    inspect_conflict_labeling_plan,
+)
 from .conflict_evaluation import evaluate_conflict_dataset
 from .citation_evaluation import evaluate_citation_dataset
 from .model_pipeline import analyze_with_model, generate_wiki_with_model
@@ -520,6 +524,22 @@ def build_parser() -> argparse.ArgumentParser:
     conflict_pack.add_argument("--actor", required=True)
     conflict_pack.add_argument("--limit", type=int, default=200)
     conflict_pack.add_argument("--minimum-similarity", type=float, default=0.55)
+    conflict_batch_plan = conflict_sub.add_parser(
+        "batch-plan",
+        help="把完整冲突候选包确定性分层为不重叠的人工标注批次",
+    )
+    conflict_batch_plan.add_argument("pack", type=Path)
+    conflict_batch_plan.add_argument("--output", type=Path)
+    conflict_batch_plan.add_argument("--actor", required=True)
+    conflict_batch_plan.add_argument("--batch-size", type=int, default=60)
+    conflict_batch_plan.add_argument(
+        "--seed", default="conflict-plan-v1"
+    )
+    conflict_batch_status = conflict_sub.add_parser(
+        "batch-status",
+        help="校验冲突标注批次计划并查看动态标注复核进度",
+    )
+    conflict_batch_status.add_argument("plan", type=Path)
     conflict_submit = conflict_sub.add_parser(
         "submit-pack", help="提交候选包中的人工冲突标签并写入审计"
     )
@@ -1599,6 +1619,42 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
         )
         print(f"跨文档冲突候选包：{output.expanduser().resolve()}")
         _print_mapping(pack["statistics"])
+        return
+    if args.conflict_command == "batch-plan":
+        output = args.output
+        if output is None:
+            output = paths.evaluations / (
+                "cross-document-conflict-labeling-plan-"
+                + time.strftime("%Y%m%d-%H%M%S")
+                + ".json"
+            )
+        plan = create_conflict_labeling_plan(
+            database,
+            paths,
+            args.pack,
+            output,
+            actor=args.actor,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
+        print(f"跨文档冲突标注计划：{output.expanduser().resolve()}")
+        _print_mapping(
+            {
+                "plan_id": plan["plan_id"],
+                "source_pack_id": plan["source_pack"]["pack_id"],
+                "candidate_count": plan["source_pack"][
+                    "candidate_count"
+                ],
+                "batch_count": len(plan["batches"]),
+                "batch_size": plan["batch_size"],
+            }
+        )
+        return
+    if args.conflict_command == "batch-status":
+        result = inspect_conflict_labeling_plan(
+            database, paths, args.plan
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.conflict_command == "submit-pack":
         result = submit_cross_document_candidate_annotations(

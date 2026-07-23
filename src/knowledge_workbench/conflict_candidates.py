@@ -765,6 +765,12 @@ def _read_candidate_pack(paths: WorkspacePaths, pack_path: Path) -> dict[str, An
 
 
 def _pack_id(pack: dict[str, Any]) -> str:
+    return "cpack_" + candidate_pack_identity_sha256(pack)[:24]
+
+
+def candidate_pack_identity_sha256(pack: dict[str, Any]) -> str:
+    """Hash immutable candidate/source metadata, excluding human decisions."""
+
     identity = {
         key: value
         for key, value in pack.items()
@@ -781,7 +787,7 @@ def _pack_id(pack: dict[str, Any]) -> str:
     canonical = json.dumps(
         identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
-    return "cpack_" + sha256_text(canonical)[:24]
+    return sha256_text(canonical)
 
 
 def _validate_pack_identity(pack: dict[str, Any]) -> None:
