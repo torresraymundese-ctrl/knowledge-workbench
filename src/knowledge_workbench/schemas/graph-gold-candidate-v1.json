@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledge-workbench.local/schemas/graph-gold-candidate-v1.json",
+  "title": "Audited graph gold annotation candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_type",
+    "candidate_id",
+    "status",
+    "name",
+    "source",
+    "annotator",
+    "annotated_at",
+    "relation_cases",
+    "path_cases"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "pack_type": {"const": "graph-gold-candidate-pack"},
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^graphgold_[a-f0-9]{32}$"
+    },
+    "status": {"const": "reviewing"},
+    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "graph_pilot_pack_id",
+        "graph_pilot_pack_path",
+        "graph_pilot_pack_sha256",
+        "graph_snapshot_sha256"
+      ],
+      "properties": {
+        "graph_pilot_pack_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "graph_pilot_pack_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "graph_pilot_pack_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "graph_snapshot_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "annotator": {"type": "string", "minLength": 1, "maxLength": 80},
+    "annotated_at": {"type": "string", "format": "date-time"},
+    "relation_cases": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {"type": "object"}
+    },
+    "path_cases": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {"type": "object"}
+    }
+  }
+}

@@ -75,6 +75,12 @@ from .graph_pilot_relationship_workpacks import (
     apply_graph_pilot_relationship_curation_work_pack,
     export_graph_pilot_relationship_curation_work_pack,
 )
+from .graph_gold_workpacks import (
+    apply_graph_gold_annotation_work_pack,
+    apply_graph_gold_review_work_pack,
+    export_graph_gold_annotation_work_pack,
+    export_graph_gold_review_work_pack,
+)
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -462,6 +468,34 @@ def build_parser() -> argparse.ArgumentParser:
     graph_pilot_relationship_apply.add_argument(
         "--actor", required=True
     )
+    graph_gold_annotation_export = graph_sub.add_parser(
+        "pilot-gold-annotation-export",
+        help="导出绑定当前业务图快照的图谱黄金标注工作包",
+    )
+    graph_gold_annotation_export.add_argument("pack", type=Path)
+    graph_gold_annotation_export.add_argument("output", type=Path)
+    graph_gold_annotation_export.add_argument("--actor", required=True)
+    graph_gold_annotation_apply = graph_sub.add_parser(
+        "pilot-gold-annotation-apply",
+        help="应用图谱黄金标注并保存不可变 reviewing 候选包",
+    )
+    graph_gold_annotation_apply.add_argument("work_pack", type=Path)
+    graph_gold_annotation_apply.add_argument("output", type=Path)
+    graph_gold_annotation_apply.add_argument("--actor", required=True)
+    graph_gold_review_export = graph_sub.add_parser(
+        "pilot-gold-review-export",
+        help="由不同 actor 导出图谱黄金逐案复核工作包",
+    )
+    graph_gold_review_export.add_argument("candidate", type=Path)
+    graph_gold_review_export.add_argument("output", type=Path)
+    graph_gold_review_export.add_argument("--actor", required=True)
+    graph_gold_review_apply = graph_sub.add_parser(
+        "pilot-gold-review-apply",
+        help="应用异人复核并在全部批准后固化、评测图谱黄金集",
+    )
+    graph_gold_review_apply.add_argument("work_pack", type=Path)
+    graph_gold_review_apply.add_argument("output", type=Path)
+    graph_gold_review_apply.add_argument("--actor", required=True)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -1384,6 +1418,48 @@ def _handle_graph(
             actor=args.actor,
         )
         print("图谱试点业务关系裁决已原子应用。")
+        _print_mapping(payload)
+        return
+    if args.graph_command == "pilot-gold-annotation-export":
+        output = export_graph_gold_annotation_work_pack(
+            database,
+            paths,
+            args.pack,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"图谱黄金标注工作包：{output}")
+        return
+    if args.graph_command == "pilot-gold-annotation-apply":
+        payload = apply_graph_gold_annotation_work_pack(
+            database,
+            paths,
+            args.work_pack,
+            args.output,
+            actor=args.actor,
+        )
+        print("图谱黄金标注候选包已保存。")
+        _print_mapping(payload)
+        return
+    if args.graph_command == "pilot-gold-review-export":
+        output = export_graph_gold_review_work_pack(
+            database,
+            paths,
+            args.candidate,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"图谱黄金异人复核工作包：{output}")
+        return
+    if args.graph_command == "pilot-gold-review-apply":
+        payload = apply_graph_gold_review_work_pack(
+            database,
+            paths,
+            args.work_pack,
+            args.output,
+            actor=args.actor,
+        )
+        print("图谱黄金异人复核已应用。")
         _print_mapping(payload)
         return
 

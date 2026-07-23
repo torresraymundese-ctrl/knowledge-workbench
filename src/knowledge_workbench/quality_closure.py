@@ -241,7 +241,10 @@ def build_quality_closure_status(
         _gate(
             "graph_gold_evaluation",
             graph["passing_graph_gold_dataset_count"] > 0,
-            required={"minimum_passing_graph_gold_dataset_count": 1},
+            required={
+                "minimum_passing_graph_gold_dataset_count": 1,
+                "finalization_audit_required": True,
+            },
             actual={
                 "valid_graph_gold_dataset_count": graph[
                     "valid_graph_gold_dataset_count"
@@ -252,8 +255,11 @@ def build_quality_closure_status(
                 "passing_graph_gold_dataset_count": graph[
                     "passing_graph_gold_dataset_count"
                 ],
+                "unaudited_graph_gold_dataset_count": graph[
+                    "unaudited_graph_gold_dataset_count"
+                ],
             },
-            next_action="由异人复核图谱黄金用例并运行 graph-evaluate",
+            next_action="通过受控工作包异人复核、固化并运行 graph-evaluate",
             phase="human_data",
         ),
     ]
@@ -500,9 +506,29 @@ def _graph_gold_dataset_status(
     valid = 0
     stale = 0
     passing = 0
+    unaudited = 0
+    with database.connect() as connection:
+        audit_rows = connection.execute(
+            """
+            SELECT details_json FROM audit_log
+            WHERE event_type = 'graph_gold_dataset_finalized'
+              AND entity_type = 'graph_gold_candidate'
+            """
+        ).fetchall()
+    finalized_outputs: dict[str, set[str]] = {}
+    for row in audit_rows:
+        try:
+            details = json.loads(row["details_json"])
+        except json.JSONDecodeError:
+            continue
+        output = details.get("output")
+        content_sha256 = details.get("content_sha256")
+        if isinstance(output, str) and isinstance(content_sha256, str):
+            finalized_outputs.setdefault(output, set()).add(content_sha256)
     for path in sorted(paths.evaluations.glob("*.json")):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            content = path.read_text(encoding="utf-8")
+            payload = json.loads(content)
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not _looks_like_graph_gold_dataset(payload):
@@ -510,6 +536,14 @@ def _graph_gold_dataset_status(
         try:
             validate_graph_evaluation_dataset(payload)
         except KnowledgeWorkbenchError:
+            continue
+        relative_path = path.resolve().relative_to(
+            paths.root.resolve()
+        ).as_posix()
+        if sha256_text(content) not in finalized_outputs.get(
+            relative_path, set()
+        ):
+            unaudited += 1
             continue
         valid += 1
         try:
@@ -528,6 +562,7 @@ def _graph_gold_dataset_status(
         "valid_graph_gold_dataset_count": valid,
         "stale_graph_gold_dataset_count": stale,
         "passing_graph_gold_dataset_count": passing,
+        "unaudited_graph_gold_dataset_count": unaudited,
     }
 
 
@@ -545,7 +580,11 @@ def _work_pack_status(database: Database) -> dict[str, int]:
               'graph_pilot_entity_curation_pack_exported',
               'graph_pilot_entity_curation_applied',
               'graph_pilot_relationship_curation_pack_exported',
-              'graph_pilot_relationship_curation_applied'
+              'graph_pilot_relationship_curation_applied',
+              'graph_gold_annotation_pack_exported',
+              'graph_gold_candidate_saved',
+              'graph_gold_review_pack_exported',
+              'graph_gold_dataset_finalized'
             )
             GROUP BY event_type
             """
@@ -575,6 +614,18 @@ def _work_pack_status(database: Database) -> dict[str, int]:
         ),
         "graph_relationship_curation_applied_count": counts.get(
             "graph_pilot_relationship_curation_applied", 0
+        ),
+        "graph_gold_annotation_export_count": counts.get(
+            "graph_gold_annotation_pack_exported", 0
+        ),
+        "graph_gold_candidate_saved_count": counts.get(
+            "graph_gold_candidate_saved", 0
+        ),
+        "graph_gold_review_export_count": counts.get(
+            "graph_gold_review_pack_exported", 0
+        ),
+        "graph_gold_dataset_finalized_count": counts.get(
+            "graph_gold_dataset_finalized", 0
         ),
     }
 

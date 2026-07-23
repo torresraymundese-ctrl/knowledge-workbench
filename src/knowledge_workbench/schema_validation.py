@@ -262,6 +262,27 @@ def validate_graph_evaluation_dataset(payload: dict) -> None:
             )
 
 
+def validate_graph_gold_candidate_pack(payload: dict) -> None:
+    _validate(payload, "graph-gold-candidate-v1.json")
+    annotation_dataset = {
+        "schema_version": "1.0",
+        "name": payload["name"],
+        "provenance": {
+            "annotator": payload["annotator"],
+            "reviewer": "__candidate_schema_reviewer__",
+            "reviewed_at": payload["annotated_at"],
+            "decision": "approved",
+        },
+        "relation_cases": payload["relation_cases"],
+        "path_cases": payload["path_cases"],
+    }
+    if payload["annotator"] == "__candidate_schema_reviewer__":
+        annotation_dataset["provenance"]["reviewer"] = (
+            "__candidate_schema_reviewer_2__"
+        )
+    validate_graph_evaluation_dataset(annotation_dataset)
+
+
 def validate_graph_pilot_pack(payload: dict) -> None:
     _validate(payload, "graph-pilot-pack-v1.json")
     evidence_ids = [

@@ -83,6 +83,12 @@ Set-Location "D:\全新知识库"
 # 已登记关系类型后，只导出同条 verified 证据中至少有两个 active 实体的项
 .\.venv\Scripts\knowledge.exe graph pilot-relationship-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-relationship-curation.md --actor relation-curator-01
 .\.venv\Scripts\knowledge.exe graph pilot-relationship-apply .\workspace\evaluations\graph-pilot-relationship-curation.md --actor relation-curator-01
+# 标注关系正负例和路径用例，应用后保存不可变 reviewing 候选包
+.\.venv\Scripts\knowledge.exe graph pilot-gold-annotation-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-gold-annotation.md --actor graph-annotator-01
+.\.venv\Scripts\knowledge.exe graph pilot-gold-annotation-apply .\workspace\evaluations\graph-gold-annotation.md .\workspace\evaluations\graph-gold-candidate.json --actor graph-annotator-01
+# 必须由不同 actor 逐案复核；全部批准后才固化并立即运行 graph-evaluate
+.\.venv\Scripts\knowledge.exe graph pilot-gold-review-export .\workspace\evaluations\graph-gold-candidate.json .\workspace\evaluations\graph-gold-review.md --actor graph-reviewer-01
+.\.venv\Scripts\knowledge.exe graph pilot-gold-review-apply .\workspace\evaluations\graph-gold-review.md .\workspace\evaluations\graph-gold-v1.json --actor graph-reviewer-01
 .\.venv\Scripts\knowledge.exe graph-evaluate .\workspace\evaluations\graph-gold-v1.json
 .\.venv\Scripts\knowledge.exe relation retract entityrel_关系ID --note "适用期结束" --actor curator-02
 .\.venv\Scripts\knowledge.exe page list
@@ -222,5 +228,7 @@ Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审�
 `graph pilot-entity-export/apply` 把当前试点包中的 verified 证据导出为本地实体裁决工作包。每条证据必须明确选择“登记实体”或“当前无实体”；后者要求说明，前者必须给出逐字 mention，并显式选择已有实体 ID，或填写新实体的规范名与类型。同类型同规范名只在本包内复用，数据库已有实体不会靠名称自动匹配。应用前会重验来源包、原文、全部定位、密级、证据状态、actor、路径、精确范围和受保护模板哈希；新实体、别名、证据提及和批次审计在同一事务内写入，任一别名冲突、非逐字提及或来源漂移都会整批回滚。工作包不可重放，审计只保存 ID、计数及名称、提及、意见和文件哈希，不复制正文或人工说明。
 
 `graph pilot-relationship-export/apply` 只处理试点包中当前 verified、非 restricted，且同条证据已人工绑定至少两个不同 active 实体的项。导出前必须先用 CLI 登记 active 关系类型；工作包逐条要求“登记关系”或带说明的“当前无关系”，不会把实体共现当成关系。每个关系使用本包内 `relationship_ref`，同一 ref 可跨证据累积支持证据，但类型、方向、端点和登记说明必须一致；端点必须来自该证据的受保护实体清单。应用会重验关系类型快照、证据原文与定位、密级、状态、实体提及范围、actor、路径和模板哈希，并通过 `entity_relationships.py` 的同一事务规则创建关系。任一提及漂移、重复 active 关系、无效方向或来源变化会整批回滚；审计不保存实体名称、原文或人工说明。
+
+`graph pilot-gold-annotation-export/apply` 与 `pilot-gold-review-export/apply` 将图谱黄金数据生产收敛为受审计双人流程。标注包绑定当前试点来源、verified 证据、人工实体范围和未截断安全业务图快照；标注人自行填写关系正/负例、方向、黄金证据及1–4跳路径，当前图只作候选参考，不能自动成为答案。应用会通过独立 Schema、最终评测 Schema、当前实体/证据及试点范围校验，保存不可重放的 `reviewing` 候选包。复核人必须是不同 actor，并逐案批准或带意见驳回；任一驳回不生成数据集，全部批准才写入最终 JSON、立即运行 `graph-evaluate` 并记录聚合结果。质量闭环只承认路径和内容哈希与 `graph_gold_dataset_finalized` 审计匹配的文件；手写或复制一个自报双人 provenance 的 JSON 会计入 `unaudited`，不能通过图谱黄金门槛。
 
 Web 写操作必须填写 `actor`，使用进程级 CSRF 令牌、同源与 Host 校验，并继续调用既有证据、冲突、Wiki 修订、实体候选、实体合并、人工业务关系或冲突候选业务服务写入审计日志。Web 层不直接执行状态 SQL；正式发布、实体合并和业务关系登记/撤销仍由核心状态机执行原子更新与审计。关系类型管理、冲突候选固化及其他高影响写操作尚未开放。

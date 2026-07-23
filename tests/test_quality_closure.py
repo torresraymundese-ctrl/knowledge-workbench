@@ -105,6 +105,10 @@ class QualityClosureStatusTests(unittest.TestCase):
                 "graph_entity_curation_applied_count",
                 "graph_relationship_curation_export_count",
                 "graph_relationship_curation_applied_count",
+                "graph_gold_annotation_export_count",
+                "graph_gold_candidate_saved_count",
+                "graph_gold_review_export_count",
+                "graph_gold_dataset_finalized_count",
             ):
                 self.assertEqual(
                     report["metrics"]["work_packs"][metric], 0
