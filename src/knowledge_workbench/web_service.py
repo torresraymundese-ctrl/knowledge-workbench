@@ -15,6 +15,11 @@ from .conflict_candidates import (
 from .conflicts import transition_conflict
 from .database import Database
 from .entity_candidates import accept_entity_candidate, reject_entity_candidate
+from .entity_merges import (
+    list_entity_merge_requests,
+    propose_entity_merge,
+    review_entity_merge,
+)
 from .entity_visibility import get_entity_visibility, list_entity_visibility
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
@@ -179,6 +184,89 @@ class WorkbenchReadService:
                     "visibility": row["visibility"],
                 }
                 for row in visible_entities
+            ],
+        }
+
+    def entity_merge_page(
+        self,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        limit, offset = _pagination(limit, offset)
+        query = _review_query(query)
+        visible_entities = list_entity_visibility(
+            self.database, web_visible_only=True, limit=500
+        )
+        visible_by_id = {
+            item["entity_id"]: item for item in visible_entities
+        }
+        requests = list_entity_merge_requests(
+            self.database, status="reviewing", limit=500
+        )
+        safe_requests = [
+            request
+            for request in requests
+            if request["source_entity_id"] in visible_by_id
+            and request["target_entity_id"] in visible_by_id
+        ]
+        if query:
+            needle = query.casefold()
+            safe_requests = [
+                request
+                for request in safe_requests
+                if any(
+                    needle in str(value).casefold()
+                    for value in (
+                        request["id"],
+                        request["source_name"],
+                        request["target_name"],
+                        request["entity_type"],
+                        request["proposed_by"],
+                    )
+                )
+            ]
+        total = len(safe_requests)
+        page_rows = safe_requests[offset : offset + limit]
+        return {
+            "query": query,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_previous": offset > 0,
+            "has_next": offset + len(page_rows) < total,
+            "source_limit_reached": len(requests) == 500,
+            "items": [
+                {
+                    **request,
+                    "source_visibility": visible_by_id[
+                        request["source_entity_id"]
+                    ]["visibility"],
+                    "source_evidence_count": visible_by_id[
+                        request["source_entity_id"]
+                    ]["evidence_count"],
+                    "target_visibility": visible_by_id[
+                        request["target_entity_id"]
+                    ]["visibility"],
+                    "target_evidence_count": visible_by_id[
+                        request["target_entity_id"]
+                    ]["evidence_count"],
+                    "approval_confirmation": _entity_merge_confirmation_phrase(
+                        request["id"]
+                    ),
+                }
+                for request in page_rows
+            ],
+            "entity_options": [
+                {
+                    "entity_id": item["entity_id"],
+                    "canonical_name": item["canonical_name"],
+                    "entity_type": item["entity_type"],
+                    "evidence_count": item["evidence_count"],
+                    "visibility": item["visibility"],
+                }
+                for item in visible_entities
             ],
         }
 
@@ -967,6 +1055,72 @@ class WorkbenchActionService:
             "actor": actor,
         }
 
+    def propose_entity_merge_web(
+        self,
+        source_entity_id: str,
+        target_entity_id: str,
+        *,
+        actor: str,
+        note: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        source_entity_id = source_entity_id.strip()
+        target_entity_id = target_entity_id.strip()
+        if not source_entity_id or not target_entity_id:
+            raise ValueError("源实体和目标实体不能为空")
+        note = _required_entity_merge_note(note, "合并提议说明")
+        self._require_web_visible_entity(source_entity_id)
+        self._require_web_visible_entity(target_entity_id)
+        request_id = propose_entity_merge(
+            self.database,
+            source_entity_id,
+            target_entity_id,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "entity_merge_request",
+            "entity_id": request_id,
+            "request_id": request_id,
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "status": "reviewing",
+            "actor": actor,
+        }
+
+    def review_entity_merge_web(
+        self,
+        request_id: str,
+        decision: str,
+        *,
+        actor: str,
+        note: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        decision = decision.strip().casefold()
+        if decision not in {"approve", "reject"}:
+            raise ValueError("实体合并复核决定必须是 approve 或 reject")
+        note = _required_entity_merge_note(note, "合并复核意见")
+        request = self._entity_merge_request(request_id)
+        self._require_web_visible_entity(request["source_entity_id"])
+        self._require_web_visible_entity(request["target_entity_id"])
+        if decision == "approve":
+            _required_entity_merge_confirmation(confirmation, request_id)
+        result = review_entity_merge(
+            self.database,
+            request_id,
+            decision,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "entity_merge_request",
+            "entity_id": request_id,
+            "actor": actor,
+            **result,
+        }
+
     def update_conflict_candidate_label(
         self,
         pack_id: str,
@@ -1219,6 +1373,28 @@ class WorkbenchActionService:
             raise KnowledgeWorkbenchError(f"实体候选不存在：{candidate_id}")
         return row["classification"]
 
+    def _entity_merge_request(self, request_id: str):
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, status, source_entity_id, target_entity_id
+                FROM entity_merge_requests
+                WHERE id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(f"实体合并请求不存在：{request_id}")
+        return row
+
+    def _require_web_visible_entity(self, entity_id: str) -> dict:
+        visibility = get_entity_visibility(self.database, entity_id)
+        if not visibility["web_visible"]:
+            raise PermissionError(
+                "该规范实体没有可用于 Web 的非受限证据密级，请通过 CLI 处理"
+            )
+        return visibility
+
 
 def _pagination(limit: int, offset: int) -> tuple[int, int]:
     if limit < 1 or limit > 200:
@@ -1324,6 +1500,27 @@ def _required_entity_candidate_note(value: str) -> str:
     if len(note) > 2000:
         raise ValueError("实体候选复核意见不能超过 2000 个字符")
     return note
+
+
+def _required_entity_merge_note(value: str, label: str) -> str:
+    note = value.strip()
+    if not note:
+        raise ValueError(f"{label}不能为空")
+    if len(note) > 2000:
+        raise ValueError(f"{label}不能超过 2000 个字符")
+    return note
+
+
+def _entity_merge_confirmation_phrase(request_id: str) -> str:
+    return f"合并 {request_id}"
+
+
+def _required_entity_merge_confirmation(value: str, request_id: str) -> str:
+    confirmation = value.strip()
+    expected = _entity_merge_confirmation_phrase(request_id)
+    if confirmation != expected:
+        raise ValueError(f"批准实体合并前必须完整输入确认短语：{expected}")
+    return confirmation
 
 
 def _publish_confirmation_phrase(revision_id: str) -> str:

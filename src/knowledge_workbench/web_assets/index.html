@@ -20,9 +20,10 @@
         <a class="nav-item" href="#documents"><span>资料</span><kbd>2</kbd></a>
         <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
         <a class="nav-item" href="#entity-candidates"><span>实体候选</span><kbd>4</kbd></a>
-        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>5</kbd></a>
-        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>6</kbd></a>
-        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>7</kbd></a>
+        <a class="nav-item" href="#entity-merges"><span>实体合并</span><kbd>5</kbd></a>
+        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>6</kbd></a>
+        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>7</kbd></a>
+        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>8</kbd></a>
       </nav>
       <div class="local-lock">
         <span class="status-dot" aria-hidden="true"></span>
@@ -170,6 +171,42 @@
         <p class="entity-candidate-boundary">仅显示非 restricted 元数据；接受候选只会把逐字提及关联到已存在的规范实体，不会自动创建实体。</p>
         <div id="entity-candidate-list" class="entity-candidate-list" aria-live="polite"></div>
         <div id="entity-candidate-pagination" class="candidate-pagination panel"></div>
+      </section>
+
+      <section id="entity-merges" aria-labelledby="entity-merges-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">ENTITY MERGES</p><h2 id="entity-merges-title">实体合并复核</h2></div>
+          <span id="entity-merge-count" class="count-pill">—</span>
+        </div>
+        <form id="entity-merge-proposal" class="entity-merge-proposal panel">
+          <label>
+            <span>源实体（合并后归档）</span>
+            <select id="entity-merge-source" required></select>
+          </label>
+          <span class="merge-direction" aria-hidden="true">→</span>
+          <label>
+            <span>目标实体（合并后保留）</span>
+            <select id="entity-merge-target" required></select>
+          </label>
+          <label class="entity-merge-note">
+            <span>提议说明</span>
+            <textarea id="entity-merge-proposal-note" maxlength="2000" rows="2" required placeholder="说明回源核对依据；正文只以哈希进入审计"></textarea>
+          </label>
+          <button class="primary-filter" type="submit">提交异人复核</button>
+        </form>
+        <form id="entity-merge-filters" class="candidate-toolbar entity-merge-toolbar" role="search">
+          <label>
+            <span>搜索待复核请求</span>
+            <input id="entity-merge-query" type="search" maxlength="120" placeholder="实体名、类型、请求 ID 或提议人">
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">查询</button>
+            <button id="clear-entity-merge-filter" type="button">清除</button>
+          </div>
+        </form>
+        <p class="entity-candidate-boundary">仅开放两个 Web 可见、同类型 active 实体。批准会归档源实体并迁移别名、证据提及和已接受候选，必须由不同于提议人的操作者复核并输入绑定请求 ID 的确认短语。</p>
+        <div id="entity-merge-list" class="entity-candidate-list" aria-live="polite"></div>
+        <div id="entity-merge-pagination" class="candidate-pagination panel"></div>
       </section>
 
       <section id="conflict-labeling" aria-labelledby="conflict-labeling-title">

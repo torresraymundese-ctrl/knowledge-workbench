@@ -87,6 +87,8 @@ class WorkbenchWebApplication:
                         "conflict-candidate-review",
                         "entity-candidate-accept",
                         "entity-candidate-reject",
+                        "entity-merge-propose",
+                        "entity-merge-review",
                     ],
                 }
                 return self._json(200, payload)
@@ -153,6 +155,15 @@ class WorkbenchWebApplication:
                         limit=_integer_query(query, "limit", 10),
                         offset=_integer_query(query, "offset", 0),
                         status=_string_query(query, "status") or "pending",
+                        query=_string_query(query, "q"),
+                    ),
+                )
+            if parsed.path == "/api/v1/entity-merges":
+                return self._json(
+                    200,
+                    self.read_service.entity_merge_page(
+                        limit=_integer_query(query, "limit", 10),
+                        offset=_integer_query(query, "offset", 0),
                         query=_string_query(query, "q"),
                     ),
                 )
@@ -225,6 +236,10 @@ class WorkbenchWebApplication:
         entity_candidate_reject_id = _route_entity_id(
             path, entity="entity-candidates", action="reject"
         )
+        entity_merge_propose = path == "/api/v1/entity-merges/propose"
+        entity_merge_review_id = _route_entity_id(
+            path, entity="entity-merges", action="review"
+        )
         if (
             evidence_id is None
             and conflict_id is None
@@ -236,6 +251,8 @@ class WorkbenchWebApplication:
             and candidate_review_id is None
             and entity_candidate_accept_id is None
             and entity_candidate_reject_id is None
+            and not entity_merge_propose
+            and entity_merge_review_id is None
         ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
@@ -331,11 +348,26 @@ class WorkbenchWebApplication:
                         else str(payload.get("note"))
                     ),
                 )
-            else:
+            elif entity_candidate_reject_id is not None:
                 result = self.action_service.reject_entity_candidate_web(
-                    entity_candidate_reject_id or "",
+                    entity_candidate_reject_id,
                     actor=actor,
                     note=str(payload.get("note", "")),
+                )
+            elif entity_merge_propose:
+                result = self.action_service.propose_entity_merge_web(
+                    str(payload.get("source_entity_id", "")),
+                    str(payload.get("target_entity_id", "")),
+                    actor=actor,
+                    note=str(payload.get("note", "")),
+                )
+            else:
+                result = self.action_service.review_entity_merge_web(
+                    entity_merge_review_id or "",
+                    str(payload.get("decision", "")),
+                    actor=actor,
+                    note=str(payload.get("note", "")),
+                    confirmation=str(payload.get("confirmation", "")),
                 )
             return self._json(200, {"ok": True, "result": result})
         except (UnicodeError, json.JSONDecodeError):

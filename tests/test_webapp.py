@@ -1287,6 +1287,206 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(statuses["乙公司"], "rejected")
             self.assertEqual(statuses["火星公司"], "pending")
 
+    def test_entity_merge_web_requires_visible_entities_and_two_person_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "internal.md"
+            restricted = root / "restricted.md"
+            internal.write_text("甲公司。\n\n甲集团。", encoding="utf-8")
+            restricted.write_text("火星集团。", encoding="utf-8")
+            internal_result = ingest_file(
+                internal, paths, Classification.INTERNAL
+            )
+            restricted_result = ingest_file(
+                restricted, paths, Classification.RESTRICTED
+            )
+            database = Database(paths.database)
+            with database.connect() as connection:
+                internal_evidence = [
+                    row["id"]
+                    for row in connection.execute(
+                        """
+                        SELECT id FROM evidence
+                        WHERE processing_run_id = ?
+                        ORDER BY run_ordinal
+                        """,
+                        (internal_result.processing_run_id,),
+                    ).fetchall()
+                ]
+                restricted_evidence = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (restricted_result.processing_run_id,),
+                ).fetchone()[0]
+            source_entity = create_entity(
+                database, "甲公司", "organization", actor="curator-01"
+            )
+            target_entity = create_entity(
+                database, "甲集团", "organization", actor="curator-01"
+            )
+            restricted_entity = create_entity(
+                database, "火星集团", "organization", actor="curator-01"
+            )
+            unclassified_entity = create_entity(
+                database, "未分类集团", "organization", actor="curator-01"
+            )
+            link_evidence_entity(
+                database,
+                source_entity,
+                internal_evidence[0],
+                "甲公司",
+                actor="curator-01",
+            )
+            link_evidence_entity(
+                database,
+                target_entity,
+                internal_evidence[1],
+                "甲集团",
+                actor="curator-01",
+            )
+            link_evidence_entity(
+                database,
+                restricted_entity,
+                restricted_evidence,
+                "火星集团",
+                actor="curator-01",
+            )
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="merge-token",
+            )
+            headers = {
+                "Content-Type": "application/json",
+                "X-Workbench-CSRF": "merge-token",
+            }
+
+            empty = application.handle("GET", "/api/v1/entity-merges")
+            empty_payload = json.loads(empty.body)
+            self.assertEqual(empty_payload["total"], 0)
+            self.assertEqual(
+                {
+                    item["entity_id"]
+                    for item in empty_payload["entity_options"]
+                },
+                {source_entity, target_entity},
+            )
+            serialized = empty.body.decode("utf-8")
+            self.assertNotIn("火星集团", serialized)
+            self.assertNotIn("未分类集团", serialized)
+
+            blocked = application.handle(
+                "POST",
+                "/api/v1/entity-merges/propose",
+                body=json.dumps(
+                    {
+                        "actor": "curator-01",
+                        "source_entity_id": source_entity,
+                        "target_entity_id": restricted_entity,
+                        "note": "伪造受限目标 ID",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(blocked.status, 403)
+            proposed = application.handle(
+                "POST",
+                "/api/v1/entity-merges/propose",
+                body=json.dumps(
+                    {
+                        "actor": "curator-01",
+                        "source_entity_id": source_entity,
+                        "target_entity_id": target_entity,
+                        "note": "回源确认属于同一组织",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(proposed.status, 200)
+            request_id = json.loads(proposed.body)["result"]["request_id"]
+            page = json.loads(
+                application.handle(
+                    "GET", "/api/v1/entity-merges?q=甲公司"
+                ).body
+            )
+            self.assertEqual(page["total"], 1)
+            self.assertEqual(
+                page["items"][0]["approval_confirmation"],
+                f"合并 {request_id}",
+            )
+
+            review_route = f"/api/v1/entity-merges/{request_id}/review"
+            same_actor = application.handle(
+                "POST",
+                review_route,
+                body=json.dumps(
+                    {
+                        "actor": "curator-01",
+                        "decision": "approve",
+                        "note": "自行批准",
+                        "confirmation": f"合并 {request_id}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(same_actor.status, 409)
+            wrong_confirmation = application.handle(
+                "POST",
+                review_route,
+                body=json.dumps(
+                    {
+                        "actor": "reviewer-02",
+                        "decision": "approve",
+                        "note": "异人复核通过",
+                        "confirmation": "合并错误请求",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(wrong_confirmation.status, 400)
+            approved = application.handle(
+                "POST",
+                review_route,
+                body=json.dumps(
+                    {
+                        "actor": "reviewer-02",
+                        "decision": "approve",
+                        "note": "异人复核通过",
+                        "confirmation": f"合并 {request_id}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(approved.status, 200)
+            self.assertEqual(
+                json.loads(approved.body)["result"]["status"], "merged"
+            )
+            with database.connect() as connection:
+                entity_statuses = {
+                    row["id"]: row["status"]
+                    for row in connection.execute(
+                        """
+                        SELECT id, status FROM canonical_entities
+                        WHERE id IN (?, ?, ?, ?)
+                        """,
+                        (
+                            source_entity,
+                            target_entity,
+                            restricted_entity,
+                            unclassified_entity,
+                        ),
+                    ).fetchall()
+                }
+            self.assertEqual(entity_statuses[source_entity], "archived")
+            self.assertEqual(entity_statuses[target_entity], "active")
+            self.assertEqual(entity_statuses[restricted_entity], "active")
+            self.assertEqual(entity_statuses[unclassified_entity], "active")
+
     def test_http_server_sets_security_headers_and_binds_loopback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

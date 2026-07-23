@@ -9,6 +9,7 @@ const statusLabels = {
   pending: "待处理",
   deprecated: "已弃用",
   archived: "已归档",
+  merged: "已合并",
 };
 
 const eventLabels = {
@@ -30,6 +31,10 @@ const eventLabels = {
   entity_candidate_rejected: "实体候选已驳回",
   entity_alias_added: "实体别名已登记",
   evidence_entity_linked: "证据已关联实体",
+  entity_merge_proposed: "实体合并已提议",
+  entity_merge_rejected: "实体合并已驳回",
+  entity_merge_approved: "实体合并已批准",
+  canonical_entities_merged: "规范实体已合并",
   worker_started: "后台工作器已启动",
   worker_stopped: "后台工作器已停止",
   labeling_session_created: "黄金标注已创建",
@@ -63,6 +68,12 @@ const entityCandidateState = {
   offset: 0,
   status: "pending",
   query: "",
+};
+const entityMergeState = {
+  limit: 10,
+  offset: 0,
+  query: "",
+  entityOptions: [],
 };
 const candidatePhaseLabels = {
   labeling: "标注中",
@@ -715,6 +726,164 @@ async function refreshEntityCandidates() {
   }
 }
 
+function entityMergeOptionLabel(item) {
+  return `${item.canonical_name} · ${item.entity_type} · ${item.visibility} · ${item.evidence_count} 条证据`;
+}
+
+function populateEntityMergeOptions(items) {
+  entityMergeState.entityOptions = items;
+  const sourceSelect = document.querySelector("#entity-merge-source");
+  const targetSelect = document.querySelector("#entity-merge-target");
+  const previousSource = sourceSelect.value;
+  const previousTarget = targetSelect.value;
+  sourceSelect.replaceChildren(element("option", "", items.length ? "选择将被归档的源实体" : "暂无 Web 可见实体"));
+  sourceSelect.firstChild.value = "";
+  items.forEach((item) => {
+    const option = element("option", "", entityMergeOptionLabel(item));
+    option.value = item.entity_id;
+    sourceSelect.append(option);
+  });
+  if (items.some((item) => item.entity_id === previousSource)) sourceSelect.value = previousSource;
+
+  const source = items.find((item) => item.entity_id === sourceSelect.value);
+  const targets = source
+    ? items.filter((item) => item.entity_type === source.entity_type && item.entity_id !== source.entity_id)
+    : [];
+  targetSelect.replaceChildren(element("option", "", source ? (targets.length ? "选择保留的目标实体" : "没有同类型目标实体") : "请先选择源实体"));
+  targetSelect.firstChild.value = "";
+  targets.forEach((item) => {
+    const option = element("option", "", entityMergeOptionLabel(item));
+    option.value = item.entity_id;
+    targetSelect.append(option);
+  });
+  if (targets.some((item) => item.entity_id === previousTarget)) targetSelect.value = previousTarget;
+}
+
+async function reviewEntityMerge(request, decision, noteInput, confirmationInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const note = noteInput.value.trim();
+  if (!note) {
+    showBanner("实体合并复核意见不能为空");
+    noteInput.focus();
+    return;
+  }
+  const approving = decision === "approve";
+  if (approving && confirmationInput.value.trim() !== request.approval_confirmation) {
+    showBanner(`批准前必须完整输入确认短语：${request.approval_confirmation}`);
+    confirmationInput.focus();
+    return;
+  }
+  const action = approving ? "批准并执行合并" : "驳回合并请求";
+  if (!window.confirm(`确认${action}？该决定将以 ${actor} 写入审计日志。`)) return;
+  try {
+    await postTransition(`/api/v1/entity-merges/${encodeURIComponent(request.id)}/review`, {
+      actor,
+      decision,
+      note,
+      confirmation: approving ? confirmationInput.value.trim() : "",
+    });
+    await loadDashboard();
+    showBanner(`实体合并请求已${approving ? "批准" : "驳回"}，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "实体合并复核失败");
+  }
+}
+
+function renderEntityMerges(page) {
+  document.querySelector("#entity-merge-count").textContent = `${page.total} 项待复核`;
+  populateEntityMergeOptions(page.entity_options);
+  const list = document.querySelector("#entity-merge-list");
+  list.replaceChildren();
+  if (!page.items.length) {
+    list.append(element("div", "panel empty", "当前没有符合条件的实体合并请求"));
+  }
+  page.items.forEach((request) => {
+    const card = element("article", "entity-candidate-card panel");
+    const heading = element("header", "entity-candidate-heading");
+    const title = element("div");
+    title.append(
+      element("h3", "", "待复核实体合并"),
+      element("small", "", request.id),
+    );
+    const badges = element("div", "entity-candidate-badges");
+    badges.append(
+      element("span", "tag", request.entity_type),
+      element("span", "tag internal", statusLabels[request.status] || request.status),
+    );
+    heading.append(title, badges);
+
+    const route = element("div", "entity-merge-route");
+    const source = element("div", "entity-merge-side");
+    source.append(
+      element("small", "", "源实体 · 合并后归档"),
+      element("strong", "", request.source_name),
+      element("small", "", `${request.source_visibility} · ${request.source_evidence_count} 条历史证据 · ${shortId(request.source_entity_id)}`),
+    );
+    const target = element("div", "entity-merge-side");
+    target.append(
+      element("small", "", "目标实体 · 合并后保留"),
+      element("strong", "", request.target_name),
+      element("small", "", `${request.target_visibility} · ${request.target_evidence_count} 条历史证据 · ${shortId(request.target_entity_id)}`),
+    );
+    route.append(source, element("span", "entity-merge-arrow", "→"), target);
+
+    const metadata = element("div", "entity-merge-review-meta", `提议人：${request.proposed_by} · 提交时间：${formatTime(request.created_at)} · 复核人必须不同于提议人`);
+    const review = element("div", "entity-merge-review");
+    const note = element("textarea");
+    note.maxLength = 2000;
+    note.rows = 2;
+    note.placeholder = "复核意见（必填，仅保存 SHA-256）";
+    const confirmation = element("input");
+    confirmation.maxLength = 180;
+    confirmation.placeholder = request.approval_confirmation;
+    confirmation.setAttribute("aria-label", "批准合并确认短语");
+    review.append(
+      note,
+      confirmation,
+      button("批准合并", "primary", () => reviewEntityMerge(request, "approve", note, confirmation)),
+      button("驳回请求", "danger", () => reviewEntityMerge(request, "reject", note, confirmation)),
+    );
+    card.append(heading, route, metadata, review);
+    list.append(card);
+  });
+
+  const pagination = document.querySelector("#entity-merge-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    entityMergeState.offset = Math.max(0, page.offset - page.limit);
+    await refreshEntityMerges();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    entityMergeState.offset = page.offset + page.limit;
+    await refreshEntityMerges();
+  });
+  next.disabled = !page.has_next;
+  pagination.replaceChildren(previous, element("span", "", `第 ${pageNumber}/${pageCount} 页 · ${page.total} 项`), next);
+}
+
+async function loadEntityMerges() {
+  const parameters = new URLSearchParams({
+    limit: String(entityMergeState.limit),
+    offset: String(entityMergeState.offset),
+  });
+  if (entityMergeState.query) parameters.set("q", entityMergeState.query);
+  const response = await fetch(`/api/v1/entity-merges?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `实体合并请求读取失败（HTTP ${response.status}）`);
+  renderEntityMerges(page);
+}
+
+async function refreshEntityMerges() {
+  try {
+    await loadEntityMerges();
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "实体合并请求读取失败");
+  }
+}
+
 function candidateSide(side, label) {
   const root = element("section", "candidate-side");
   const heading = element("div", "candidate-side-heading");
@@ -1018,7 +1187,13 @@ async function loadDashboard() {
       document.querySelector("#entity-candidate-pagination").replaceChildren();
       showBanner(message);
     });
-    await Promise.all([loadReviewQueues(), candidateLoad, entityCandidateLoad]);
+    const entityMergeLoad = loadEntityMerges().catch((cause) => {
+      const message = cause instanceof Error ? cause.message : "实体合并请求读取失败";
+      document.querySelector("#entity-merge-list").replaceChildren(element("div", "panel empty", message));
+      document.querySelector("#entity-merge-pagination").replaceChildren();
+      showBanner(message);
+    });
+    await Promise.all([loadReviewQueues(), candidateLoad, entityCandidateLoad, entityMergeLoad]);
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -1071,6 +1246,55 @@ document.querySelector("#clear-entity-candidate-filters").addEventListener("clic
   entityCandidateState.query = "";
   entityCandidateState.offset = 0;
   await refreshEntityCandidates();
+});
+document.querySelector("#entity-merge-source").addEventListener("change", () => {
+  populateEntityMergeOptions(entityMergeState.entityOptions);
+});
+document.querySelector("#entity-merge-proposal").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const sourceEntityId = document.querySelector("#entity-merge-source").value;
+  const targetEntityId = document.querySelector("#entity-merge-target").value;
+  const note = document.querySelector("#entity-merge-proposal-note").value.trim();
+  if (!sourceEntityId || !targetEntityId) {
+    showBanner("请选择源实体和同类型目标实体");
+    return;
+  }
+  if (!note) {
+    showBanner("实体合并提议说明不能为空");
+    document.querySelector("#entity-merge-proposal-note").focus();
+    return;
+  }
+  const source = entityMergeState.entityOptions.find((item) => item.entity_id === sourceEntityId);
+  const target = entityMergeState.entityOptions.find((item) => item.entity_id === targetEntityId);
+  if (!window.confirm(`确认提交合并方向“${source?.canonical_name || sourceEntityId} → ${target?.canonical_name || targetEntityId}”供异人复核？`)) return;
+  try {
+    await postTransition("/api/v1/entity-merges/propose", {
+      actor,
+      source_entity_id: sourceEntityId,
+      target_entity_id: targetEntityId,
+      note,
+    });
+    document.querySelector("#entity-merge-proposal-note").value = "";
+    entityMergeState.offset = 0;
+    await loadDashboard();
+    showBanner(`实体合并提议已提交，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "实体合并提议失败");
+  }
+});
+document.querySelector("#entity-merge-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  entityMergeState.query = document.querySelector("#entity-merge-query").value.trim();
+  entityMergeState.offset = 0;
+  await refreshEntityMerges();
+});
+document.querySelector("#clear-entity-merge-filter").addEventListener("click", async () => {
+  document.querySelector("#entity-merge-query").value = "";
+  entityMergeState.query = "";
+  entityMergeState.offset = 0;
+  await refreshEntityMerges();
 });
 document.querySelector("#candidate-filters").addEventListener("submit", async (event) => {
   event.preventDefault();
