@@ -14,6 +14,8 @@ from knowledge_workbench.graph_pilot import (
     inspect_graph_pilot_pack,
 )
 from knowledge_workbench.graph_pilot_review_workpacks import (
+    SOLO_ATTESTATION_PHRASE,
+    SOLO_ATTESTED_REVIEW_MODE,
     apply_graph_pilot_triage_work_pack,
     apply_graph_pilot_verification_work_pack,
     export_graph_pilot_triage_work_pack,
@@ -384,6 +386,153 @@ class GraphPilotReviewWorkPackTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM audit_log"
                 ).fetchone()[0]
             self.assertEqual(audit_count_after, audit_count_before + 5)
+
+    def test_solo_attested_review_is_explicit_and_not_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, database, source_pack_path, source_pack = (
+                self._build_pilot(root)
+            )
+            evidence_ids = [
+                item["evidence_id"]
+                for item in source_pack["candidates"]
+            ]
+            triage_path = paths.evaluations / "solo-triage.md"
+            export_graph_pilot_triage_work_pack(
+                database,
+                paths,
+                source_pack_path,
+                triage_path,
+                actor="owner-01",
+            )
+            triage_path.write_text(
+                self._fill_triage(
+                    triage_path.read_text(encoding="utf-8"),
+                    submit_ids=set(evidence_ids),
+                    hold_ids=set(),
+                ),
+                encoding="utf-8",
+            )
+            apply_graph_pilot_triage_work_pack(
+                database,
+                paths,
+                triage_path,
+                actor="owner-01",
+            )
+            with self.assertRaisesRegex(
+                InvalidTransitionError, "当前 actor"
+            ):
+                export_graph_pilot_verification_work_pack(
+                    database,
+                    paths,
+                    source_pack_path,
+                    paths.evaluations / "false-independent.md",
+                    actor="owner-01",
+                )
+
+            solo_path = paths.evaluations / "solo-verification.md"
+            export_graph_pilot_verification_work_pack(
+                database,
+                paths,
+                source_pack_path,
+                solo_path,
+                actor="owner-01",
+                review_mode=SOLO_ATTESTED_REVIEW_MODE,
+            )
+            solo_content = solo_path.read_text(encoding="utf-8")
+            self.assertIn("review_mode: solo_attested", solo_content)
+            self.assertIn("不构成独立复核", solo_content)
+            self.assertIn("图谱试点证据人工复核", solo_content)
+            self.assertIn("同一责任人必须重新回源核对", solo_content)
+            self.assertNotIn("复核人必须独立核对", solo_content)
+            solo_path.write_text(
+                self._fill_verification(
+                    solo_content,
+                    approve_ids=set(evidence_ids),
+                    return_ids=set(),
+                ),
+                encoding="utf-8",
+            )
+            status = inspect_graph_pilot_review_work_pack(
+                database, paths, solo_path
+            )
+            self.assertEqual(
+                status["review_mode"], SOLO_ATTESTED_REVIEW_MODE
+            )
+            self.assertFalse(status["independent_review"])
+            self.assertTrue(status["solo_attestation_required"])
+            self.assertTrue(status["review_actor_policy_valid"])
+            self.assertFalse(status["actor_separation_valid"])
+            self.assertTrue(status["apply_ready"])
+
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "明确确认声明"
+            ):
+                apply_graph_pilot_verification_work_pack(
+                    database,
+                    paths,
+                    solo_path,
+                    actor="owner-01",
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "确认短语"
+            ):
+                apply_graph_pilot_verification_work_pack(
+                    database,
+                    paths,
+                    solo_path,
+                    actor="owner-01",
+                    solo_attestation="我确认",
+                )
+            result = apply_graph_pilot_verification_work_pack(
+                database,
+                paths,
+                solo_path,
+                actor="owner-01",
+                solo_attestation=SOLO_ATTESTATION_PHRASE,
+            )
+            self.assertEqual(result["approved_count"], 3)
+            self.assertFalse(result["independent_review"])
+            self.assertEqual(
+                result["review_mode"], SOLO_ATTESTED_REVIEW_MODE
+            )
+            self.assertEqual(self._statuses(database), {"verified": 3})
+            pilot_status = inspect_graph_pilot_pack(
+                database, paths, source_pack_path
+            )
+            self.assertEqual(
+                pilot_status["summary"][
+                    "human_attested_verified_evidence_count"
+                ],
+                3,
+            )
+            self.assertEqual(
+                pilot_status["summary"][
+                    "solo_attested_verified_evidence_count"
+                ],
+                3,
+            )
+            self.assertFalse(
+                pilot_status["summary"]["independent_review_complete"]
+            )
+            with database.connect() as connection:
+                event = connection.execute(
+                    """
+                    SELECT details_json FROM audit_log
+                    WHERE event_type = 'graph_pilot_verification_applied'
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
+            details = json.loads(event["details_json"])
+            self.assertEqual(
+                details["review_mode"], SOLO_ATTESTED_REVIEW_MODE
+            )
+            self.assertFalse(details["independent_review"])
+            self.assertIn("solo_attestation_sha256", details)
+            self.assertNotIn(
+                SOLO_ATTESTATION_PHRASE,
+                json.dumps(details, ensure_ascii=False),
+            )
 
     def test_paths_duplicates_and_status_drift_are_strict(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -23,6 +23,14 @@ from .wiki import write_text_atomic
 _TRIAGE_PACK_TYPE = "graph-pilot-evidence-triage-pack"
 _VERIFICATION_PACK_TYPE = "graph-pilot-evidence-verification-pack"
 _ELIGIBLE_TRIAGE_STATUSES = frozenset({"draft", "conflicted"})
+INDEPENDENT_REVIEW_MODE = "independent"
+SOLO_ATTESTED_REVIEW_MODE = "solo_attested"
+SOLO_ATTESTATION_PHRASE = (
+    "我确认本次由同一责任人完成二次核对，非独立复核"
+)
+_REVIEW_MODES = frozenset(
+    {INDEPENDENT_REVIEW_MODE, SOLO_ATTESTED_REVIEW_MODE}
+)
 
 
 def export_graph_pilot_triage_work_pack(
@@ -221,10 +229,12 @@ def export_graph_pilot_verification_work_pack(
     output: Path,
     *,
     actor: str,
+    review_mode: str = INDEPENDENT_REVIEW_MODE,
 ) -> Path:
     actor = _required_actor(actor)
+    review_mode = _required_review_mode(review_mode)
     output = _validated_output(
-        paths, output, "图谱试点证据异人复核工作包"
+        paths, output, "图谱试点证据人工复核工作包"
     )
     source_path, source_content, source_pack = resolve_graph_pilot_pack(
         database, paths, source_pack_path
@@ -241,7 +251,7 @@ def export_graph_pilot_verification_work_pack(
     ]
     if not reviewing_candidates:
         raise InvalidTransitionError(
-            "图谱试点包没有 reviewing 证据可进行异人复核"
+            "图谱试点包没有 reviewing 证据可进行人工复核"
         )
     with database.connect() as connection:
         candidates = []
@@ -250,7 +260,15 @@ def export_graph_pilot_verification_work_pack(
             submitter = _reviewing_submitter(
                 connection, candidate["evidence_id"]
             )
-            if submitter == actor:
+            if (
+                review_mode == INDEPENDENT_REVIEW_MODE
+                and submitter == actor
+            ):
+                continue
+            if (
+                review_mode == SOLO_ATTESTED_REVIEW_MODE
+                and submitter != actor
+            ):
                 continue
             candidates.append(candidate)
             records.append(
@@ -261,8 +279,12 @@ def export_graph_pilot_verification_work_pack(
                 }
             )
     if not candidates:
+        if review_mode == INDEPENDENT_REVIEW_MODE:
+            raise InvalidTransitionError(
+                "没有可由当前 actor 异人复核的 reviewing 证据"
+            )
         raise InvalidTransitionError(
-            "没有可由当前 actor 异人复核的 reviewing 证据"
+            "没有由当前 actor 提交、可作单人二次确认的 reviewing 证据"
         )
     source_relative = source_path.relative_to(
         paths.root.resolve()
@@ -275,14 +297,29 @@ def export_graph_pilot_verification_work_pack(
         source_sha256,
         role_key="reviewer",
         actor=actor,
+        extra_metadata={"review_mode": review_mode},
+    )
+    review_description = (
+        "- 复核模式：`independent`（提交人与复核人必须不同）。"
+        if review_mode == INDEPENDENT_REVIEW_MODE
+        else (
+            "- 复核模式：`solo_attested`（同一责任人二次确认，"
+            "不构成独立复核）。"
+        )
+    )
+    review_instruction = (
+        "- 复核人必须独立核对来源正文、定位和原子边界。"
+        if review_mode == INDEPENDENT_REVIEW_MODE
+        else "- 同一责任人必须重新回源核对正文、定位和原子边界。"
     )
     lines.extend(
         [
-            f"# 图谱试点证据异人复核：`{source_pack['pack_id']}`",
+            f"# 图谱试点证据人工复核：`{source_pack['pack_id']}`",
             "",
             f"- 复核人：`{_markdown_code(actor)}`",
+            review_description,
             f"- 待复核证据：`{len(candidates)}`",
-            "- 复核人必须独立核对来源正文、定位和原子边界。",
+            review_instruction,
             "- 每条必须且只能选择“验证通过”或“退回草稿”。",
             "- 退回草稿必须填写复核意见；验证通过不会自动创建实体或关系。",
             "- 全部决定一次原子应用；任何一条失效时整批零写入。",
@@ -295,6 +332,12 @@ def export_graph_pilot_verification_work_pack(
                 "pilot-verification-apply "
                 f"{_powershell_literal(str(output))} "
                 f"--actor {_powershell_literal(actor)}"
+                + (
+                    " --solo-attestation "
+                    + _powershell_literal(SOLO_ATTESTATION_PHRASE)
+                    if review_mode == SOLO_ATTESTED_REVIEW_MODE
+                    else ""
+                )
             ),
             "```",
             "",
@@ -336,12 +379,17 @@ def apply_graph_pilot_verification_work_pack(
     work_pack_path: Path,
     *,
     actor: str,
+    solo_attestation: str | None = None,
 ) -> dict[str, Any]:
     actor = _required_actor(actor)
     work_pack_path, content = _read_work_pack(
-        paths, work_pack_path, "图谱试点证据异人复核工作包"
+        paths, work_pack_path, "图谱试点证据人工复核工作包"
     )
     metadata, decisions = _parse_verification_pack(content)
+    review_mode = metadata["review_mode"]
+    attestation_sha256 = _validate_review_attestation(
+        review_mode, solo_attestation
+    )
     if metadata["reviewer"] != actor:
         raise KnowledgeWorkbenchError(
             "工作包声明的复核人与当前 actor 不一致"
@@ -366,7 +414,13 @@ def apply_graph_pilot_verification_work_pack(
     context = {
         "graph_pilot_pack_id": source_pack["pack_id"],
         "work_pack_sha256": work_pack_sha256,
+        "review_mode": review_mode,
+        "independent_review": (
+            review_mode == INDEPENDENT_REVIEW_MODE
+        ),
     }
+    if attestation_sha256 is not None:
+        context["solo_attestation_sha256"] = attestation_sha256
     candidates = _candidates_by_id(source_pack)
     with database.transaction() as connection:
         for record in records:
@@ -378,8 +432,18 @@ def apply_graph_pilot_verification_work_pack(
             submitter = _reviewing_submitter(
                 connection, record["evidence_id"]
             )
-            if submitter == actor:
+            if (
+                review_mode == INDEPENDENT_REVIEW_MODE
+                and submitter == actor
+            ):
                 raise InvalidTransitionError("证据提交人与复核人必须不同")
+            if (
+                review_mode == SOLO_ATTESTED_REVIEW_MODE
+                and submitter != actor
+            ):
+                raise InvalidTransitionError(
+                    "单人确认只能处理由当前 actor 自己提交的证据"
+                )
         by_id = {
             item["evidence_id"]: item for item in decisions
         }
@@ -413,6 +477,19 @@ def apply_graph_pilot_verification_work_pack(
                 {
                     "approved_count": len(approved),
                     "returned_count": len(returned),
+                    "review_mode": review_mode,
+                    "independent_review": (
+                        review_mode == INDEPENDENT_REVIEW_MODE
+                    ),
+                    **(
+                        {
+                            "solo_attestation_sha256": (
+                                attestation_sha256
+                            )
+                        }
+                        if attestation_sha256 is not None
+                        else {}
+                    ),
                     "approved_evidence_ids": [
                         item["evidence_id"] for item in approved
                     ],
@@ -431,6 +508,10 @@ def apply_graph_pilot_verification_work_pack(
         "approved_count": len(approved),
         "returned_count": len(returned),
         "actor": actor,
+        "review_mode": review_mode,
+        "independent_review": (
+            review_mode == INDEPENDENT_REVIEW_MODE
+        ),
     }
 
 
@@ -477,6 +558,11 @@ def inspect_graph_pilot_review_work_pack(
             )
         _require_metadata(metadata, (role_key,))
         actor = _required_actor(metadata[role_key])
+        review_mode = (
+            _verification_review_mode(metadata)
+            if pack_type == _VERIFICATION_PACK_TYPE
+            else None
+        )
         records = _parse_sections(
             lines,
             start,
@@ -539,7 +625,7 @@ def inspect_graph_pilot_review_work_pack(
         integrity_error = str(exc)
 
     snapshot_invalid_ids: list[str] = []
-    actor_separation_conflict_ids: list[str] = []
+    review_actor_policy_conflict_ids: list[str] = []
     submitter_audit_invalid_ids: list[str] = []
     if integrity_valid and source_pack is not None:
         candidates = _candidates_by_id(source_pack)
@@ -569,8 +655,15 @@ def inspect_graph_pilot_review_work_pack(
                         record["evidence_id"]
                     )
                     continue
-                if submitter == actor:
-                    actor_separation_conflict_ids.append(
+                actor_matches_submitter = submitter == actor
+                if (
+                    review_mode == INDEPENDENT_REVIEW_MODE
+                    and actor_matches_submitter
+                ) or (
+                    review_mode == SOLO_ATTESTED_REVIEW_MODE
+                    and not actor_matches_submitter
+                ):
+                    review_actor_policy_conflict_ids.append(
                         record["evidence_id"]
                     )
 
@@ -587,15 +680,15 @@ def inspect_graph_pilot_review_work_pack(
         issue_codes.append("source_or_status_drift")
     if submitter_audit_invalid_ids:
         issue_codes.append("submitter_audit_missing")
-    if actor_separation_conflict_ids:
-        issue_codes.append("actor_separation_conflict")
+    if review_actor_policy_conflict_ids:
+        issue_codes.append("review_actor_policy_conflict")
 
     apply_ready = (
         integrity_valid
         and not unresolved_ids
         and not snapshot_invalid_ids
         and not submitter_audit_invalid_ids
-        and not actor_separation_conflict_ids
+        and not review_actor_policy_conflict_ids
     )
     payload = {
         **base,
@@ -625,16 +718,31 @@ def inspect_graph_pilot_review_work_pack(
         "submitter_audit_invalid_count": len(
             submitter_audit_invalid_ids
         ),
-        "actor_separation_valid": (
+        "review_mode": review_mode,
+        "independent_review": (
+            review_mode == INDEPENDENT_REVIEW_MODE
+            if review_mode is not None
+            else None
+        ),
+        "solo_attestation_required": (
+            review_mode == SOLO_ATTESTED_REVIEW_MODE
+        ),
+        "review_actor_policy_valid": (
             pack_type != _VERIFICATION_PACK_TYPE
             or (
                 integrity_valid
                 and not submitter_audit_invalid_ids
-                and not actor_separation_conflict_ids
+                and not review_actor_policy_conflict_ids
             )
         ),
-        "actor_separation_conflict_count": len(
-            actor_separation_conflict_ids
+        "actor_separation_valid": (
+            review_mode == INDEPENDENT_REVIEW_MODE
+            and integrity_valid
+            and not submitter_audit_invalid_ids
+            and not review_actor_policy_conflict_ids
+        ) if pack_type == _VERIFICATION_PACK_TYPE else None,
+        "review_actor_policy_conflict_count": len(
+            review_actor_policy_conflict_ids
         ),
         "next_unresolved_evidence_id": (
             unresolved_ids[0] if unresolved_ids else None
@@ -655,18 +763,22 @@ def _frontmatter(
     *,
     role_key: str,
     actor: str,
+    extra_metadata: dict[str, str] | None = None,
 ) -> list[str]:
-    return [
+    lines = [
         "---",
         f"type: {pack_type}",
         f"graph_pilot_pack_id: {source_pack['pack_id']}",
         f"source_pack_path: {source_path}",
         f"source_content_sha256: {source_sha256}",
         f"{role_key}: {actor}",
-        f"generated_at: {utc_now()}",
-        "---",
-        "",
     ]
+    lines.extend(
+        f"{key}: {value}"
+        for key, value in (extra_metadata or {}).items()
+    )
+    lines.extend([f"generated_at: {utc_now()}", "---", ""])
+    return lines
 
 
 def _candidate_header(
@@ -731,6 +843,7 @@ def _parse_verification_pack(
         content, _VERIFICATION_PACK_TYPE
     )
     _require_metadata(metadata, ("reviewer",))
+    metadata["review_mode"] = _verification_review_mode(metadata)
     records = _parse_sections(
         lines,
         start,
@@ -1296,6 +1409,44 @@ def _required_actor(value: str) -> str:
     if any(character in actor for character in "\r\n"):
         raise KnowledgeWorkbenchError("actor 不能包含换行")
     return actor
+
+
+def _required_review_mode(value: str) -> str:
+    if not isinstance(value, str):
+        raise KnowledgeWorkbenchError("复核模式无效")
+    mode = value.strip().replace("-", "_")
+    if mode not in _REVIEW_MODES:
+        raise KnowledgeWorkbenchError(
+            "复核模式必须是 independent 或 solo_attested"
+        )
+    return mode
+
+
+def _verification_review_mode(metadata: dict[str, str]) -> str:
+    return _required_review_mode(
+        metadata.get("review_mode", INDEPENDENT_REVIEW_MODE)
+    )
+
+
+def _validate_review_attestation(
+    review_mode: str, solo_attestation: str | None
+) -> str | None:
+    if review_mode == INDEPENDENT_REVIEW_MODE:
+        if solo_attestation:
+            raise KnowledgeWorkbenchError(
+                "独立复核模式不接受单人确认声明"
+            )
+        return None
+    if not isinstance(solo_attestation, str):
+        raise KnowledgeWorkbenchError(
+            "单人确认模式必须提供明确确认声明"
+        )
+    attestation = solo_attestation.strip()
+    if attestation != SOLO_ATTESTATION_PHRASE:
+        raise KnowledgeWorkbenchError(
+            "单人确认声明与要求的确认短语不一致"
+        )
+    return sha256_text(attestation)
 
 
 def _markdown_code(value: str) -> str:

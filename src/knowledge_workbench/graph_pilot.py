@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections import Counter
 from pathlib import Path
 
@@ -184,6 +185,10 @@ def inspect_graph_pilot_pack(
     )
     items = []
     with database.connect() as connection:
+        assurance_by_evidence = _verification_assurance_map(
+            connection,
+            [candidate["evidence_id"] for candidate in pack["candidates"]],
+        )
         current_locators = _location_map(
             connection,
             [candidate["evidence_id"] for candidate in pack["candidates"]],
@@ -232,6 +237,7 @@ def inspect_graph_pilot_pack(
                         "active_entity_count": 0,
                         "active_relationship_count": 0,
                         "ready_for_relationship_registration": False,
+                        "review_assurance": None,
                     }
                 )
                 continue
@@ -259,6 +265,11 @@ def inspect_graph_pilot_pack(
                     "active_relationship_count": row[
                         "active_relationship_count"
                     ],
+                    "review_assurance": (
+                        assurance_by_evidence.get(evidence_id)
+                        if row["status"] == "verified"
+                        else None
+                    ),
                     "ready_for_relationship_registration": (
                         snapshot_valid
                         and row["status"] == "verified"
@@ -293,6 +304,21 @@ def inspect_graph_pilot_pack(
     restricted_leak_count = sum(
         item.get("classification") == "restricted" for item in items
     )
+    assurance_counts = Counter(
+        item.get("review_assurance") or "unattributed"
+        for item in verified_items
+    )
+    human_attested_verified_count = (
+        assurance_counts["independent"]
+        + assurance_counts["solo_attested"]
+    )
+    evidence_review_complete = (
+        invalid_count == 0
+        and all(
+            item["status"] not in {"draft", "reviewing"}
+            for item in items
+        )
+    )
     return {
         "schema_version": "1.0",
         "kind": "graph-pilot-status",
@@ -308,6 +334,24 @@ def inspect_graph_pilot_pack(
             "restricted_leak_count": restricted_leak_count,
             "status_counts": status_counts,
             "verified_evidence_count": len(verified_items),
+            "human_attested_verified_evidence_count": (
+                human_attested_verified_count
+            ),
+            "independent_verified_evidence_count": assurance_counts[
+                "independent"
+            ],
+            "solo_attested_verified_evidence_count": assurance_counts[
+                "solo_attested"
+            ],
+            "unattributed_verified_evidence_count": assurance_counts[
+                "unattributed"
+            ],
+            "independent_review_complete": (
+                evidence_review_complete
+                and bool(verified_items)
+                and assurance_counts["independent"]
+                == len(verified_items)
+            ),
             "verified_evidence_coverage": _coverage(
                 len(verified_items), total
             ),
@@ -329,13 +373,7 @@ def inspect_graph_pilot_pack(
             ),
             "source_snapshot_passed": invalid_count == 0,
             "classification_boundary_passed": restricted_leak_count == 0,
-            "evidence_review_complete": (
-                invalid_count == 0
-                and all(
-                    item["status"] not in {"draft", "reviewing"}
-                    for item in items
-                )
-            ),
+            "evidence_review_complete": evidence_review_complete,
             "graph_gold_prerequisites_met": (
                 invalid_count == 0
                 and restricted_leak_count == 0
@@ -531,6 +569,45 @@ def _validate_source_rows(rows: list) -> None:
             raise KnowledgeWorkbenchError(
                 f"黄金标注证据已退出当前试点资格：{row['evidence_id']}"
             )
+
+
+def _verification_assurance_map(
+    connection: sqlite3.Connection,
+    evidence_ids: list[str],
+) -> dict[str, str]:
+    if not evidence_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in evidence_ids)
+    rows = connection.execute(
+        f"""
+        SELECT entity_id, details_json
+        FROM audit_log
+        WHERE event_type = 'evidence_status_changed'
+          AND entity_type = 'evidence'
+          AND entity_id IN ({placeholders})
+        ORDER BY id DESC
+        """,
+        tuple(evidence_ids),
+    ).fetchall()
+    assurance: dict[str, str] = {}
+    for row in rows:
+        evidence_id = row["entity_id"]
+        if evidence_id in assurance:
+            continue
+        try:
+            details = json.loads(row["details_json"])
+        except json.JSONDecodeError:
+            continue
+        if details.get("to") != "verified":
+            continue
+        review_mode = details.get("review_mode")
+        if review_mode == "independent":
+            assurance[evidence_id] = "independent"
+        elif review_mode == "solo_attested":
+            assurance[evidence_id] = "solo_attested"
+        else:
+            assurance[evidence_id] = "unattributed"
+    return assurance
 
 
 def _location_map(

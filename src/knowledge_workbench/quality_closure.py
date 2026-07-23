@@ -191,11 +191,17 @@ def build_quality_closure_status(
             "graph_evidence_review",
             (
                 graph["evidence_review_complete"]
-                and graph["verified_evidence_count"] > 0
+                and graph[
+                    "human_attested_verified_evidence_count"
+                ] > 0
             ),
             required={
                 "evidence_review_complete": True,
-                "minimum_verified_evidence_count": 1,
+                "minimum_human_attested_verified_evidence_count": 1,
+                "accepted_review_modes": [
+                    "independent",
+                    "solo_attested",
+                ],
             },
             actual={
                 "evidence_review_complete": graph[
@@ -204,9 +210,27 @@ def build_quality_closure_status(
                 "verified_evidence_count": graph[
                     "verified_evidence_count"
                 ],
+                "human_attested_verified_evidence_count": graph[
+                    "human_attested_verified_evidence_count"
+                ],
+                "independent_verified_evidence_count": graph[
+                    "independent_verified_evidence_count"
+                ],
+                "solo_attested_verified_evidence_count": graph[
+                    "solo_attested_verified_evidence_count"
+                ],
+                "unattributed_verified_evidence_count": graph[
+                    "unattributed_verified_evidence_count"
+                ],
+                "independent_review_complete": graph[
+                    "independent_review_complete"
+                ],
                 "status_counts": graph["status_counts"],
             },
-            next_action="完成试点证据初审与异人验证或明确暂缓处置",
+            next_action=(
+                "完成试点证据人工验证；单人模式必须显式记录"
+                " solo_attested，不能冒充独立复核"
+            ),
             phase="human_data",
         ),
         _gate(
@@ -508,6 +532,21 @@ def _graph_status(
         "status_counts": summary.get("status_counts", {}),
         "verified_evidence_count": summary.get(
             "verified_evidence_count", 0
+        ),
+        "human_attested_verified_evidence_count": summary.get(
+            "human_attested_verified_evidence_count", 0
+        ),
+        "independent_verified_evidence_count": summary.get(
+            "independent_verified_evidence_count", 0
+        ),
+        "solo_attested_verified_evidence_count": summary.get(
+            "solo_attested_verified_evidence_count", 0
+        ),
+        "unattributed_verified_evidence_count": summary.get(
+            "unattributed_verified_evidence_count", 0
+        ),
+        "independent_review_complete": summary.get(
+            "independent_review_complete", False
         ),
         "verified_with_entity_count": summary.get(
             "verified_with_entity_count", 0

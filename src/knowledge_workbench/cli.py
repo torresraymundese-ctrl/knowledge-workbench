@@ -408,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph_pilot_status.add_argument("pack", type=Path)
     graph_pilot_review_status = graph_sub.add_parser(
         "pilot-review-status",
-        help="只读检查图谱试点初审或异人复核工作包进度",
+        help="只读检查图谱试点初审或人工复核工作包进度",
     )
     graph_pilot_review_status.add_argument("work_pack", type=Path)
     graph_pilot_triage_export = graph_sub.add_parser(
@@ -433,6 +433,12 @@ def build_parser() -> argparse.ArgumentParser:
     graph_pilot_verification_export.add_argument(
         "--actor", required=True
     )
+    graph_pilot_verification_export.add_argument(
+        "--review-mode",
+        choices=("independent", "solo-attested"),
+        default="independent",
+        help="默认异人复核；单人开发可显式选择可审计但非独立的二次确认",
+    )
     graph_pilot_verification_apply = graph_sub.add_parser(
         "pilot-verification-apply",
         help="原子验证或退回一个图谱试点证据批次",
@@ -442,6 +448,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     graph_pilot_verification_apply.add_argument(
         "--actor", required=True
+    )
+    graph_pilot_verification_apply.add_argument(
+        "--solo-attestation",
+        help="solo-attested 模式要求的精确确认短语",
     )
     graph_pilot_entity_export = graph_sub.add_parser(
         "pilot-entity-export",
@@ -1385,8 +1395,9 @@ def _handle_graph(
             args.pack,
             args.output,
             actor=args.actor,
+            review_mode=args.review_mode,
         )
-        print(f"图谱试点证据异人复核工作包：{output}")
+        print(f"图谱试点证据人工复核工作包：{output}")
         return
     if args.graph_command == "pilot-verification-apply":
         payload = apply_graph_pilot_verification_work_pack(
@@ -1394,8 +1405,9 @@ def _handle_graph(
             paths,
             args.work_pack,
             actor=args.actor,
+            solo_attestation=args.solo_attestation,
         )
-        print("图谱试点证据异人复核决定已原子应用。")
+        print("图谱试点证据人工复核决定已原子应用。")
         _print_mapping(payload)
         return
     if args.graph_command == "pilot-entity-export":
