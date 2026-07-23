@@ -15,6 +15,7 @@ from .conflict_candidates import (
 from .conflicts import transition_conflict
 from .database import Database
 from .entity_candidates import accept_entity_candidate, reject_entity_candidate
+from .entity_visibility import get_entity_visibility, list_entity_visibility
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
 from .review import (
@@ -136,18 +137,9 @@ class WorkbenchReadService:
                 """,
                 [*parameters, limit, offset],
             ).fetchall()
-            entity_rows = connection.execute(
-                """
-                SELECT ce.id, ce.canonical_name, ce.entity_type,
-                       COUNT(DISTINCT eem.evidence_id) AS evidence_count
-                FROM canonical_entities ce
-                LEFT JOIN evidence_entity_mentions eem ON eem.entity_id = ce.id
-                WHERE ce.status = 'active'
-                GROUP BY ce.id
-                ORDER BY ce.entity_type, ce.canonical_name, ce.id
-                LIMIT 200
-                """
-            ).fetchall()
+        visible_entities = list_entity_visibility(
+            self.database, web_visible_only=True, limit=200
+        )
         return {
             "status": status,
             "query": query,
@@ -180,12 +172,13 @@ class WorkbenchReadService:
             ],
             "entity_options": [
                 {
-                    "entity_id": row["id"],
+                    "entity_id": row["entity_id"],
                     "canonical_name": row["canonical_name"],
                     "entity_type": row["entity_type"],
                     "evidence_count": row["evidence_count"],
+                    "visibility": row["visibility"],
                 }
-                for row in entity_rows
+                for row in visible_entities
             ],
         }
 
@@ -927,6 +920,11 @@ class WorkbenchActionService:
         note = _optional_note(note)
         if self._entity_candidate_classification(candidate_id) == "restricted":
             raise PermissionError("restricted 实体候选只能通过 CLI 审核")
+        target_visibility = get_entity_visibility(self.database, entity_id)
+        if not target_visibility["web_visible"]:
+            raise PermissionError(
+                "该规范实体没有可用于 Web 的非受限证据密级，请通过 CLI 审核"
+            )
         result = accept_entity_candidate(
             self.database,
             candidate_id,

@@ -52,6 +52,7 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe entity accept-candidate entitycand_复制实际候选ID entity_复制实际实体ID --actor reviewer-01
 .\.venv\Scripts\knowledge.exe entity reject-candidate entitycand_复制实际候选ID --note "非同一实体" --actor reviewer-01
 .\.venv\Scripts\knowledge.exe entity merge-candidates --type project --minimum-similarity 0.65 --limit 100
+.\.venv\Scripts\knowledge.exe entity visibility-list --web-visible-only
 .\.venv\Scripts\knowledge.exe entity merge-propose entity_源实体ID entity_目标实体ID --note "人工核对为同一实体" --actor curator-01
 .\.venv\Scripts\knowledge.exe entity merge-list --status reviewing
 # 必须由不同于提议人的操作者复核
@@ -122,6 +123,8 @@ SQLite Schema v10 增加模型实体候选队列。`entity import-candidates` �
 SQLite Schema v11 增加人工实体合并复核。`merge-propose` 只登记人工选择的同类型源实体和目标实体，不运行相似度模型、不自动合并，并要求提议说明；请求进入 `reviewing` 后只能由不同 actor 用 `merge-review` 批准或驳回。批准时系统在单一事务中把源实体的全部别名、证据逐字提及和已接受模型候选指向迁移到目标实体，再归档源实体；源实体原规范名称成为不可删除、可继续随链式合并迁移的 merge anchor。旧实体 ID、源目标方向、提议人、复核人和哈希意见永久保留在合并请求与审计中。类型变化、实体已归档、并发重复请求、同人自审或任何别名/外键完整性错误都会阻断并整体回滚。合并不删除证据、不修改原文，也不自动建立业务关系。
 
 `entity merge-candidates` 是不落库的确定性候选投影，不会自动调用 `merge-propose`。它只比较 active、同类型规范实体及其人工别名，先按规范化名称的三字符片段阻塞，再计算最佳别名编辑相似度；超过50个实体的高频块跳过，单次最多比较50,000对，并在结果中显式报告跳块、比较上限和截断状态。候选包含稳定 ID、相似度、最佳匹配别名、当前证据计数及已有合并请求状态，不产生审计事件，也不修改实体、别名或合并请求。
+
+实体自身不建立第二套人工密级字段；`entity visibility-list` 从该实体全部历史证据提及实时推导最高密级，优先级为 `restricted > confidential > internal > public`，没有证据支持时为 `unclassified`。该策略不会因文件版本更新或证据退出当前运行而降低历史敏感性。Web 只列出具有至少一条非 restricted 证据且最高密级不是 restricted 的 active 实体；`unclassified`、restricted 支持实体及已归档实体保持 CLI 边界。接受实体候选时后端会按目标实体 ID 再次计算可见性，不能通过手工构造请求绕过列表过滤。
 
 `graph project` 是不落库的确定性实体共现投影。节点只来自 active 规范实体，边只表示两个实体逐字出现在同一条当前原子证据中，不代表因果、隶属、依赖或其他业务关系。默认只消费 `verified` 证据；`--include-unverified` 仅用于审核探索，会额外加入 draft、reviewing 和 conflicted，但 deprecated、archived 以及所有 `restricted` 支持始终排除。输出只包含实体、状态/密级集合和支持证据 ID，不包含证据原文，也不提供文件导出。
 

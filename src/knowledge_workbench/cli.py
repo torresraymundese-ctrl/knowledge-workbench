@@ -46,6 +46,7 @@ from .entity_merges import (
     review_entity_merge,
 )
 from .entity_similarity import project_similar_entity_candidates
+from .entity_visibility import list_entity_visibility
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
 from .ingest import ingest_file, initialize_workspace
@@ -248,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--minimum-similarity", type=float, default=0.65
     )
     entity_merge_candidates.add_argument("--limit", type=int, default=100)
+    entity_visibility = entity_sub.add_parser(
+        "visibility-list", help="按全部历史证据的最高密级投影实体可见性"
+    )
+    entity_visibility.add_argument("--type", choices=ENTITY_TYPES)
+    entity_visibility.add_argument("--web-visible-only", action="store_true")
+    entity_visibility.add_argument("--limit", type=int, default=100)
 
     graph = subparsers.add_parser("graph", help="只读投影人工确认实体的证据共现图")
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
@@ -822,6 +829,18 @@ def _handle_evidence(args, database) -> None:
 
 
 def _handle_entity(args, database) -> None:
+    if args.entity_command == "visibility-list":
+        payload = {
+            "kind": "entity-visibility-projection",
+            "items": list_entity_visibility(
+                database,
+                entity_type=args.type,
+                web_visible_only=args.web_visible_only,
+                limit=args.limit,
+            ),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
     if args.entity_command == "merge-candidates":
         payload = project_similar_entity_candidates(
             database,

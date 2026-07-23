@@ -12,7 +12,7 @@ from knowledge_workbench.conflict_candidates import (
     create_cross_document_candidate_pack,
 )
 from knowledge_workbench.database import Database
-from knowledge_workbench.entities import create_entity
+from knowledge_workbench.entities import create_entity, link_evidence_entity
 from knowledge_workbench.entity_candidates import import_entity_candidates
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
@@ -1072,8 +1072,12 @@ class WorkbenchWebTests(unittest.TestCase):
             paths = WorkspacePaths(root / "workspace")
             internal = root / "内部实体.md"
             restricted = root / "受限实体.md"
-            internal.write_text("甲公司负责甲项目。", encoding="utf-8")
-            restricted.write_text("火星公司负责受限项目。", encoding="utf-8")
+            internal.write_text(
+                "甲公司负责甲项目。\n\n甲集团是规范实体。", encoding="utf-8"
+            )
+            restricted.write_text(
+                "火星公司属于火星集团。", encoding="utf-8"
+            )
             internal_result = ingest_file(
                 internal, paths, Classification.INTERNAL
             )
@@ -1107,6 +1111,12 @@ class WorkbenchWebTests(unittest.TestCase):
             entity_id = create_entity(
                 database, "甲集团", "organization", actor="curator-01"
             )
+            unclassified_entity_id = create_entity(
+                database, "未分类组织", "organization", actor="curator-01"
+            )
+            restricted_entity_id = create_entity(
+                database, "火星集团", "organization", actor="curator-01"
+            )
             with database.connect() as connection:
                 candidate_ids = {
                     row["suggested_name"]: row["id"]
@@ -1114,6 +1124,31 @@ class WorkbenchWebTests(unittest.TestCase):
                         "SELECT id, suggested_name FROM entity_candidates"
                     ).fetchall()
                 }
+                internal_entity_evidence_id = connection.execute(
+                    """
+                    SELECT id FROM evidence
+                    WHERE processing_run_id = ? AND run_ordinal = 2
+                    """,
+                    (internal_result.processing_run_id,),
+                ).fetchone()[0]
+                restricted_entity_evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (restricted_result.processing_run_id,),
+                ).fetchone()[0]
+            link_evidence_entity(
+                database,
+                entity_id,
+                internal_entity_evidence_id,
+                "甲集团",
+                actor="curator-01",
+            )
+            link_evidence_entity(
+                database,
+                restricted_entity_id,
+                restricted_entity_evidence_id,
+                "火星集团",
+                actor="curator-01",
+            )
             application = WorkbenchWebApplication(
                 WorkbenchReadService(database, paths),
                 WorkbenchActionService(database, paths),
@@ -1129,9 +1164,13 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(len(page["items"]), 1)
             self.assertTrue(page["has_next"])
             self.assertEqual(page["entity_options"][0]["entity_id"], entity_id)
+            self.assertEqual(page["entity_options"][0]["visibility"], "internal")
+            self.assertEqual(len(page["entity_options"]), 1)
             serialized = first.body.decode("utf-8")
             self.assertNotIn("火星公司", serialized)
             self.assertNotIn("受限实体", serialized)
+            self.assertNotIn("火星集团", serialized)
+            self.assertNotIn("未分类组织", serialized)
             self.assertNotIn("excerpt", serialized)
             self.assertNotIn("source_path", serialized)
             searched = application.handle(
@@ -1165,6 +1204,26 @@ class WorkbenchWebTests(unittest.TestCase):
                 headers={"Content-Type": "application/json"},
             )
             self.assertEqual(no_csrf.status, 403)
+            hidden_target_body = json.dumps(
+                {
+                    "actor": "reviewer-01",
+                    "entity_id": unclassified_entity_id,
+                }
+            ).encode("utf-8")
+            hidden_target = application.handle(
+                "POST", accept_route, body=hidden_target_body, headers=headers
+            )
+            self.assertEqual(hidden_target.status, 403)
+            restricted_target_body = json.dumps(
+                {
+                    "actor": "reviewer-01",
+                    "entity_id": restricted_entity_id,
+                }
+            ).encode("utf-8")
+            restricted_target = application.handle(
+                "POST", accept_route, body=restricted_target_body, headers=headers
+            )
+            self.assertEqual(restricted_target.status, 403)
             accepted = application.handle(
                 "POST", accept_route, body=accept_body, headers=headers
             )
