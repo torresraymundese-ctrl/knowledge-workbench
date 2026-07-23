@@ -32,59 +32,13 @@ def create_entity(
     *,
     actor: str,
 ) -> str:
-    canonical_name = _required_text(canonical_name, "规范实体名称")
-    entity_type = _entity_type(entity_type)
-    actor = _required_text(actor, "actor")
-    normalized_name = normalize_entity_name(canonical_name)
-    entity_id = new_id("entity")
-    alias_id = new_id("alias")
-    now = utc_now()
     try:
         with database.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO canonical_entities(
-                    id, canonical_name, normalized_name, entity_type,
-                    status, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
-                """,
-                (
-                    entity_id,
-                    canonical_name,
-                    normalized_name,
-                    entity_type,
-                    actor,
-                    now,
-                    now,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO entity_aliases(
-                    id, entity_id, entity_type, alias, normalized_alias,
-                    is_canonical, created_by, created_at
-                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                """,
-                (
-                    alias_id,
-                    entity_id,
-                    entity_type,
-                    canonical_name,
-                    normalized_name,
-                    actor,
-                    now,
-                ),
-            )
-            record_event(
+            entity_id = _create_entity_in_transaction(
                 connection,
-                "canonical_entity_created",
-                "canonical_entity",
-                entity_id,
+                canonical_name,
+                entity_type,
                 actor=actor,
-                details={
-                    "entity_type": entity_type,
-                    "canonical_name_sha256": sha256_text(canonical_name),
-                },
             )
     except sqlite3.IntegrityError as exc:
         raise KnowledgeWorkbenchError("同类型的规范实体名称或别名已存在") from exc
@@ -98,51 +52,128 @@ def add_entity_alias(
     *,
     actor: str,
 ) -> str:
+    with database.transaction() as connection:
+        return _add_entity_alias_in_transaction(
+            connection,
+            entity_id,
+            alias,
+            actor=actor,
+        )
+
+
+def _create_entity_in_transaction(
+    connection: sqlite3.Connection,
+    canonical_name: str,
+    entity_type: str,
+    *,
+    actor: str,
+) -> str:
+    canonical_name = _required_text(canonical_name, "规范实体名称")
+    entity_type = _entity_type(entity_type)
+    actor = _required_text(actor, "actor")
+    normalized_name = normalize_entity_name(canonical_name)
+    entity_id = new_id("entity")
+    alias_id = new_id("alias")
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO canonical_entities(
+            id, canonical_name, normalized_name, entity_type,
+            status, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+        """,
+        (
+            entity_id,
+            canonical_name,
+            normalized_name,
+            entity_type,
+            actor,
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO entity_aliases(
+            id, entity_id, entity_type, alias, normalized_alias,
+            is_canonical, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (
+            alias_id,
+            entity_id,
+            entity_type,
+            canonical_name,
+            normalized_name,
+            actor,
+            now,
+        ),
+    )
+    record_event(
+        connection,
+        "canonical_entity_created",
+        "canonical_entity",
+        entity_id,
+        actor=actor,
+        details={
+            "entity_type": entity_type,
+            "canonical_name_sha256": sha256_text(canonical_name),
+        },
+    )
+    return entity_id
+
+
+def _add_entity_alias_in_transaction(
+    connection: sqlite3.Connection,
+    entity_id: str,
+    alias: str,
+    *,
+    actor: str,
+) -> str:
     alias = _required_text(alias, "实体别名")
     actor = _required_text(actor, "actor")
     normalized_alias = normalize_entity_name(alias)
-    with database.transaction() as connection:
-        entity = _active_entity(connection, entity_id)
-        existing = connection.execute(
-            """
-            SELECT id, entity_id FROM entity_aliases
-            WHERE entity_type = ? AND normalized_alias = ?
-            """,
-            (entity["entity_type"], normalized_alias),
-        ).fetchone()
-        if existing:
-            if existing["entity_id"] == entity_id:
-                return existing["id"]
-            raise KnowledgeWorkbenchError("该别名已指向同类型的另一个规范实体")
-        alias_id = new_id("alias")
-        connection.execute(
-            """
-            INSERT INTO entity_aliases(
-                id, entity_id, entity_type, alias, normalized_alias,
-                is_canonical, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-            """,
-            (
-                alias_id,
-                entity_id,
-                entity["entity_type"],
-                alias,
-                normalized_alias,
-                actor,
-                utc_now(),
-            ),
-        )
-        record_event(
-            connection,
-            "entity_alias_added",
-            "canonical_entity",
+    entity = _active_entity(connection, entity_id)
+    existing = connection.execute(
+        """
+        SELECT id, entity_id FROM entity_aliases
+        WHERE entity_type = ? AND normalized_alias = ?
+        """,
+        (entity["entity_type"], normalized_alias),
+    ).fetchone()
+    if existing:
+        if existing["entity_id"] == entity_id:
+            return existing["id"]
+        raise KnowledgeWorkbenchError("该别名已指向同类型的另一个规范实体")
+    alias_id = new_id("alias")
+    connection.execute(
+        """
+        INSERT INTO entity_aliases(
+            id, entity_id, entity_type, alias, normalized_alias,
+            is_canonical, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+        """,
+        (
+            alias_id,
             entity_id,
-            actor=actor,
-            details={
-                "alias_id": alias_id,
-                "alias_sha256": sha256_text(alias),
-            },
-        )
+            entity["entity_type"],
+            alias,
+            normalized_alias,
+            actor,
+            utc_now(),
+        ),
+    )
+    record_event(
+        connection,
+        "entity_alias_added",
+        "canonical_entity",
+        entity_id,
+        actor=actor,
+        details={
+            "alias_id": alias_id,
+            "alias_sha256": sha256_text(alias),
+        },
+    )
     return alias_id
 
 
@@ -196,60 +227,77 @@ def link_evidence_entity(
     *,
     actor: str,
 ) -> bool:
+    with database.transaction() as connection:
+        return _link_evidence_entity_in_transaction(
+            connection,
+            entity_id,
+            evidence_id,
+            mention,
+            actor=actor,
+        )
+
+
+def _link_evidence_entity_in_transaction(
+    connection: sqlite3.Connection,
+    entity_id: str,
+    evidence_id: str,
+    mention: str,
+    *,
+    actor: str,
+) -> bool:
     mention = _required_text(mention, "证据中的实体提及")
     actor = _required_text(actor, "actor")
     normalized_mention = normalize_entity_name(mention)
-    with database.transaction() as connection:
-        entity = _active_entity(connection, entity_id)
-        alias = connection.execute(
-            """
-            SELECT id FROM entity_aliases
-            WHERE entity_id = ? AND entity_type = ? AND normalized_alias = ?
-            """,
-            (entity_id, entity["entity_type"], normalized_mention),
-        ).fetchone()
-        if not alias:
-            raise KnowledgeWorkbenchError("该提及尚未登记为此实体的别名")
-        evidence = connection.execute(
-            """
-            SELECT e.excerpt, d.classification
-            FROM evidence e
-            JOIN processing_runs pr
-              ON pr.id = e.processing_run_id AND pr.is_current = 1
-            JOIN document_versions dv ON dv.id = e.document_version_id
-            JOIN documents d
-              ON d.id = dv.document_id AND d.current_version_id = dv.id
-            WHERE e.id = ?
-            """,
-            (evidence_id,),
-        ).fetchone()
-        if not evidence:
-            raise KnowledgeWorkbenchError("证据不存在或不是当前文件版本和当前处理运行")
-        if mention not in evidence["excerpt"]:
-            raise KnowledgeWorkbenchError("实体提及必须逐字出现在证据原文中")
-        cursor = connection.execute(
-            """
-            INSERT OR IGNORE INTO evidence_entity_mentions(
-                evidence_id, entity_id, alias_id, mention_text, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (evidence_id, entity_id, alias["id"], mention, actor, utc_now()),
-        )
-        if cursor.rowcount == 0:
-            return False
-        record_event(
-            connection,
-            "evidence_entity_linked",
-            "canonical_entity",
-            entity_id,
-            actor=actor,
-            details={
-                "evidence_id": evidence_id,
-                "alias_id": alias["id"],
-                "mention_sha256": sha256_text(mention),
-                "classification": evidence["classification"],
-            },
-        )
+    entity = _active_entity(connection, entity_id)
+    alias = connection.execute(
+        """
+        SELECT id FROM entity_aliases
+        WHERE entity_id = ? AND entity_type = ? AND normalized_alias = ?
+        """,
+        (entity_id, entity["entity_type"], normalized_mention),
+    ).fetchone()
+    if not alias:
+        raise KnowledgeWorkbenchError("该提及尚未登记为此实体的别名")
+    evidence = connection.execute(
+        """
+        SELECT e.excerpt, d.classification
+        FROM evidence e
+        JOIN processing_runs pr
+          ON pr.id = e.processing_run_id AND pr.is_current = 1
+        JOIN document_versions dv ON dv.id = e.document_version_id
+        JOIN documents d
+          ON d.id = dv.document_id AND d.current_version_id = dv.id
+        WHERE e.id = ?
+        """,
+        (evidence_id,),
+    ).fetchone()
+    if not evidence:
+        raise KnowledgeWorkbenchError("证据不存在或不是当前文件版本和当前处理运行")
+    if mention not in evidence["excerpt"]:
+        raise KnowledgeWorkbenchError("实体提及必须逐字出现在证据原文中")
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO evidence_entity_mentions(
+            evidence_id, entity_id, alias_id, mention_text, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (evidence_id, entity_id, alias["id"], mention, actor, utc_now()),
+    )
+    if cursor.rowcount == 0:
+        return False
+    record_event(
+        connection,
+        "evidence_entity_linked",
+        "canonical_entity",
+        entity_id,
+        actor=actor,
+        details={
+            "evidence_id": evidence_id,
+            "alias_id": alias["id"],
+            "mention_sha256": sha256_text(mention),
+            "classification": evidence["classification"],
+        },
+    )
     return True
 
 
