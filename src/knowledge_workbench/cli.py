@@ -39,6 +39,7 @@ from .entity_candidates import (
     reject_entity_candidate,
 )
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
+from .graph_projection import project_entity_graph
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -208,6 +209,22 @@ def build_parser() -> argparse.ArgumentParser:
     entity_reject.add_argument("candidate_id")
     entity_reject.add_argument("--actor", required=True)
     entity_reject.add_argument("--note", required=True)
+
+    graph = subparsers.add_parser("graph", help="只读投影人工确认实体的证据共现图")
+    graph_sub = graph.add_subparsers(dest="graph_command", required=True)
+    graph_project = graph_sub.add_parser("project", help="输出确定性实体共现 JSON")
+    graph_project.add_argument("--entity-id")
+    graph_project.add_argument(
+        "--include-unverified",
+        action="store_true",
+        help="显式加入 draft、reviewing 和 conflicted 当前证据",
+    )
+    graph_project.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="最大返回边数；无边节点也最多补足至该数量",
+    )
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -571,6 +588,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _handle_evidence(args, database)
         elif args.command == "entity":
             _handle_entity(args, database)
+        elif args.command == "graph":
+            _handle_graph(args, database)
         elif args.command == "page":
             _handle_page(args, database, paths)
         elif args.command == "search":
@@ -852,6 +871,17 @@ def _handle_entity(args, database) -> None:
             f"{row['canonical_name']}  aliases={row['alias_count']}  "
             f"current_evidence={row['current_evidence_count']}"
         )
+
+
+def _handle_graph(args, database) -> None:
+    if args.graph_command == "project":
+        payload = project_entity_graph(
+            database,
+            entity_id=args.entity_id,
+            include_unverified=args.include_unverified,
+            limit=args.limit,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _handle_page(args, database, paths: WorkspacePaths) -> None:
