@@ -60,7 +60,7 @@ from .entity_visibility import list_entity_visibility
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
 from .graph_evaluation import evaluate_graph_dataset
-from .graph_pilot import build_graph_pilot_pack
+from .graph_pilot import build_graph_pilot_pack, inspect_graph_pilot_pack
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -364,6 +364,11 @@ def build_parser() -> argparse.ArgumentParser:
     graph_pilot.add_argument("session_id")
     graph_pilot.add_argument("--actor", required=True)
     graph_pilot.add_argument("--output", type=Path)
+    graph_pilot_status = graph_sub.add_parser(
+        "pilot-status",
+        help="校验图谱试点包并显示证据审核、实体和关系覆盖进度",
+    )
+    graph_pilot_status.add_argument("pack", type=Path)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -1137,6 +1142,10 @@ def _handle_graph(
         )
         print(f"图谱试点证据包：{output.expanduser().resolve()}")
         _print_mapping(pack["statistics"])
+        return
+    if args.graph_command == "pilot-status":
+        payload = inspect_graph_pilot_pack(database, paths, args.pack)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _handle_relation(args, database) -> None:

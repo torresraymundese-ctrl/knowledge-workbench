@@ -93,6 +93,7 @@
 - 包只能新增到 `workspace/evaluations/`，包含人工回源所需的证据 ID、原文、全部定位、资料元数据和原黄金用例 ID；同一证据跨用例去重。生成审计只保存包内容 SHA-256、相对路径、来源会话 ID 和计数，不复制原文。
 - 包明确声明不会自动改变证据状态、创建实体或创建关系，也没有自动写回入口。证据仍需按 `draft → reviewing → verified` 人工审核，实体仍需逐字提及绑定，关系仍需共同 verified 证据支撑。
 - 已从 approved 会话 `labels_bbfe7377e7004ad4bcd446a9fcf9996d` 生成首份真实试点包：覆盖10份 internal 资料、46条不重复证据、全部具有来源定位、restricted 排除0条；46条证据状态仍全部为 draft。包只保存在本地 `workspace/evaluations/`，未提交到 Git。
+- `graph pilot-status` 校验包身份、内容哈希、审计来源与保存路径后，逐条对比当前证据正文、全部定位、文件版本、处理运行和密级；状态输出不复制原文。真实首包当前快照有效46/46、restricted 泄漏0，但 verified 0/46、实体提及0、双实体关系资格0、active 关系支撑0，因此 `graph_gold_prerequisites_met=false`，准确显示人工阶段尚未开始。
 
 ## 真实试点基线（2026-07-21）
 

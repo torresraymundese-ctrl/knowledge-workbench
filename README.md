@@ -70,6 +70,7 @@ Set-Location "D:\全新知识库"
 # 只有显式授权时才允许反向遍历有向关系
 .\.venv\Scripts\knowledge.exe graph paths entity_起点ID --target entity_目标ID --include-inverse
 .\.venv\Scripts\knowledge.exe graph pilot-pack labels_已批准黄金会话ID --actor pilot-builder-01
+.\.venv\Scripts\knowledge.exe graph pilot-status .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json
 .\.venv\Scripts\knowledge.exe graph-evaluate .\workspace\evaluations\graph-gold-v1.json
 .\.venv\Scripts\knowledge.exe relation retract entityrel_关系ID --note "适用期结束" --actor curator-02
 .\.venv\Scripts\knowledge.exe page list
@@ -148,6 +149,8 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 `graph-evaluate` 读取通过双人复核的图谱黄金集，评测关系精确率/召回率、方向准确率、关系证据覆盖率、路径精确率/召回率、路径路线准确率、路径证据覆盖率和 restricted 支撑泄漏数。黄金集只保存实体、关系与证据 ID，不复制证据原文；标注人与复核人必须不同。评测启动前会重验全部实体仍为 active，全部黄金证据仍属于当前文件版本与当前处理运行、状态为 verified 且不是 restricted；数据过期会整体阻断，不能被计成算法失败。任何候选或路径查询截断也不能作为正式通过。关系、路径或安全指标未全部通过时命令默认返回失败，但仍保存报告；只有诊断时可显式使用 `--allow-failures`。
 
 `graph pilot-pack` 从既有 `approved` 黄金标注会话中提取双人确认过的必要证据，作为人工证据审核、实体建档和关系登记的优先试点池。生成器重验每个用例已批准、来源版本和处理运行仍为当前、密级未漂移，并排除 restricted；包只能写入当前 `workspace/evaluations/`，包含证据原文与全部定位，禁止覆盖。它只生成候选快照，不改变证据状态、不创建实体或关系；审计仅保存包哈希、相对路径和计数，不保存原文。
+
+`graph pilot-status` 只读取系统生成且内容哈希、包身份、保存路径均与审计匹配的试点包，然后逐条重查数据库快照。输出不回显原文，只报告来源失效、密级泄漏、证据状态、verified 覆盖、active 实体提及、双实体关系资格和 active 关系覆盖，并明确给出证据审核是否完成、是否已经具备图谱黄金集前置条件。复制或修改包文件不能通过状态检查。
 
 跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
 

@@ -6,7 +6,10 @@ from pathlib import Path
 from knowledge_workbench.config import WorkspacePaths
 from knowledge_workbench.database import Database
 from knowledge_workbench.errors import KnowledgeWorkbenchError
-from knowledge_workbench.graph_pilot import build_graph_pilot_pack
+from knowledge_workbench.graph_pilot import (
+    build_graph_pilot_pack,
+    inspect_graph_pilot_pack,
+)
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.labeling import (
     approve_labeling_session,
@@ -158,6 +161,23 @@ class GraphPilotPackTests(unittest.TestCase):
             self.assertNotIn("甲公司负责平台建设", audit_text)
             self.assertNotIn("受限项目由秘密团队负责", audit_text)
             self.assertIn("content_sha256", audit_text)
+            status = inspect_graph_pilot_pack(database, paths, output)
+            self.assertEqual(
+                status["summary"]["snapshot_valid_count"], 1
+            )
+            self.assertEqual(
+                status["summary"]["status_counts"], {"draft": 1}
+            )
+            self.assertEqual(
+                status["summary"]["verified_evidence_coverage"], 0.0
+            )
+            self.assertFalse(
+                status["summary"]["graph_gold_prerequisites_met"]
+            )
+            self.assertNotIn(
+                "甲公司负责平台建设",
+                json.dumps(status, ensure_ascii=False),
+            )
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "不允许静默覆盖"
             ):
@@ -168,6 +188,12 @@ class GraphPilotPackTests(unittest.TestCase):
                     output,
                     actor="pilot-builder",
                 )
+            copied = paths.evaluations / "copied.json"
+            copied.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "审计记录"
+            ):
+                inspect_graph_pilot_pack(database, paths, copied)
 
     def test_requires_approved_session_and_workspace_output(self):
         with tempfile.TemporaryDirectory() as temporary:
