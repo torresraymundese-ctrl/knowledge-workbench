@@ -6,17 +6,22 @@ from pathlib import Path
 from knowledge_workbench.config import WorkspacePaths
 from knowledge_workbench.conflict_candidates import (
     create_cross_document_candidate_pack,
-    update_cross_document_candidate_label,
 )
 from knowledge_workbench.conflict_labeling_plan import (
     create_conflict_labeling_plan,
     inspect_conflict_labeling_plan,
+    list_conflict_labeling_plans,
+    resolve_conflict_labeling_batch,
 )
 from knowledge_workbench.database import Database
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
-from knowledge_workbench.utils import sha256_file
+from knowledge_workbench.web_service import (
+    WorkbenchActionService,
+    WorkbenchReadService,
+)
+from knowledge_workbench.webapp import WorkbenchWebApplication
 
 
 class ConflictLabelingPlanTests(unittest.TestCase):
@@ -88,17 +93,109 @@ class ConflictLabelingPlanTests(unittest.TestCase):
             self.assertEqual(status["summary"]["labeled_count"], 0)
             self.assertFalse(status["summary"]["annotation_complete"])
 
-            first_candidate = pack["candidates"][0]
-            update_cross_document_candidate_label(
+            listing = list_conflict_labeling_plans(
                 database,
                 paths,
-                pack["pack_id"],
-                first_candidate["candidate_id"],
-                expected_content_sha256=sha256_file(pack_path),
-                expected_conflict=first_candidate["predicted_conflict"],
-                expected_type=first_candidate["predicted_type"],
-                note="人工回源确认。",
-                actor="annotator-01",
+                source_pack_id=pack["pack_id"],
+            )
+            self.assertEqual(listing["total"], 2)
+            self.assertEqual(listing["invalid_plan_count"], 0)
+            self.assertNotIn(
+                "candidate_ids", json.dumps(listing, ensure_ascii=False)
+            )
+            batch = resolve_conflict_labeling_batch(
+                database,
+                paths,
+                first["plan_id"],
+                first["batches"][0]["batch_id"],
+            )
+            self.assertEqual(batch["source_pack_id"], pack["pack_id"])
+            self.assertEqual(
+                batch["candidate_ids"],
+                first["batches"][0]["candidate_ids"],
+            )
+
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+            listing_response = application.handle(
+                "GET",
+                "/api/v1/conflict-labeling-plans"
+                f"?source_pack_id={pack['pack_id']}",
+            )
+            self.assertEqual(listing_response.status, 200)
+            self.assertNotIn(
+                "项目预算",
+                listing_response.body.decode("utf-8"),
+            )
+            page_route = (
+                f"/api/v1/conflict-candidate-packs/{pack['pack_id']}"
+                f"?plan_id={first['plan_id']}"
+                f"&batch_id={first['batches'][0]['batch_id']}"
+            )
+            page_response = application.handle("GET", page_route)
+            self.assertEqual(page_response.status, 200)
+            page = json.loads(page_response.body)
+            self.assertEqual(
+                page["total"],
+                len(first["batches"][0]["candidate_ids"]),
+            )
+            self.assertEqual(
+                page["labeling_batch"]["plan_id"], first["plan_id"]
+            )
+            self.assertEqual(
+                page["scope_counts"]["total"],
+                len(first["batches"][0]["candidate_ids"]),
+            )
+            missing_batch = application.handle(
+                "GET",
+                f"/api/v1/conflict-candidate-packs/{pack['pack_id']}"
+                f"?plan_id={first['plan_id']}",
+            )
+            self.assertEqual(missing_batch.status, 400)
+            cross_pack = application.handle(
+                "GET",
+                "/api/v1/conflict-candidate-packs/"
+                "cpack_000000000000000000000000"
+                f"?plan_id={first['plan_id']}"
+                f"&batch_id={first['batches'][0]['batch_id']}",
+            )
+            self.assertEqual(cross_pack.status, 404)
+
+            candidate = page["items"][0]
+            labeled_response = application.handle(
+                "POST",
+                f"/api/v1/conflict-candidate-packs/{pack['pack_id']}/label",
+                body=json.dumps(
+                    {
+                        "actor": "annotator-01",
+                        "candidate_id": candidate["candidate_id"],
+                        "expected_content_sha256": page[
+                            "content_sha256"
+                        ],
+                        "expected_conflict": candidate[
+                            "predicted_conflict"
+                        ],
+                        "expected_type": candidate["predicted_type"],
+                        "note": "人工回源确认。",
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                },
+            )
+            self.assertEqual(labeled_response.status, 200)
+            persisted = json.loads(pack_path.read_text(encoding="utf-8"))
+            persisted_candidate = next(
+                item
+                for item in persisted["candidates"]
+                if item["candidate_id"] == candidate["candidate_id"]
+            )
+            self.assertIsNotNone(
+                persisted_candidate["label"]["expected_conflict"]
             )
             updated = inspect_conflict_labeling_plan(
                 database, paths, first_path
@@ -166,16 +263,20 @@ class ConflictLabelingPlanTests(unittest.TestCase):
                 inspect_conflict_labeling_plan(
                     database, paths, copied_path
                 )
+            listing = list_conflict_labeling_plans(database, paths)
+            self.assertEqual(listing["total"], 1)
+            self.assertEqual(listing["invalid_plan_count"], 1)
 
+            tampered_path = paths.evaluations / "tampered-plan.json"
             tampered = json.loads(plan_path.read_text(encoding="utf-8"))
             tampered["batches"][0]["candidate_ids"].reverse()
-            plan_path.write_text(
+            tampered_path.write_text(
                 json.dumps(tampered, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(KnowledgeWorkbenchError, "身份校验"):
                 inspect_conflict_labeling_plan(
-                    database, paths, plan_path
+                    database, paths, tampered_path
                 )
 
             with database.transaction() as connection:
@@ -183,6 +284,19 @@ class ConflictLabelingPlanTests(unittest.TestCase):
                     "UPDATE evidence SET status = 'deprecated' WHERE id = ?",
                     (pack["candidates"][0]["left"]["evidence_id"],),
                 )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "已过期、受限"
+            ):
+                inspect_conflict_labeling_plan(
+                    database, paths, plan_path
+                )
+            stale_listing = list_conflict_labeling_plans(
+                database, paths
+            )
+            self.assertEqual(stale_listing["total"], 0)
+            self.assertGreaterEqual(
+                stale_listing["invalid_plan_count"], 1
+            )
             with self.assertRaisesRegex(KnowledgeWorkbenchError, "已过期、受限"):
                 create_conflict_labeling_plan(
                     database,

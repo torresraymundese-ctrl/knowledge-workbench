@@ -141,7 +141,15 @@ td { padding: 14px 16px; border-top: 1px solid #edf0f2; font-size: 12px; vertica
 .candidate-toolbar label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .candidate-toolbar input, .candidate-toolbar select, .candidate-decision select, .candidate-decision textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px; color: var(--ink); background: #fff; outline: none; }
 .candidate-toolbar input:focus, .candidate-toolbar select:focus, .candidate-decision select:focus, .candidate-decision textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(22,126,102,.1); }
+.candidate-batch-toolbar { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+.candidate-batch-toolbar > :nth-child(1),
+.candidate-batch-toolbar > :nth-child(2),
+.candidate-batch-toolbar > :nth-child(3) { grid-column: span 4; }
+.candidate-batch-toolbar > :nth-child(4) { grid-column: span 3; }
+.candidate-batch-toolbar > :nth-child(5) { grid-column: span 7; }
+.candidate-batch-toolbar > :nth-child(6) { grid-column: span 2; }
 .candidate-pack-summary { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 14px; padding: 16px 18px; }
+.candidate-pack-summary[aria-busy="true"] { opacity: .58; }
 .candidate-summary-metadata strong, .candidate-summary-metadata span, .candidate-summary-metadata small { display: block; }
 .candidate-summary-metadata strong { color: var(--green); font-size: 13px; }
 .candidate-summary-metadata span { margin-top: 4px; font-size: 11px; }
@@ -282,6 +290,7 @@ dialog::backdrop { background: rgba(15,28,40,.48); backdrop-filter: blur(2px); }
   .review-grid, .evaluation-grid { grid-template-columns: 1fr 1fr; }
   .review-toolbar { grid-template-columns: 1fr 1fr; }
   .candidate-toolbar { grid-template-columns: 1fr 1fr; }
+  .candidate-batch-toolbar > * { grid-column: span 1; }
   .graph-pilot-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .graph-pilot-progress:nth-child(2) { border-right: 0; }
   .graph-pilot-progress:nth-child(-n+2) { border-bottom: 1px solid var(--line); }

@@ -177,6 +177,8 @@ def inspect_conflict_labeling_plan(
         "kind": "cross-document-conflict-labeling-plan-status",
         "checked_at": utc_now(),
         "plan_id": plan["plan_id"],
+        "generated_at": plan["generated_at"],
+        "generated_by": plan["generated_by"],
         "source_pack_id": source_pack["pack_id"],
         "summary": {
             "candidate_count": candidate_count,
@@ -191,6 +193,93 @@ def inspect_conflict_labeling_plan(
             "review_complete": totals["approved"] == candidate_count,
         },
         "items": items,
+    }
+
+
+def list_conflict_labeling_plans(
+    database: Database,
+    paths: WorkspacePaths,
+    *,
+    source_pack_id: str | None = None,
+) -> dict[str, Any]:
+    normalized_source_pack_id = (source_pack_id or "").strip() or None
+    items = []
+    invalid_plan_count = 0
+    seen: set[str] = set()
+    for plan_path in sorted(paths.evaluations.glob("*.json")):
+        try:
+            raw = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(raw, dict)
+            or raw.get("kind")
+            != "cross-document-conflict-labeling-plan"
+        ):
+            continue
+        try:
+            status = inspect_conflict_labeling_plan(
+                database, paths, plan_path
+            )
+        except KnowledgeWorkbenchError:
+            invalid_plan_count += 1
+            continue
+        if status["plan_id"] in seen:
+            invalid_plan_count += 1
+            continue
+        seen.add(status["plan_id"])
+        if (
+            normalized_source_pack_id is not None
+            and status["source_pack_id"] != normalized_source_pack_id
+        ):
+            continue
+        items.append(
+            {
+                "plan_id": status["plan_id"],
+                "generated_at": status["generated_at"],
+                "generated_by": status["generated_by"],
+                "source_pack_id": status["source_pack_id"],
+                "summary": status["summary"],
+                "batches": status["items"],
+            }
+        )
+    items.sort(
+        key=lambda item: (item["generated_at"], item["plan_id"]),
+        reverse=True,
+    )
+    return {
+        "items": items,
+        "total": len(items),
+        "invalid_plan_count": invalid_plan_count,
+    }
+
+
+def resolve_conflict_labeling_batch(
+    database: Database,
+    paths: WorkspacePaths,
+    plan_id: str,
+    batch_id: str,
+) -> dict[str, Any]:
+    plan_path = _find_plan_path(paths, plan_id)
+    status = inspect_conflict_labeling_plan(database, paths, plan_path)
+    _, _, plan = _read_plan(paths, plan_path)
+    batches = {
+        item["batch_id"]: item for item in plan["batches"]
+    }
+    batch = batches.get(batch_id)
+    if batch is None:
+        raise KnowledgeWorkbenchError(
+            f"冲突标注批次不存在：{batch_id}"
+        )
+    status_items = {
+        item["batch_id"]: item for item in status["items"]
+    }
+    return {
+        "plan_id": plan["plan_id"],
+        "source_pack_id": plan["source_pack"]["pack_id"],
+        "batch_id": batch["batch_id"],
+        "candidate_ids": batch["candidate_ids"],
+        "status": status_items[batch["batch_id"]],
     }
 
 
@@ -343,6 +432,36 @@ def _read_plan(
     validate_conflict_labeling_plan(plan)
     _validate_plan_identity(plan)
     return plan_path, content, plan
+
+
+def _find_plan_path(paths: WorkspacePaths, plan_id: str) -> Path:
+    if (
+        not isinstance(plan_id, str)
+        or not re.fullmatch(r"cplan_[a-f0-9]{24}", plan_id)
+    ):
+        raise KnowledgeWorkbenchError("冲突标注计划 ID 无效")
+    matched = []
+    for plan_path in sorted(paths.evaluations.glob("*.json")):
+        try:
+            raw = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(raw, dict)
+            and raw.get("kind")
+            == "cross-document-conflict-labeling-plan"
+            and raw.get("plan_id") == plan_id
+        ):
+            matched.append(plan_path)
+    if not matched:
+        raise KnowledgeWorkbenchError(
+            "冲突标注计划不存在或校验失败"
+        )
+    if len(matched) > 1:
+        raise KnowledgeWorkbenchError(
+            "冲突标注计划 ID 重复，无法安全读取"
+        )
+    return matched[0]
 
 
 def _plan_id(plan: dict[str, Any]) -> str:

@@ -150,6 +150,15 @@ class WorkbenchWebApplication:
                 )
             if parsed.path == "/api/v1/conflict-candidate-packs":
                 return self._json(200, self.read_service.conflict_candidate_packs())
+            if parsed.path == "/api/v1/conflict-labeling-plans":
+                return self._json(
+                    200,
+                    self.read_service.conflict_labeling_plans(
+                        source_pack_id=_string_query(
+                            query, "source_pack_id"
+                        ),
+                    ),
+                )
             if parsed.path == "/api/v1/graph-pilot-packs":
                 return self._json(200, self.read_service.graph_pilot_packs())
             if parsed.path == "/api/v1/entity-candidates":
@@ -204,6 +213,8 @@ class WorkbenchWebApplication:
                         offset=_integer_query(query, "offset", 0),
                         state=_string_query(query, "state"),
                         query=_string_query(query, "q"),
+                        plan_id=_string_query(query, "plan_id"),
+                        batch_id=_string_query(query, "batch_id"),
                     ),
                 )
             graph_pilot_pack_id = _route_entity_id(

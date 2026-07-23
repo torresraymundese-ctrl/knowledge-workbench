@@ -63,6 +63,12 @@ const candidateState = {
   limit: 10,
   offset: 0,
   packId: "",
+  planId: "",
+  batchId: "",
+  plans: [],
+  invalidPlanCount: 0,
+  pageRequestSerial: 0,
+  planRequestSerial: 0,
   state: "all",
   query: "",
   contentSha256: "",
@@ -1177,6 +1183,7 @@ async function saveCandidateLabel(candidate, conflictSelect, typeSelect, noteInp
       expected_type: expectedType,
       note: noteInput.value.trim() || null,
     });
+    await loadCandidatePlans();
     await loadCandidatePage();
     showBanner(`候选标签已保存，审计操作者：${actor}`, true);
   } catch (cause) {
@@ -1207,6 +1214,7 @@ async function saveCandidateReview(candidate, decisionSelect, noteInput) {
       decision,
       note: note || null,
     });
+    await loadCandidatePlans();
     await loadCandidatePage();
     showBanner(`候选复核已保存，审计操作者：${actor}`, true);
   } catch (cause) {
@@ -1232,6 +1240,7 @@ async function submitCandidatePack(page) {
 
 function renderCandidatePage(page) {
   candidateState.contentSha256 = page.content_sha256;
+  renderCandidatePlanBoundary();
   const summary = document.querySelector("#candidate-pack-summary");
   const metadata = element("div", "candidate-summary-metadata");
   metadata.append(
@@ -1239,6 +1248,12 @@ function renderCandidatePage(page) {
     element("span", "", `${page.counts.labeled}/${page.counts.total} 已标注 · ${page.counts.approved} 通过 · ${page.counts.rejected} 驳回`),
     element("small", "", `生成者 ${page.generated_by} · 相似度阈值 ${page.minimum_similarity}${page.annotator ? ` · 标注人 ${page.annotator}` : ""}`),
   );
+  if (page.labeling_batch) {
+    const batch = page.labeling_batch.status;
+    metadata.append(
+      element("span", "candidate-batch-progress", `${page.labeling_batch.batch_id}：${batch.labeled_count}/${batch.candidate_count} 已标注 · ${batch.approved_count} 通过 · ${batch.rejected_count} 驳回`),
+    );
+  }
   const controls = element("div", "candidate-summary-actions");
   if (page.phase === "labeling") {
     const submit = button("提交整包复核", "primary", () => submitCandidatePack(page));
@@ -1337,16 +1352,123 @@ function renderCandidatePage(page) {
 
 async function loadCandidatePage() {
   if (!candidateState.packId) return;
+  const requestSerial = ++candidateState.pageRequestSerial;
+  const summaryRoot = document.querySelector("#candidate-pack-summary");
+  summaryRoot.setAttribute("aria-busy", "true");
   const parameters = new URLSearchParams({
     limit: String(candidateState.limit),
     offset: String(candidateState.offset),
     state: candidateState.state,
   });
   if (candidateState.query) parameters.set("q", candidateState.query);
-  const response = await fetch(`/api/v1/conflict-candidate-packs/${encodeURIComponent(candidateState.packId)}?${parameters}`, { headers: { Accept: "application/json" } });
-  const page = await response.json();
-  if (!response.ok) throw new Error(page.error || `候选包读取失败（HTTP ${response.status}）`);
-  renderCandidatePage(page);
+  if (candidateState.planId && candidateState.batchId) {
+    parameters.set("plan_id", candidateState.planId);
+    parameters.set("batch_id", candidateState.batchId);
+  }
+  try {
+    const response = await fetch(`/api/v1/conflict-candidate-packs/${encodeURIComponent(candidateState.packId)}?${parameters}`, { headers: { Accept: "application/json" } });
+    const page = await response.json();
+    if (requestSerial !== candidateState.pageRequestSerial) return;
+    if (!response.ok) throw new Error(page.error || `候选包读取失败（HTTP ${response.status}）`);
+    renderCandidatePage(page);
+  } finally {
+    if (requestSerial === candidateState.pageRequestSerial) {
+      summaryRoot.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function renderCandidatePlanBoundary() {
+  const boundary = document.querySelector("#candidate-plan-boundary");
+  const plan = candidateState.plans.find(
+    (item) => item.plan_id === candidateState.planId
+  );
+  if (!plan || !candidateState.batchId) {
+    boundary.textContent = "未启用批次范围；当前显示候选包全部候选。";
+  } else {
+    boundary.textContent = `当前只显示 ${candidateState.batchId}；计划覆盖整包 ${plan.summary.candidate_count} 对候选且不保存第二套标签。`;
+  }
+  if (candidateState.invalidPlanCount) {
+    boundary.textContent += `；另有 ${candidateState.invalidPlanCount} 个计划校验失败，未开放。`;
+  }
+}
+
+function renderCandidateBatchOptions() {
+  const planSelector = document.querySelector("#candidate-plan");
+  const batchSelector = document.querySelector("#candidate-batch");
+  const plan = candidateState.plans.find((item) => item.plan_id === candidateState.planId);
+  batchSelector.replaceChildren();
+  if (!plan) {
+    candidateState.planId = "";
+    candidateState.batchId = "";
+    planSelector.value = "";
+    const option = element("option", "", "未选择批次");
+    option.value = "";
+    batchSelector.append(option);
+    batchSelector.disabled = true;
+    renderCandidatePlanBoundary();
+    return;
+  }
+  const previousBatchId = candidateState.batchId;
+  const nextBatch = plan.batches.find((item) => !item.annotation_complete)
+    || plan.batches.find((item) => !item.review_complete)
+    || plan.batches[0];
+  candidateState.batchId = plan.batches.some((item) => item.batch_id === previousBatchId)
+    ? previousBatchId
+    : nextBatch?.batch_id || "";
+  plan.batches.forEach((batch) => {
+    const option = element(
+      "option",
+      "",
+      `${batch.batch_id} · 标注 ${batch.labeled_count}/${batch.candidate_count} · 通过 ${batch.approved_count}`,
+    );
+    option.value = batch.batch_id;
+    batchSelector.append(option);
+  });
+  batchSelector.value = candidateState.batchId;
+  batchSelector.disabled = !candidateState.batchId;
+  renderCandidatePlanBoundary();
+}
+
+async function loadCandidatePlans() {
+  const requestSerial = ++candidateState.planRequestSerial;
+  const planSelector = document.querySelector("#candidate-plan");
+  const previousPlanId = candidateState.planId;
+  planSelector.replaceChildren();
+  const allOption = element("option", "", "全部候选（不按批次）");
+  allOption.value = "";
+  planSelector.append(allOption);
+  if (!candidateState.packId) {
+    candidateState.plans = [];
+    candidateState.invalidPlanCount = 0;
+    candidateState.planId = "";
+    candidateState.batchId = "";
+    renderCandidateBatchOptions();
+    return;
+  }
+  const parameters = new URLSearchParams({
+    source_pack_id: candidateState.packId,
+  });
+  const response = await fetch(`/api/v1/conflict-labeling-plans?${parameters}`, { headers: { Accept: "application/json" } });
+  const listing = await response.json();
+  if (requestSerial !== candidateState.planRequestSerial) return;
+  if (!response.ok) throw new Error(listing.error || `标注计划读取失败（HTTP ${response.status}）`);
+  candidateState.plans = listing.items;
+  candidateState.invalidPlanCount = listing.invalid_plan_count;
+  listing.items.forEach((item) => {
+    const option = element(
+      "option",
+      "",
+      `${shortId(item.plan_id)} · ${item.summary.labeled_count}/${item.summary.candidate_count} 已标注 · ${item.summary.batch_count} 批`,
+    );
+    option.value = item.plan_id;
+    planSelector.append(option);
+  });
+  candidateState.planId = listing.items.some((item) => item.plan_id === previousPlanId)
+    ? previousPlanId
+    : listing.items[0]?.plan_id || "";
+  planSelector.value = candidateState.planId;
+  renderCandidateBatchOptions();
 }
 
 async function loadCandidatePacks() {
@@ -1374,6 +1496,7 @@ async function loadCandidatePacks() {
     document.querySelector("#candidate-pagination").replaceChildren();
     return;
   }
+  await loadCandidatePlans();
   await loadCandidatePage();
 }
 
@@ -1811,6 +1934,8 @@ document.querySelector("#clear-entity-relationship-filter").addEventListener("cl
 document.querySelector("#candidate-filters").addEventListener("submit", async (event) => {
   event.preventDefault();
   candidateState.packId = document.querySelector("#candidate-pack").value;
+  candidateState.planId = document.querySelector("#candidate-plan").value;
+  candidateState.batchId = document.querySelector("#candidate-batch").value;
   candidateState.state = document.querySelector("#candidate-state").value;
   candidateState.query = document.querySelector("#candidate-query").value.trim();
   candidateState.offset = 0;
@@ -1820,9 +1945,31 @@ document.querySelector("#candidate-filters").addEventListener("submit", async (e
 });
 document.querySelector("#candidate-pack").addEventListener("change", async (event) => {
   candidateState.packId = event.target.value;
+  candidateState.planId = "";
+  candidateState.batchId = "";
   candidateState.offset = 0;
-  try { await loadCandidatePage(); } catch (cause) {
+  try {
+    await loadCandidatePlans();
+    await loadCandidatePage();
+  } catch (cause) {
     showBanner(cause instanceof Error ? cause.message : "候选包读取失败");
+  }
+});
+document.querySelector("#candidate-plan").addEventListener("change", async (event) => {
+  candidateState.planId = event.target.value;
+  candidateState.batchId = "";
+  candidateState.offset = 0;
+  renderCandidateBatchOptions();
+  try { await loadCandidatePage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "标注批次读取失败");
+  }
+});
+document.querySelector("#candidate-batch").addEventListener("change", async (event) => {
+  candidateState.batchId = event.target.value;
+  candidateState.offset = 0;
+  renderCandidatePlanBoundary();
+  try { await loadCandidatePage(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "标注批次读取失败");
   }
 });
 document.querySelector("#clear-candidate-filters").addEventListener("click", async () => {

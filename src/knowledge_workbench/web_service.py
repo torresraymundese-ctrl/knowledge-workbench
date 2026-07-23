@@ -12,6 +12,10 @@ from .conflict_candidates import (
     update_cross_document_candidate_label,
     update_cross_document_candidate_review,
 )
+from .conflict_labeling_plan import (
+    list_conflict_labeling_plans,
+    resolve_conflict_labeling_batch,
+)
 from .conflicts import transition_conflict
 from .database import Database
 from .entity_candidates import accept_entity_candidate, reject_entity_candidate
@@ -65,6 +69,15 @@ class WorkbenchReadService:
     def conflict_candidate_packs(self) -> dict[str, Any]:
         return list_cross_document_candidate_packs(self.database, self.paths)
 
+    def conflict_labeling_plans(
+        self, *, source_pack_id: str | None = None
+    ) -> dict[str, Any]:
+        return list_conflict_labeling_plans(
+            self.database,
+            self.paths,
+            source_pack_id=source_pack_id,
+        )
+
     def graph_pilot_packs(self) -> dict[str, Any]:
         return list_graph_pilot_packs(self.database, self.paths)
 
@@ -95,8 +108,28 @@ class WorkbenchReadService:
         offset: int = 0,
         state: str | None = None,
         query: str | None = None,
+        plan_id: str | None = None,
+        batch_id: str | None = None,
     ) -> dict[str, Any]:
-        return cross_document_candidate_page(
+        normalized_plan_id = (plan_id or "").strip() or None
+        normalized_batch_id = (batch_id or "").strip() or None
+        if (normalized_plan_id is None) != (normalized_batch_id is None):
+            raise ValueError("plan_id 与 batch_id 必须同时提供")
+        batch = None
+        candidate_ids = None
+        if normalized_plan_id is not None:
+            batch = resolve_conflict_labeling_batch(
+                self.database,
+                self.paths,
+                normalized_plan_id,
+                normalized_batch_id or "",
+            )
+            if batch["source_pack_id"] != pack_id:
+                raise KnowledgeWorkbenchError(
+                    "冲突标注批次不属于请求的候选包"
+                )
+            candidate_ids = batch["candidate_ids"]
+        page = cross_document_candidate_page(
             self.database,
             self.paths,
             pack_id,
@@ -104,7 +137,18 @@ class WorkbenchReadService:
             offset=offset,
             state=state,
             query=query,
+            candidate_ids=candidate_ids,
         )
+        page["labeling_batch"] = (
+            {
+                "plan_id": batch["plan_id"],
+                "batch_id": batch["batch_id"],
+                "status": batch["status"],
+            }
+            if batch is not None
+            else None
+        )
+        return page
 
     def entity_candidate_page(
         self,

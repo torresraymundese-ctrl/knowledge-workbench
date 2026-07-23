@@ -67,6 +67,7 @@ def cross_document_candidate_page(
     offset: int = 0,
     state: str | None = None,
     query: str | None = None,
+    candidate_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     limit, offset = _candidate_pagination(limit, offset)
     state = _candidate_state_filter(state)
@@ -80,9 +81,31 @@ def cross_document_candidate_page(
         raise KnowledgeWorkbenchError(
             "候选包标签在提交审计后发生变化；已锁定 Web 操作，请恢复已提交版本"
         )
+    scoped_candidates = pack["candidates"]
+    if candidate_ids is not None:
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise KnowledgeWorkbenchError(
+                "候选分页范围包含重复 candidate_id"
+            )
+        candidates_by_id = {
+            item["candidate_id"]: item for item in pack["candidates"]
+        }
+        unknown = [
+            candidate_id
+            for candidate_id in candidate_ids
+            if candidate_id not in candidates_by_id
+        ]
+        if unknown:
+            raise KnowledgeWorkbenchError(
+                "候选分页范围包含来源包不存在的 candidate_id"
+            )
+        scoped_candidates = [
+            candidates_by_id[candidate_id]
+            for candidate_id in candidate_ids
+        ]
     candidates = [
         candidate
-        for candidate in pack["candidates"]
+        for candidate in scoped_candidates
         if _candidate_matches(candidate, state=state, query=query)
     ]
     total = len(candidates)
@@ -94,6 +117,9 @@ def cross_document_candidate_page(
         "minimum_similarity": pack["minimum_similarity"],
         "statistics": pack["statistics"],
         "counts": counts,
+        "scope_counts": _candidate_counts(
+            {"candidates": scoped_candidates}
+        ),
         "phase": phase,
         "annotator": submission["actor"] if submission else None,
         "content_sha256": sha256_file(path),

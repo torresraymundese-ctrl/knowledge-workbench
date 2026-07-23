@@ -311,10 +311,22 @@
           <div><p class="eyebrow">CROSS-DOCUMENT CONFLICTS</p><h2 id="conflict-labeling-title">跨文档冲突标注</h2></div>
           <span id="candidate-pack-count" class="count-pill">—</span>
         </div>
-        <form id="candidate-filters" class="candidate-toolbar" role="search">
+        <form id="candidate-filters" class="candidate-toolbar candidate-batch-toolbar" role="search">
           <label>
             <span>候选包</span>
             <select id="candidate-pack"></select>
+          </label>
+          <label>
+            <span>标注计划</span>
+            <select id="candidate-plan">
+              <option value="">全部候选（不按批次）</option>
+            </select>
+          </label>
+          <label>
+            <span>人工批次</span>
+            <select id="candidate-batch" disabled>
+              <option value="">未选择批次</option>
+            </select>
           </label>
           <label>
             <span>状态</span>
@@ -337,6 +349,7 @@
             <button id="clear-candidate-filters" type="button">清除</button>
           </div>
         </form>
+        <p id="candidate-plan-boundary" class="entity-candidate-boundary">未启用批次范围；当前显示候选包全部候选。</p>
         <div id="candidate-pack-summary" class="candidate-pack-summary panel"></div>
         <div id="candidate-list" class="candidate-list" aria-live="polite"></div>
         <div id="candidate-pagination" class="candidate-pagination panel"></div>
