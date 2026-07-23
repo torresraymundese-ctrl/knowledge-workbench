@@ -89,7 +89,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations"
                     ).fetchall()
                 }
-                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8, 9})
+                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
                 run = connection.execute(
                     "SELECT * FROM processing_runs WHERE document_version_id = 'ver_1'"
                 ).fetchone()
@@ -140,7 +140,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         SELECT name FROM sqlite_master
                         WHERE type = 'table' AND name IN (
                             'canonical_entities', 'entity_aliases',
-                            'evidence_entity_mentions'
+                            'evidence_entity_mentions', 'entity_candidates'
                         )
                         """
                     ).fetchall()
@@ -151,6 +151,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "canonical_entities",
                         "entity_aliases",
                         "evidence_entity_mentions",
+                        "entity_candidates",
                     },
                 )
 
@@ -177,6 +178,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM schema_migrations WHERE version = 9"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 10"
                     ).fetchone()[0],
                     1,
                 )

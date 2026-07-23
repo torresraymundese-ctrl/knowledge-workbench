@@ -47,6 +47,10 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe entity add-alias entity_复制实际实体ID "交易平台升级" --actor curator-01
 .\.venv\Scripts\knowledge.exe entity link-evidence entity_复制实际实体ID ev_复制实际证据ID --mention "交易平台升级" --actor curator-01
 .\.venv\Scripts\knowledge.exe entity list --type project
+.\.venv\Scripts\knowledge.exe entity import-candidates .\workspace\evaluations\实际.analysis.json --actor curator-01
+.\.venv\Scripts\knowledge.exe entity candidate-list --status pending
+.\.venv\Scripts\knowledge.exe entity accept-candidate entitycand_复制实际候选ID entity_复制实际实体ID --actor reviewer-01
+.\.venv\Scripts\knowledge.exe entity reject-candidate entitycand_复制实际候选ID --note "非同一实体" --actor reviewer-01
 .\.venv\Scripts\knowledge.exe page list
 .\.venv\Scripts\knowledge.exe page request-review rev_复制实际修订ID --actor author-01
 .\.venv\Scripts\knowledge.exe page publish rev_复制实际修订ID --actor reviewer-01
@@ -103,6 +107,8 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 SQLite Schema v8 支持一条证据正文对应多个来源定位。`faithful-schema-v2-multilocator` 只合并同一文件版本、同一处理运行内逐字相同的正文；跨文档、跨版本或仅大小写/空白近似的内容不会合并。首定位继续保存在兼容字段 `evidence.locator_json`，全部有序定位保存在 `evidence_locations`，并同步写入分析 JSON、JSONL 镜像、Wiki 草稿、标注候选和 Web 详情。历史证据 ID、审核状态和引用不会由迁移改写；需要使用新策略时显式运行 `ingest --reprocess`，旧处理运行仍完整保留。
 
 SQLite Schema v9 增加人工确认的实体规范化基础层。规范实体创建时自动登记规范名称别名；同一实体类型中的规范化别名只能指向一个实体，不能自动一名多指。证据关联只接受当前文件版本、当前处理运行中的证据，并要求 `--mention` 逐字存在于证据原文且已登记为该实体别名。创建、别名增删和证据关联/解除均要求 actor 并写审计，审计只保存名称或提及哈希；DeepSeek 输出不会自动创建、合并或关联规范实体。
+
+SQLite Schema v10 增加模型实体候选队列。`entity import-candidates` 只读取已存在的 `model_assisted` 阶段一 JSON，不触发模型调用；导入前重验 JSON Schema、来源文件版本、SHA-256、密级和当前处理运行，并按逐字 excerpt 映射数据库证据。候选保持 `pending`，只有人工用 `accept-candidate` 明确选择现有规范实体后，系统才会原子登记无歧义别名并创建证据关联；非逐字候选、过期来源和别名冲突不能接受。`rejected` 和 `accepted` 都是不可重复裁决的终态，复核意见只以 SHA-256 进入数据库与审计。
 
 跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
 

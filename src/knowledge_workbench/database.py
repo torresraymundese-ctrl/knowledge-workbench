@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 SCHEMA = """
@@ -436,6 +436,53 @@ CREATE INDEX idx_evidence_entity_mentions_entity
 """
 
 
+MIGRATION_10 = """
+CREATE TABLE entity_candidates (
+    id TEXT PRIMARY KEY,
+    analysis_sha256 TEXT NOT NULL CHECK (length(analysis_sha256) = 64),
+    document_version_id TEXT NOT NULL REFERENCES document_versions(id),
+    processing_run_id TEXT NOT NULL REFERENCES processing_runs(id),
+    evidence_id TEXT NOT NULL REFERENCES evidence(id),
+    source_candidate_id TEXT NOT NULL,
+    suggested_name TEXT NOT NULL CHECK (length(trim(suggested_name)) > 0),
+    normalized_name TEXT NOT NULL CHECK (length(normalized_name) > 0),
+    suggested_type TEXT NOT NULL CHECK (length(trim(suggested_type)) > 0),
+    verbatim_match INTEGER NOT NULL CHECK (verbatim_match IN (0, 1)),
+    provider TEXT NOT NULL CHECK (length(trim(provider)) > 0),
+    model TEXT,
+    prompt_version TEXT NOT NULL CHECK (length(trim(prompt_version)) > 0),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'accepted', 'rejected')
+    ),
+    resolved_entity_id TEXT REFERENCES canonical_entities(id),
+    imported_by TEXT NOT NULL CHECK (length(trim(imported_by)) > 0),
+    reviewed_by TEXT,
+    review_note_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    UNIQUE(
+        analysis_sha256, evidence_id, normalized_name, suggested_type
+    ),
+    CHECK (
+        (status = 'pending' AND resolved_entity_id IS NULL
+         AND reviewed_by IS NULL AND reviewed_at IS NULL)
+        OR
+        (status = 'accepted' AND resolved_entity_id IS NOT NULL
+         AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)
+        OR
+        (status = 'rejected' AND resolved_entity_id IS NULL
+         AND reviewed_by IS NOT NULL AND review_note_sha256 IS NOT NULL
+         AND reviewed_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_entity_candidates_review
+    ON entity_candidates(status, created_at, id);
+CREATE INDEX idx_entity_candidates_evidence
+    ON entity_candidates(evidence_id, status);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -526,6 +573,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (9, applied_at),
+                )
+                applied.add(9)
+            if 10 not in applied:
+                connection.executescript(MIGRATION_10)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (10, applied_at),
                 )
 
     @contextmanager

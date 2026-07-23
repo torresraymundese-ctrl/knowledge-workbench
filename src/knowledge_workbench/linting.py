@@ -28,6 +28,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
     checked_evidence = 0
     checked_entities = 0
     checked_entity_mentions = 0
+    checked_entity_candidates = 0
     labeling_sessions = []
     with database.connect() as connection:
         foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -106,6 +107,51 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
                         "evidence_entity_mention_invalid",
                         f"{mention['evidence_id']}:{mention['entity_id']}",
                         "实体提及必须逐字存在于证据原文并匹配已登记别名",
+                    )
+                )
+        candidates = connection.execute(
+            """
+            SELECT ec.id, ec.status, ec.suggested_name, ec.normalized_name,
+                   ec.verbatim_match, e.excerpt,
+                   CASE WHEN e.processing_run_id = ec.processing_run_id
+                                  AND e.document_version_id = ec.document_version_id
+                        THEN 1 ELSE 0 END AS source_identity_valid,
+                   CASE WHEN ec.status = 'accepted' AND EXISTS (
+                       SELECT 1 FROM evidence_entity_mentions eem
+                       JOIN entity_aliases ea
+                         ON ea.id = eem.alias_id AND ea.entity_id = eem.entity_id
+                       WHERE eem.evidence_id = ec.evidence_id
+                         AND eem.entity_id = ec.resolved_entity_id
+                         AND eem.mention_text = ec.suggested_name
+                         AND ea.normalized_alias = ec.normalized_name
+                   ) THEN 1 ELSE 0 END AS accepted_link_exists
+            FROM entity_candidates ec
+            JOIN evidence e ON e.id = ec.evidence_id
+            ORDER BY ec.id
+            """
+        ).fetchall()
+        checked_entity_candidates = len(candidates)
+        for candidate in candidates:
+            expected_normalized = normalize_entity_name(candidate["suggested_name"])
+            expected_verbatim = int(candidate["suggested_name"] in candidate["excerpt"])
+            if (
+                candidate["normalized_name"] != expected_normalized
+                or candidate["verbatim_match"] != expected_verbatim
+                or not candidate["source_identity_valid"]
+            ):
+                issues.append(
+                    LintIssue(
+                        "entity_candidate_source_invalid",
+                        candidate["id"],
+                        "实体候选规范名称或逐字匹配标记与来源证据不一致",
+                    )
+                )
+            if candidate["status"] == "accepted" and not candidate["accepted_link_exists"]:
+                issues.append(
+                    LintIssue(
+                        "accepted_entity_candidate_link_missing",
+                        candidate["id"],
+                        "已接受实体候选缺少对应别名或证据关联",
                     )
                 )
         for document in documents:
@@ -215,6 +261,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
             "reviewing_or_approved_labeling_session_count": len(labeling_sessions),
             "canonical_entity_count": checked_entities,
             "entity_evidence_mention_count": checked_entity_mentions,
+            "entity_candidate_count": checked_entity_candidates,
         },
         "issues": [asdict(issue) for issue in issues],
     }

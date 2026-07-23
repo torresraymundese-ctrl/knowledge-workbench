@@ -31,6 +31,13 @@ from .entities import (
     remove_entity_alias,
     unlink_evidence_entity,
 )
+from .entity_candidates import (
+    CANDIDATE_STATUSES,
+    accept_entity_candidate,
+    import_entity_candidates,
+    list_entity_candidates,
+    reject_entity_candidate,
+)
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
@@ -182,6 +189,25 @@ def build_parser() -> argparse.ArgumentParser:
     entity_unlink.add_argument("entity_id")
     entity_unlink.add_argument("evidence_id")
     entity_unlink.add_argument("--actor", required=True)
+    entity_import = entity_sub.add_parser(
+        "import-candidates", help="从 model_assisted 阶段一 JSON 导入待人工裁决实体候选"
+    )
+    entity_import.add_argument("analysis", type=Path)
+    entity_import.add_argument("--actor", required=True)
+    entity_candidates = entity_sub.add_parser("candidate-list", help="列出模型实体候选")
+    entity_candidates.add_argument("--status", choices=CANDIDATE_STATUSES, default="pending")
+    entity_candidates.add_argument("--limit", type=int, default=50)
+    entity_accept = entity_sub.add_parser(
+        "accept-candidate", help="把逐字候选映射到人工选择的规范实体"
+    )
+    entity_accept.add_argument("candidate_id")
+    entity_accept.add_argument("entity_id")
+    entity_accept.add_argument("--actor", required=True)
+    entity_accept.add_argument("--note")
+    entity_reject = entity_sub.add_parser("reject-candidate", help="驳回模型实体候选")
+    entity_reject.add_argument("candidate_id")
+    entity_reject.add_argument("--actor", required=True)
+    entity_reject.add_argument("--note", required=True)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -646,6 +672,9 @@ def _status(database, paths: WorkspacePaths) -> None:
             "entity_evidence_links": connection.execute(
                 "SELECT COUNT(*) FROM evidence_entity_mentions"
             ).fetchone()[0],
+            "pending_entity_candidates": connection.execute(
+                "SELECT COUNT(*) FROM entity_candidates WHERE status = 'pending'"
+            ).fetchone()[0],
         }
     print(f"工作区：{paths.root}")
     _print_mapping(counts)
@@ -732,6 +761,47 @@ def _handle_evidence(args, database) -> None:
 
 
 def _handle_entity(args, database) -> None:
+    if args.entity_command == "import-candidates":
+        _print_mapping(
+            import_entity_candidates(database, args.analysis, actor=args.actor)
+        )
+        return
+    if args.entity_command == "candidate-list":
+        rows = list_entity_candidates(
+            database, status=args.status, limit=args.limit
+        )
+        if not rows:
+            print("暂无模型实体候选。")
+            return
+        for row in rows:
+            freshness = "current" if row["source_is_current"] else "stale"
+            verbatim = "verbatim" if row["verbatim_match"] else "non-verbatim"
+            print(
+                f"{row['id']}  [{row['status']}/{freshness}/{verbatim}]  "
+                f"{row['suggested_name']}  type={row['suggested_type']}  "
+                f"evidence={row['evidence_id']}"
+            )
+        return
+    if args.entity_command == "accept-candidate":
+        _print_mapping(
+            accept_entity_candidate(
+                database,
+                args.candidate_id,
+                args.entity_id,
+                actor=args.actor,
+                note=args.note,
+            )
+        )
+        return
+    if args.entity_command == "reject-candidate":
+        reject_entity_candidate(
+            database,
+            args.candidate_id,
+            actor=args.actor,
+            note=args.note,
+        )
+        print(f"实体候选已驳回：{args.candidate_id}")
+        return
     if args.entity_command == "create":
         entity_id = create_entity(
             database,
