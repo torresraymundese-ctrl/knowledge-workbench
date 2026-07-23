@@ -50,6 +50,14 @@ class QualityClosureStatusTests(unittest.TestCase):
                 actor="coordinator-01",
                 batch_size=20,
             )
+            extra_source = root / "unapproved-current.md"
+            extra_source.write_text(
+                "乙项目尚待人工判断是否适合纳入黄金资料。",
+                encoding="utf-8",
+            )
+            extra_result = ingest_file(
+                extra_source, paths, Classification.INTERNAL
+            )
 
             report = build_quality_closure_status(
                 database,
@@ -85,6 +93,38 @@ class QualityClosureStatusTests(unittest.TestCase):
                     "approved_current_document_count"
                 ],
                 10,
+            )
+            self.assertEqual(
+                report["metrics"]["gold"]["current_document_count"], 11
+            )
+            self.assertEqual(
+                report["metrics"]["gold"][
+                    "unapproved_current_document_count"
+                ],
+                1,
+            )
+            expansion = gates["gold_expansion"]["actual"]
+            self.assertEqual(
+                expansion["unapproved_current_document_ids"],
+                [extra_result.document_id],
+            )
+            self.assertEqual(
+                expansion["minimum_new_document_import_count"], 0
+            )
+            target_twenty = build_quality_closure_status(
+                database,
+                paths,
+                target_gold_documents=20,
+            )
+            target_expansion = {
+                item["gate_id"]: item
+                for item in target_twenty["gates"]
+            }["gold_expansion"]["actual"]
+            self.assertEqual(
+                target_expansion["remaining_document_count"], 10
+            )
+            self.assertEqual(
+                target_expansion["minimum_new_document_import_count"], 9
             )
             self.assertEqual(
                 report["metrics"]["conflict"]["candidate_count"],

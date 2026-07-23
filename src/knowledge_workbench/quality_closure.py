@@ -92,13 +92,30 @@ def build_quality_closure_status(
                 "approved_current_document_count": gold[
                     "approved_current_document_count"
                 ],
+                "current_document_count": gold[
+                    "current_document_count"
+                ],
+                "unapproved_current_document_count": gold[
+                    "unapproved_current_document_count"
+                ],
+                "unapproved_current_document_ids": gold[
+                    "unapproved_current_document_ids"
+                ],
                 "remaining_document_count": max(
                     0,
                     target_gold_documents
                     - gold["approved_current_document_count"],
                 ),
+                "minimum_new_document_import_count": max(
+                    0,
+                    target_gold_documents
+                    - gold["current_document_count"],
+                ),
             },
-            next_action="扩充并异人复核真实黄金资料",
+            next_action=(
+                "先人工判断当前未覆盖资料是否适合作为真实黄金资料，"
+                "再导入缺少的新资料并完成异人复核"
+            ),
             phase="human_data",
         ),
         _gate(
@@ -385,7 +402,10 @@ def _gold_status(database: Database) -> dict[str, Any]:
     with database.connect() as connection:
         row = connection.execute(
             """
-            SELECT COUNT(DISTINCT dv.document_id) AS document_count
+            SELECT COUNT(DISTINCT dv.document_id) AS approved_document_count,
+                   (SELECT COUNT(*) FROM documents
+                    WHERE current_version_id IS NOT NULL)
+                     AS current_document_count
             FROM labeling_sessions ls
             JOIN labeling_cases lc ON lc.session_id = ls.id
             JOIN document_versions dv
@@ -396,12 +416,34 @@ def _gold_status(database: Database) -> dict[str, Any]:
             WHERE ls.status = 'approved'
             """
         ).fetchone()
+        unapproved_rows = connection.execute(
+            """
+            SELECT d.id
+            FROM documents d
+            WHERE d.current_version_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM labeling_sessions ls
+                JOIN labeling_cases lc ON lc.session_id = ls.id
+                WHERE ls.status = 'approved'
+                  AND lc.document_version_id = d.current_version_id
+              )
+            ORDER BY d.id
+            """
+        ).fetchall()
     return {
         "session_count": len(sessions),
         "approved_session_count": len(approved),
         "invalid_approved_session_count": invalid,
         "approved_case_count": approved_case_count,
-        "approved_current_document_count": row["document_count"],
+        "approved_current_document_count": row[
+            "approved_document_count"
+        ],
+        "current_document_count": row["current_document_count"],
+        "unapproved_current_document_count": len(unapproved_rows),
+        "unapproved_current_document_ids": [
+            item["id"] for item in unapproved_rows
+        ],
     }
 
 
