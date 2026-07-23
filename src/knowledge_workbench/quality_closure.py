@@ -541,7 +541,11 @@ def _work_pack_status(database: Database) -> dict[str, int]:
               'conflict_batch_annotation_pack_exported',
               'conflict_batch_review_pack_exported',
               'graph_pilot_triage_pack_exported',
-              'graph_pilot_verification_pack_exported'
+              'graph_pilot_verification_pack_exported',
+              'graph_pilot_entity_curation_pack_exported',
+              'graph_pilot_entity_curation_applied',
+              'graph_pilot_relationship_curation_pack_exported',
+              'graph_pilot_relationship_curation_applied'
             )
             GROUP BY event_type
             """
@@ -559,6 +563,18 @@ def _work_pack_status(database: Database) -> dict[str, int]:
         ),
         "graph_verification_export_count": counts.get(
             "graph_pilot_verification_pack_exported", 0
+        ),
+        "graph_entity_curation_export_count": counts.get(
+            "graph_pilot_entity_curation_pack_exported", 0
+        ),
+        "graph_entity_curation_applied_count": counts.get(
+            "graph_pilot_entity_curation_applied", 0
+        ),
+        "graph_relationship_curation_export_count": counts.get(
+            "graph_pilot_relationship_curation_pack_exported", 0
+        ),
+        "graph_relationship_curation_applied_count": counts.get(
+            "graph_pilot_relationship_curation_applied", 0
         ),
     }
 

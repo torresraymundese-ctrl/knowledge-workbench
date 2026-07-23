@@ -80,6 +80,9 @@ Set-Location "D:\全新知识库"
 # verified 证据进入实体裁决；每条必须明确登记实体或说明当前无实体
 .\.venv\Scripts\knowledge.exe graph pilot-entity-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-entity-curation.md --actor entity-curator-01
 .\.venv\Scripts\knowledge.exe graph pilot-entity-apply .\workspace\evaluations\graph-pilot-entity-curation.md --actor entity-curator-01
+# 已登记关系类型后，只导出同条 verified 证据中至少有两个 active 实体的项
+.\.venv\Scripts\knowledge.exe graph pilot-relationship-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-relationship-curation.md --actor relation-curator-01
+.\.venv\Scripts\knowledge.exe graph pilot-relationship-apply .\workspace\evaluations\graph-pilot-relationship-curation.md --actor relation-curator-01
 .\.venv\Scripts\knowledge.exe graph-evaluate .\workspace\evaluations\graph-gold-v1.json
 .\.venv\Scripts\knowledge.exe relation retract entityrel_关系ID --note "适用期结束" --actor curator-02
 .\.venv\Scripts\knowledge.exe page list
@@ -217,5 +220,7 @@ Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审�
 `quality status` 每次从 SQLite、经审计的冲突计划、图谱试点包和本地黄金数据集重新计算真实进度，不缓存人工决定，也不使用单一百分比掩盖不同门槛。当前共检查工作区完整性、10份黄金基线、可配置黄金扩充目标、完整冲突计划、冲突标注、异人冲突复核、图谱试点快照、证据审核、实体提及、业务关系和图谱黄金评测11项。每项独立返回 `passed/pending`、要求、实际计数和下一动作；默认扩充目标为20份。使用 `--output` 时必须提供 actor，报告只能新增到 `workspace/evaluations/`，内容哈希、门槛结果和待办 ID 写入审计，报告与审计均不包含证据原文或资料路径。
 
 `graph pilot-entity-export/apply` 把当前试点包中的 verified 证据导出为本地实体裁决工作包。每条证据必须明确选择“登记实体”或“当前无实体”；后者要求说明，前者必须给出逐字 mention，并显式选择已有实体 ID，或填写新实体的规范名与类型。同类型同规范名只在本包内复用，数据库已有实体不会靠名称自动匹配。应用前会重验来源包、原文、全部定位、密级、证据状态、actor、路径、精确范围和受保护模板哈希；新实体、别名、证据提及和批次审计在同一事务内写入，任一别名冲突、非逐字提及或来源漂移都会整批回滚。工作包不可重放，审计只保存 ID、计数及名称、提及、意见和文件哈希，不复制正文或人工说明。
+
+`graph pilot-relationship-export/apply` 只处理试点包中当前 verified、非 restricted，且同条证据已人工绑定至少两个不同 active 实体的项。导出前必须先用 CLI 登记 active 关系类型；工作包逐条要求“登记关系”或带说明的“当前无关系”，不会把实体共现当成关系。每个关系使用本包内 `relationship_ref`，同一 ref 可跨证据累积支持证据，但类型、方向、端点和登记说明必须一致；端点必须来自该证据的受保护实体清单。应用会重验关系类型快照、证据原文与定位、密级、状态、实体提及范围、actor、路径和模板哈希，并通过 `entity_relationships.py` 的同一事务规则创建关系。任一提及漂移、重复 active 关系、无效方向或来源变化会整批回滚；审计不保存实体名称、原文或人工说明。
 
 Web 写操作必须填写 `actor`，使用进程级 CSRF 令牌、同源与 Host 校验，并继续调用既有证据、冲突、Wiki 修订、实体候选、实体合并、人工业务关系或冲突候选业务服务写入审计日志。Web 层不直接执行状态 SQL；正式发布、实体合并和业务关系登记/撤销仍由核心状态机执行原子更新与审计。关系类型管理、冲突候选固化及其他高影响写操作尚未开放。

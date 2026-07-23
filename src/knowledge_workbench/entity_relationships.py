@@ -116,6 +116,34 @@ def create_entity_relationship(
     actor: str,
     note: str,
 ) -> str:
+    try:
+        with database.transaction() as connection:
+            relationship_id = _create_entity_relationship_in_transaction(
+                connection,
+                relation_key,
+                source_entity_id,
+                target_entity_id,
+                evidence_ids,
+                actor=actor,
+                note=note,
+            )
+    except sqlite3.IntegrityError as exc:
+        raise KnowledgeWorkbenchError(
+            "相同方向的 active 业务关系已存在，或关系完整性校验失败"
+        ) from exc
+    return relationship_id
+
+
+def _create_entity_relationship_in_transaction(
+    connection: sqlite3.Connection,
+    relation_key: str,
+    source_entity_id: str,
+    target_entity_id: str,
+    evidence_ids: Iterable[str],
+    *,
+    actor: str,
+    note: str,
+) -> str:
     actor = _required_actor(actor)
     relation_key = _required_relation_key(relation_key)
     note_hash = sha256_text(
@@ -136,81 +164,75 @@ def create_entity_relationship(
     )
     if not support_ids:
         raise KnowledgeWorkbenchError("业务关系必须至少引用一条证据")
+    relation_type = connection.execute(
+        """
+        SELECT relation_key, directed FROM entity_relation_types
+        WHERE relation_key = ? AND status = 'active'
+        """,
+        (relation_key,),
+    ).fetchone()
+    if not relation_type:
+        raise KnowledgeWorkbenchError("关系类型不存在或不是 active 状态")
+    _active_entity(connection, source_entity_id)
+    _active_entity(connection, target_entity_id)
+    if not relation_type["directed"] and source_entity_id > target_entity_id:
+        source_entity_id, target_entity_id = (
+            target_entity_id,
+            source_entity_id,
+        )
+    for evidence_id in support_ids:
+        _validate_relationship_evidence(
+            connection,
+            evidence_id,
+            source_entity_id,
+            target_entity_id,
+        )
     relationship_id = new_id("entityrel")
     now = utc_now()
-    try:
-        with database.transaction() as connection:
-            relation_type = connection.execute(
-                """
-                SELECT relation_key, directed FROM entity_relation_types
-                WHERE relation_key = ? AND status = 'active'
-                """,
-                (relation_key,),
-            ).fetchone()
-            if not relation_type:
-                raise KnowledgeWorkbenchError("关系类型不存在或不是 active 状态")
-            _active_entity(connection, source_entity_id)
-            _active_entity(connection, target_entity_id)
-            if not relation_type["directed"] and source_entity_id > target_entity_id:
-                source_entity_id, target_entity_id = (
-                    target_entity_id,
-                    source_entity_id,
-                )
-            for evidence_id in support_ids:
-                _validate_relationship_evidence(
-                    connection,
-                    evidence_id,
-                    source_entity_id,
-                    target_entity_id,
-                )
-            connection.execute(
-                """
-                INSERT INTO entity_relationships(
-                    id, relation_key, source_entity_id, target_entity_id,
-                    status, created_by, creation_note_sha256,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)
-                """,
-                (
-                    relationship_id,
-                    relation_key,
-                    source_entity_id,
-                    target_entity_id,
-                    actor,
-                    note_hash,
-                    now,
-                    now,
-                ),
-            )
-            connection.executemany(
-                """
-                INSERT INTO entity_relationship_evidence(
-                    relationship_id, evidence_id, added_by, added_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                [
-                    (relationship_id, evidence_id, actor, now)
-                    for evidence_id in support_ids
-                ],
-            )
-            record_event(
-                connection,
-                "entity_relationship_created",
-                "entity_relationship",
-                relationship_id,
-                actor=actor,
-                details={
-                    "relation_key": relation_key,
-                    "source_entity_id": source_entity_id,
-                    "target_entity_id": target_entity_id,
-                    "supporting_evidence_ids": support_ids,
-                    "creation_note_sha256": note_hash,
-                },
-            )
-    except sqlite3.IntegrityError as exc:
-        raise KnowledgeWorkbenchError(
-            "相同方向的 active 业务关系已存在，或关系完整性校验失败"
-        ) from exc
+    connection.execute(
+        """
+        INSERT INTO entity_relationships(
+            id, relation_key, source_entity_id, target_entity_id,
+            status, created_by, creation_note_sha256,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)
+        """,
+        (
+            relationship_id,
+            relation_key,
+            source_entity_id,
+            target_entity_id,
+            actor,
+            note_hash,
+            now,
+            now,
+        ),
+    )
+    connection.executemany(
+        """
+        INSERT INTO entity_relationship_evidence(
+            relationship_id, evidence_id, added_by, added_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        [
+            (relationship_id, evidence_id, actor, now)
+            for evidence_id in support_ids
+        ],
+    )
+    record_event(
+        connection,
+        "entity_relationship_created",
+        "entity_relationship",
+        relationship_id,
+        actor=actor,
+        details={
+            "relation_key": relation_key,
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "supporting_evidence_ids": support_ids,
+            "creation_note_sha256": note_hash,
+        },
+    )
     return relationship_id
 
 

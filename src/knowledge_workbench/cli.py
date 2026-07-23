@@ -71,6 +71,10 @@ from .graph_pilot_entity_workpacks import (
     apply_graph_pilot_entity_curation_work_pack,
     export_graph_pilot_entity_curation_work_pack,
 )
+from .graph_pilot_relationship_workpacks import (
+    apply_graph_pilot_relationship_curation_work_pack,
+    export_graph_pilot_relationship_curation_work_pack,
+)
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -439,6 +443,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     graph_pilot_entity_apply.add_argument("work_pack", type=Path)
     graph_pilot_entity_apply.add_argument("--actor", required=True)
+    graph_pilot_relationship_export = graph_sub.add_parser(
+        "pilot-relationship-export",
+        help="导出双实体 verified 试点证据的业务关系裁决工作包",
+    )
+    graph_pilot_relationship_export.add_argument("pack", type=Path)
+    graph_pilot_relationship_export.add_argument("output", type=Path)
+    graph_pilot_relationship_export.add_argument(
+        "--actor", required=True
+    )
+    graph_pilot_relationship_apply = graph_sub.add_parser(
+        "pilot-relationship-apply",
+        help="原子应用图谱试点业务关系裁决",
+    )
+    graph_pilot_relationship_apply.add_argument(
+        "work_pack", type=Path
+    )
+    graph_pilot_relationship_apply.add_argument(
+        "--actor", required=True
+    )
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -1341,6 +1364,26 @@ def _handle_graph(
             actor=args.actor,
         )
         print("图谱试点实体裁决已原子应用。")
+        _print_mapping(payload)
+        return
+    if args.graph_command == "pilot-relationship-export":
+        output = export_graph_pilot_relationship_curation_work_pack(
+            database,
+            paths,
+            args.pack,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"图谱试点业务关系裁决工作包：{output}")
+        return
+    if args.graph_command == "pilot-relationship-apply":
+        payload = apply_graph_pilot_relationship_curation_work_pack(
+            database,
+            paths,
+            args.work_pack,
+            actor=args.actor,
+        )
+        print("图谱试点业务关系裁决已原子应用。")
         _print_mapping(payload)
         return
 

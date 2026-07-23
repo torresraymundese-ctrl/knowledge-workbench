@@ -100,6 +100,15 @@ class QualityClosureStatusTests(unittest.TestCase):
                 report["metrics"]["graph"]["verified_evidence_count"],
                 0,
             )
+            for metric in (
+                "graph_entity_curation_export_count",
+                "graph_entity_curation_applied_count",
+                "graph_relationship_curation_export_count",
+                "graph_relationship_curation_applied_count",
+            ):
+                self.assertEqual(
+                    report["metrics"]["work_packs"][metric], 0
+                )
             report_text = json.dumps(report, ensure_ascii=False)
             self.assertNotIn("甲项目年度预算", report_text)
             self.assertNotIn(str(root), report_text)
