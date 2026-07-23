@@ -61,6 +61,12 @@ from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
 from .graph_evaluation import evaluate_graph_dataset
 from .graph_pilot import build_graph_pilot_pack, inspect_graph_pilot_pack
+from .graph_pilot_review_workpacks import (
+    apply_graph_pilot_triage_work_pack,
+    apply_graph_pilot_verification_work_pack,
+    export_graph_pilot_triage_work_pack,
+    export_graph_pilot_verification_work_pack,
+)
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
 from .labeling import (
@@ -379,6 +385,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="校验图谱试点包并显示证据审核、实体和关系覆盖进度",
     )
     graph_pilot_status.add_argument("pack", type=Path)
+    graph_pilot_triage_export = graph_sub.add_parser(
+        "pilot-triage-export",
+        help="导出图谱试点证据的本地初审工作包",
+    )
+    graph_pilot_triage_export.add_argument("pack", type=Path)
+    graph_pilot_triage_export.add_argument("output", type=Path)
+    graph_pilot_triage_export.add_argument("--actor", required=True)
+    graph_pilot_triage_apply = graph_sub.add_parser(
+        "pilot-triage-apply",
+        help="原子应用图谱试点证据初审决定",
+    )
+    graph_pilot_triage_apply.add_argument("work_pack", type=Path)
+    graph_pilot_triage_apply.add_argument("--actor", required=True)
+    graph_pilot_verification_export = graph_sub.add_parser(
+        "pilot-verification-export",
+        help="由不同复核人导出 reviewing 试点证据工作包",
+    )
+    graph_pilot_verification_export.add_argument("pack", type=Path)
+    graph_pilot_verification_export.add_argument("output", type=Path)
+    graph_pilot_verification_export.add_argument(
+        "--actor", required=True
+    )
+    graph_pilot_verification_apply = graph_sub.add_parser(
+        "pilot-verification-apply",
+        help="原子验证或退回一个图谱试点证据批次",
+    )
+    graph_pilot_verification_apply.add_argument(
+        "work_pack", type=Path
+    )
+    graph_pilot_verification_apply.add_argument(
+        "--actor", required=True
+    )
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -1200,6 +1238,47 @@ def _handle_graph(
     if args.graph_command == "pilot-status":
         payload = inspect_graph_pilot_pack(database, paths, args.pack)
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.graph_command == "pilot-triage-export":
+        output = export_graph_pilot_triage_work_pack(
+            database,
+            paths,
+            args.pack,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"图谱试点证据初审工作包：{output}")
+        return
+    if args.graph_command == "pilot-triage-apply":
+        payload = apply_graph_pilot_triage_work_pack(
+            database,
+            paths,
+            args.work_pack,
+            actor=args.actor,
+        )
+        print("图谱试点证据初审决定已原子应用。")
+        _print_mapping(payload)
+        return
+    if args.graph_command == "pilot-verification-export":
+        output = export_graph_pilot_verification_work_pack(
+            database,
+            paths,
+            args.pack,
+            args.output,
+            actor=args.actor,
+        )
+        print(f"图谱试点证据异人复核工作包：{output}")
+        return
+    if args.graph_command == "pilot-verification-apply":
+        payload = apply_graph_pilot_verification_work_pack(
+            database,
+            paths,
+            args.work_pack,
+            actor=args.actor,
+        )
+        print("图谱试点证据异人复核决定已原子应用。")
+        _print_mapping(payload)
+        return
 
 
 def _handle_relation(args, database) -> None:

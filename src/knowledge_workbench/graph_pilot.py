@@ -179,9 +179,9 @@ def inspect_graph_pilot_pack(
     paths: WorkspacePaths,
     pack_path: Path,
 ) -> dict:
-    pack_path, content, pack = _read_pack(paths, pack_path)
-    _validate_pack_identity(pack)
-    _validate_pack_audit(database, paths, pack_path, content, pack)
+    pack_path, _, pack = resolve_graph_pilot_pack(
+        database, paths, pack_path
+    )
     items = []
     with database.connect() as connection:
         current_locators = _location_map(
@@ -344,6 +344,17 @@ def inspect_graph_pilot_pack(
         },
         "items": items,
     }
+
+
+def resolve_graph_pilot_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_path: Path,
+) -> tuple[Path, str, dict]:
+    pack_path, content, pack = _read_pack(paths, pack_path)
+    _validate_pack_identity(pack)
+    _validate_pack_audit(database, paths, pack_path, content, pack)
+    return pack_path, content, pack
 
 
 def build_graph_pilot_pack(

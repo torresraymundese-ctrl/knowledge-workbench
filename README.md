@@ -71,6 +71,12 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe graph paths entity_起点ID --target entity_目标ID --include-inverse
 .\.venv\Scripts\knowledge.exe graph pilot-pack labels_已批准黄金会话ID --actor pilot-builder-01
 .\.venv\Scripts\knowledge.exe graph pilot-status .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json
+# 初审人逐条核对后提交复核；未通过项选择“暂缓”并填写原因
+.\.venv\Scripts\knowledge.exe graph pilot-triage-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-triage.md --actor curator-01
+.\.venv\Scripts\knowledge.exe graph pilot-triage-apply .\workspace\evaluations\graph-pilot-triage.md --actor curator-01
+# 只能由不同 actor 对 reviewing 证据验证通过或退回草稿
+.\.venv\Scripts\knowledge.exe graph pilot-verification-export .\workspace\evaluations\graph-pilot-labels_已批准黄金会话ID.json .\workspace\evaluations\graph-pilot-verification.md --actor reviewer-01
+.\.venv\Scripts\knowledge.exe graph pilot-verification-apply .\workspace\evaluations\graph-pilot-verification.md --actor reviewer-01
 .\.venv\Scripts\knowledge.exe graph-evaluate .\workspace\evaluations\graph-gold-v1.json
 .\.venv\Scripts\knowledge.exe relation retract entityrel_关系ID --note "适用期结束" --actor curator-02
 .\.venv\Scripts\knowledge.exe page list
@@ -159,6 +165,8 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 `graph pilot-pack` 从既有 `approved` 黄金标注会话中提取双人确认过的必要证据，作为人工证据审核、实体建档和关系登记的优先试点池。生成器重验每个用例已批准、来源版本和处理运行仍为当前、密级未漂移，并排除 restricted；包只能写入当前 `workspace/evaluations/`，包含证据原文与全部定位，禁止覆盖。它只生成候选快照，不改变证据状态、不创建实体或关系；审计仅保存包哈希、相对路径和计数，不保存原文。
 
 `graph pilot-status` 只读取系统生成且内容哈希、包身份、保存路径均与审计匹配的试点包，然后逐条重查数据库快照。输出不回显原文，只报告来源失效、密级泄漏、证据状态、verified 覆盖、active 实体提及、双实体关系资格和 active 关系覆盖，并明确给出证据审核是否完成、是否已经具备图谱黄金集前置条件。复制或修改包文件不能通过状态检查。
+
+`graph pilot-triage-export/apply` 将仍为 `draft` 或 `conflicted` 的试点证据导出为本地 Markdown 初审包。初审人必须逐条选择“提交复核”或“暂缓”，暂缓原因必填；提交项只进入 `reviewing`，不会直接验证、归档、创建实体或关系。`pilot-verification-export/apply` 只导出当前复核人未亲自提交的 `reviewing` 证据，由异人选择“验证通过”或“退回草稿”，退回意见必填。两阶段工作包均绑定原试点包身份和哈希、actor、导出路径、证据范围与导出状态；只有勾选框和对应 JSON 意见是可编辑字段，修改展示的原文、定位、提交人或其他受保护内容也会被模板哈希阻断。复制、删改范围、重复字段、状态或来源漂移同样使整批零写入。状态变更和批次结果在同一 SQLite 事务内完成，审计保存证据 ID、决定、计数及意见/工作包哈希，不保存正文或意见明文。
 
 Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审计路径和当前来源快照校验的试点包。列表按试点包内的证据 ID、资料名、序号和黄金用例 ID 搜索并独立分页，只返回定位摘要、状态与实体/关系进度，不批量返回原文；用户必须显式打开单条证据才能查看内容。证据审核继续复用既有 CSRF、actor、密级边界及 `draft → reviewing → verified` 核心状态机，已验证证据仍保留在试点进度中。被篡改、复制、来源过期或密级越界的包不会进入可操作视图。
 

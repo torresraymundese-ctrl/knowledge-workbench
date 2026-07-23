@@ -42,49 +42,74 @@ def transition_evidence(
     *,
     actor: str,
 ) -> None:
-    now = utc_now()
+    actor = _required_actor(actor)
     with database.transaction() as connection:
-        row = connection.execute(
-            """
-            SELECT e.status,
-                   pr.is_current AS processing_run_is_current,
-                   (d.current_version_id = dv.id) AS document_version_is_current
-            FROM evidence e
-            LEFT JOIN processing_runs pr ON pr.id = e.processing_run_id
-            JOIN document_versions dv ON dv.id = e.document_version_id
-            JOIN documents d ON d.id = dv.document_id
-            WHERE e.id = ?
-            """,
-            (evidence_id,),
-        ).fetchone()
-        if not row:
-            raise KnowledgeWorkbenchError(f"原子证据不存在：{evidence_id}")
-        current = EvidenceStatus(row["status"])
-        if current == target:
-            return
-        if target in {EvidenceStatus.REVIEWING, EvidenceStatus.VERIFIED} and (
-            not row["processing_run_is_current"]
-            or not row["document_version_is_current"]
-        ):
-            raise InvalidTransitionError(
-                "历史文件版本或已被替代处理运行的证据不能进入审核或正式状态"
-            )
-        if target not in EVIDENCE_TRANSITIONS[current]:
-            raise InvalidTransitionError(
-                f"证据状态不能从 {current.value} 直接变为 {target.value}"
-            )
-        connection.execute(
-            "UPDATE evidence SET status = ?, updated_at = ? WHERE id = ?",
-            (target.value, now, evidence_id),
-        )
-        record_event(
+        _transition_evidence_in_transaction(
             connection,
-            "evidence_status_changed",
-            "evidence",
             evidence_id,
+            target,
             actor=actor,
-            details={"from": current.value, "to": target.value},
         )
+
+
+def _transition_evidence_in_transaction(
+    connection: sqlite3.Connection,
+    evidence_id: str,
+    target: EvidenceStatus,
+    *,
+    actor: str,
+    expected_status: EvidenceStatus | None = None,
+    context: dict[str, str] | None = None,
+) -> EvidenceStatus:
+    row = connection.execute(
+        """
+        SELECT e.status,
+               pr.is_current AS processing_run_is_current,
+               (d.current_version_id = dv.id) AS document_version_is_current
+        FROM evidence e
+        LEFT JOIN processing_runs pr ON pr.id = e.processing_run_id
+        JOIN document_versions dv ON dv.id = e.document_version_id
+        JOIN documents d ON d.id = dv.document_id
+        WHERE e.id = ?
+        """,
+        (evidence_id,),
+    ).fetchone()
+    if not row:
+        raise KnowledgeWorkbenchError(f"原子证据不存在：{evidence_id}")
+    current = EvidenceStatus(row["status"])
+    if expected_status is not None and current is not expected_status:
+        raise InvalidTransitionError(
+            f"证据 {evidence_id} 状态已变化；"
+            f"预期 {expected_status.value}，当前 {current.value}"
+        )
+    if current is target:
+        return current
+    if target in {EvidenceStatus.REVIEWING, EvidenceStatus.VERIFIED} and (
+        not row["processing_run_is_current"]
+        or not row["document_version_is_current"]
+    ):
+        raise InvalidTransitionError(
+            "历史文件版本或已被替代处理运行的证据不能进入审核或正式状态"
+        )
+    if target not in EVIDENCE_TRANSITIONS[current]:
+        raise InvalidTransitionError(
+            f"证据状态不能从 {current.value} 直接变为 {target.value}"
+        )
+    connection.execute(
+        "UPDATE evidence SET status = ?, updated_at = ? WHERE id = ?",
+        (target.value, utc_now(), evidence_id),
+    )
+    details = {"from": current.value, "to": target.value}
+    details.update(context or {})
+    record_event(
+        connection,
+        "evidence_status_changed",
+        "evidence",
+        evidence_id,
+        actor=actor,
+        details=details,
+    )
+    return current
 
 
 def request_revision_review(database: Database, revision_id: str, *, actor: str) -> None:
@@ -265,3 +290,14 @@ def _ensure_revision_is_current(revision: sqlite3.Row) -> None:
         raise InvalidTransitionError(
             "历史文件版本或已被替代处理运行的 Wiki 修订不能提交审核或发布"
         )
+
+
+def _required_actor(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise KnowledgeWorkbenchError("actor 不能为空")
+    actor = value.strip()
+    if len(actor) > 80:
+        raise KnowledgeWorkbenchError("actor 不能超过 80 个字符")
+    if any(character in actor for character in "\r\n"):
+        raise KnowledgeWorkbenchError("actor 不能包含换行")
+    return actor
