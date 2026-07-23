@@ -21,6 +21,16 @@ import numpy as np
 from .benchmarking import benchmark_fts_search
 from .config import WorkspacePaths, resolve_workspace
 from .errors import KnowledgeWorkbenchError
+from .entities import (
+    ENTITY_TYPES,
+    add_entity_alias,
+    create_entity,
+    get_entity,
+    link_evidence_entity,
+    list_entities,
+    remove_entity_alias,
+    unlink_evidence_entity,
+)
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
@@ -141,6 +151,37 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_set.add_argument("evidence_id")
     evidence_set.add_argument("status", choices=[value.value for value in EvidenceStatus])
     evidence_set.add_argument("--actor", required=True, help="审核人或操作者")
+
+    entity = subparsers.add_parser("entity", help="人工维护规范实体、别名和证据关联")
+    entity_sub = entity.add_subparsers(dest="entity_command", required=True)
+    entity_list = entity_sub.add_parser("list", help="列出规范实体")
+    entity_list.add_argument("--type", choices=ENTITY_TYPES)
+    entity_list.add_argument("--limit", type=int, default=50)
+    entity_show = entity_sub.add_parser("show", help="显示规范实体及其别名")
+    entity_show.add_argument("entity_id")
+    entity_create = entity_sub.add_parser("create", help="创建规范实体")
+    entity_create.add_argument("canonical_name")
+    entity_create.add_argument("--type", required=True, choices=ENTITY_TYPES)
+    entity_create.add_argument("--actor", required=True)
+    entity_alias_add = entity_sub.add_parser("add-alias", help="登记人工确认的别名")
+    entity_alias_add.add_argument("entity_id")
+    entity_alias_add.add_argument("alias")
+    entity_alias_add.add_argument("--actor", required=True)
+    entity_alias_remove = entity_sub.add_parser("remove-alias", help="移除未被引用的普通别名")
+    entity_alias_remove.add_argument("entity_id")
+    entity_alias_remove.add_argument("alias")
+    entity_alias_remove.add_argument("--actor", required=True)
+    entity_link = entity_sub.add_parser(
+        "link-evidence", help="将当前证据中的逐字提及关联到规范实体"
+    )
+    entity_link.add_argument("entity_id")
+    entity_link.add_argument("evidence_id")
+    entity_link.add_argument("--mention", required=True)
+    entity_link.add_argument("--actor", required=True)
+    entity_unlink = entity_sub.add_parser("unlink-evidence", help="解除证据与规范实体关联")
+    entity_unlink.add_argument("entity_id")
+    entity_unlink.add_argument("evidence_id")
+    entity_unlink.add_argument("--actor", required=True)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -502,6 +543,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "evidence":
             _handle_evidence(args, database)
+        elif args.command == "entity":
+            _handle_entity(args, database)
         elif args.command == "page":
             _handle_page(args, database, paths)
         elif args.command == "search":
@@ -597,6 +640,12 @@ def _status(database, paths: WorkspacePaths) -> None:
             "labeling_sessions": connection.execute(
                 "SELECT COUNT(*) FROM labeling_sessions"
             ).fetchone()[0],
+            "canonical_entities": connection.execute(
+                "SELECT COUNT(*) FROM canonical_entities WHERE status = 'active'"
+            ).fetchone()[0],
+            "entity_evidence_links": connection.execute(
+                "SELECT COUNT(*) FROM evidence_entity_mentions"
+            ).fetchone()[0],
         }
     print(f"工作区：{paths.root}")
     _print_mapping(counts)
@@ -679,6 +728,59 @@ def _handle_evidence(args, database) -> None:
                 ensure_ascii=False,
                 sort_keys=True,
             )
+        )
+
+
+def _handle_entity(args, database) -> None:
+    if args.entity_command == "create":
+        entity_id = create_entity(
+            database,
+            args.canonical_name,
+            args.type,
+            actor=args.actor,
+        )
+        print(f"规范实体已创建：{entity_id}")
+        return
+    if args.entity_command == "add-alias":
+        alias_id = add_entity_alias(
+            database, args.entity_id, args.alias, actor=args.actor
+        )
+        print(f"实体别名已登记：{alias_id}")
+        return
+    if args.entity_command == "remove-alias":
+        remove_entity_alias(
+            database, args.entity_id, args.alias, actor=args.actor
+        )
+        print("实体别名已移除")
+        return
+    if args.entity_command == "link-evidence":
+        created = link_evidence_entity(
+            database,
+            args.entity_id,
+            args.evidence_id,
+            args.mention,
+            actor=args.actor,
+        )
+        print("证据实体关联已创建" if created else "证据实体关联已存在，未重复创建")
+        return
+    if args.entity_command == "unlink-evidence":
+        removed = unlink_evidence_entity(
+            database, args.entity_id, args.evidence_id, actor=args.actor
+        )
+        print(f"证据实体关联已解除：{removed} 条")
+        return
+    if args.entity_command == "show":
+        print(json.dumps(get_entity(database, args.entity_id), ensure_ascii=False, indent=2))
+        return
+    rows = list_entities(database, entity_type=args.type, limit=args.limit)
+    if not rows:
+        print("暂无规范实体。")
+        return
+    for row in rows:
+        print(
+            f"{row['id']}  [{row['entity_type']}/{row['status']}]  "
+            f"{row['canonical_name']}  aliases={row['alias_count']}  "
+            f"current_evidence={row['current_evidence_count']}"
         )
 
 

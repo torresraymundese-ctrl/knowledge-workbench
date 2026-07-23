@@ -89,7 +89,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations"
                     ).fetchall()
                 }
-                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8})
+                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8, 9})
                 run = connection.execute(
                     "SELECT * FROM processing_runs WHERE document_version_id = 'ver_1'"
                 ).fetchone()
@@ -133,6 +133,26 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "labeling_case_reviews",
                     },
                 )
+                entity_tables = {
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'table' AND name IN (
+                            'canonical_entities', 'entity_aliases',
+                            'evidence_entity_mentions'
+                        )
+                        """
+                    ).fetchall()
+                }
+                self.assertEqual(
+                    entity_tables,
+                    {
+                        "canonical_entities",
+                        "entity_aliases",
+                        "evidence_entity_mentions",
+                    },
+                )
 
             database.initialize("t5-repeat")
             with database.connect() as connection:
@@ -151,6 +171,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM schema_migrations WHERE version = 8"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 9"
                     ).fetchone()[0],
                     1,
                 )

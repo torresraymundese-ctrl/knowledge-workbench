@@ -43,6 +43,10 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe ingest .\samples\example.md --classification internal --reprocess
 .\.venv\Scripts\knowledge.exe ingest .\samples\legacy.doc --classification internal --allow-legacy-word-conversion
 .\.venv\Scripts\knowledge.exe evidence list
+.\.venv\Scripts\knowledge.exe entity create "产权交易平台" --type project --actor curator-01
+.\.venv\Scripts\knowledge.exe entity add-alias entity_复制实际实体ID "交易平台升级" --actor curator-01
+.\.venv\Scripts\knowledge.exe entity link-evidence entity_复制实际实体ID ev_复制实际证据ID --mention "交易平台升级" --actor curator-01
+.\.venv\Scripts\knowledge.exe entity list --type project
 .\.venv\Scripts\knowledge.exe page list
 .\.venv\Scripts\knowledge.exe page request-review rev_复制实际修订ID --actor author-01
 .\.venv\Scripts\knowledge.exe page publish rev_复制实际修订ID --actor reviewer-01
@@ -82,7 +86,7 @@ $Reviewer = "reviewer-01"
 .\.venv\Scripts\knowledge.exe worker run --worker local-worker-1 --stop-when-idle
 ```
 
-DeepSeek 是可选增强。只有配置 `DEEPSEEK_API_KEY` 后才能显式运行 `--mode deepseek`；`internal` 资料还必须增加 `--allow-internal-cloud-once`。`confidential` 和 `restricted` 资料始终禁止云调用。阶段一 `analysis-v2-local-locators` 只让模型选择逐字证据和补充语义字段，来源定位由本地 faithful 提取器按 excerpt 强制回填，模型返回的定位不会成为事实来源；阶段二使用 `wiki-generation-v2-extractive` 抽取式提示词，结论必须逐字等于一条所引证据，禁止改写、多证据合成及原文范围外推断。无法逐字表达的整理需求进入 `human_tasks`，现有方向词、关键数字和文本支撑校验继续作为硬防线。真实短 Markdown 与34单元表格 DOCX 已完成调用验证，但不能代表企业资料整体质量。项目禁止使用 `qwen2.5:7b-instruct`。
+DeepSeek 是可选增强。只有配置 `DEEPSEEK_API_KEY` 后才能显式运行 `--mode deepseek`；`internal` 资料还必须增加 `--allow-internal-cloud-once`。`confidential` 和 `restricted` 资料始终禁止云调用。阶段一 `analysis-v3-source-anchored` 由本地 faithful 提取器先固定完整、有序的证据 ID、逐字正文和全部定位；模型只能补充语义字段，返回后本地按 ID 强制覆盖正文与定位，遗漏、重排、重复或未知 ID 均阻断。阶段二使用 `wiki-generation-v2-extractive` 抽取式提示词，结论必须逐字等于一条所引证据，禁止改写、多证据合成及原文范围外推断。无法逐字表达的整理需求进入 `human_tasks`，现有方向词、关键数字和文本支撑校验继续作为硬防线。真实短 Markdown 与34单元表格 DOCX 已完成调用验证，但不能代表企业资料整体质量。项目禁止使用 `qwen2.5:7b-instruct`。
 
 不安装项目也可以运行：
 
@@ -97,6 +101,8 @@ python .\knowledge.py ingest .\samples\example.md --classification internal
 重处理会改变当前证据集合；已有向量索引会被识别为过期，必须重新运行 `index build` 后才能继续语义检索。全文检索不受影响。
 
 SQLite Schema v8 支持一条证据正文对应多个来源定位。`faithful-schema-v2-multilocator` 只合并同一文件版本、同一处理运行内逐字相同的正文；跨文档、跨版本或仅大小写/空白近似的内容不会合并。首定位继续保存在兼容字段 `evidence.locator_json`，全部有序定位保存在 `evidence_locations`，并同步写入分析 JSON、JSONL 镜像、Wiki 草稿、标注候选和 Web 详情。历史证据 ID、审核状态和引用不会由迁移改写；需要使用新策略时显式运行 `ingest --reprocess`，旧处理运行仍完整保留。
+
+SQLite Schema v9 增加人工确认的实体规范化基础层。规范实体创建时自动登记规范名称别名；同一实体类型中的规范化别名只能指向一个实体，不能自动一名多指。证据关联只接受当前文件版本、当前处理运行中的证据，并要求 `--mention` 逐字存在于证据原文且已登记为该实体别名。创建、别名增删和证据关联/解除均要求 actor 并写审计，审计只保存名称或提及哈希；DeepSeek 输出不会自动创建、合并或关联规范实体。
 
 跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
 

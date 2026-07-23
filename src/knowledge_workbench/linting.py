@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import WorkspacePaths
 from .database import Database
+from .entities import normalize_entity_name
 from .errors import KnowledgeWorkbenchError
 from .labeling import validate_labeling_session_ready
 from .schema_validation import validate_analysis, validate_wiki_generation
@@ -25,6 +26,8 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
     issues: list[LintIssue] = []
     checked_runs = 0
     checked_evidence = 0
+    checked_entities = 0
+    checked_entity_mentions = 0
     labeling_sessions = []
     with database.connect() as connection:
         foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -52,6 +55,59 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
             ORDER BY id
             """
         ).fetchall()
+        entities = connection.execute(
+            """
+            SELECT ce.id, ce.canonical_name, ce.normalized_name,
+                   SUM(CASE WHEN ea.is_canonical = 1 THEN 1 ELSE 0 END)
+                       AS canonical_alias_count,
+                   MAX(CASE WHEN ea.is_canonical = 1 THEN ea.normalized_alias END)
+                       AS canonical_alias_normalized
+            FROM canonical_entities ce
+            LEFT JOIN entity_aliases ea ON ea.entity_id = ce.id
+            GROUP BY ce.id
+            ORDER BY ce.id
+            """
+        ).fetchall()
+        checked_entities = len(entities)
+        for entity in entities:
+            if (
+                entity["canonical_alias_count"] != 1
+                or entity["canonical_alias_normalized"] != entity["normalized_name"]
+                or normalize_entity_name(entity["canonical_name"])
+                != entity["normalized_name"]
+            ):
+                issues.append(
+                    LintIssue(
+                        "canonical_entity_alias_invalid",
+                        entity["id"],
+                        "规范实体必须有且仅有一个与规范名称一致的 canonical 别名",
+                    )
+                )
+        mentions = connection.execute(
+            """
+            SELECT eem.evidence_id, eem.entity_id, eem.mention_text,
+                   e.excerpt, ea.normalized_alias
+            FROM evidence_entity_mentions eem
+            JOIN evidence e ON e.id = eem.evidence_id
+            JOIN entity_aliases ea
+              ON ea.id = eem.alias_id AND ea.entity_id = eem.entity_id
+            ORDER BY eem.entity_id, eem.evidence_id
+            """
+        ).fetchall()
+        checked_entity_mentions = len(mentions)
+        for mention in mentions:
+            if (
+                mention["mention_text"] not in mention["excerpt"]
+                or normalize_entity_name(mention["mention_text"])
+                != mention["normalized_alias"]
+            ):
+                issues.append(
+                    LintIssue(
+                        "evidence_entity_mention_invalid",
+                        f"{mention['evidence_id']}:{mention['entity_id']}",
+                        "实体提及必须逐字存在于证据原文并匹配已登记别名",
+                    )
+                )
         for document in documents:
             document_id = document["document_id"]
             version_id = document["current_version_id"]
@@ -157,6 +213,8 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
             "error_count": error_count,
             "warning_count": warning_count,
             "reviewing_or_approved_labeling_session_count": len(labeling_sessions),
+            "canonical_entity_count": checked_entities,
+            "entity_evidence_mention_count": checked_entity_mentions,
         },
         "issues": [asdict(issue) for issue in issues],
     }

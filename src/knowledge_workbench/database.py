@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 SCHEMA = """
@@ -380,6 +380,62 @@ CREATE INDEX idx_evidence_locations_evidence
 """
 
 
+MIGRATION_9 = """
+CREATE TABLE canonical_entities (
+    id TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL CHECK (length(trim(canonical_name)) > 0),
+    normalized_name TEXT NOT NULL CHECK (length(normalized_name) > 0),
+    entity_type TEXT NOT NULL CHECK (
+        entity_type IN (
+            'person', 'organization', 'project', 'product',
+            'location', 'concept', 'other'
+        )
+    ),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (
+        status IN ('active', 'archived')
+    ),
+    created_by TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(normalized_name, entity_type),
+    UNIQUE(id, entity_type)
+);
+
+CREATE TABLE entity_aliases (
+    id TEXT PRIMARY KEY,
+    entity_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    alias TEXT NOT NULL CHECK (length(trim(alias)) > 0),
+    normalized_alias TEXT NOT NULL CHECK (length(normalized_alias) > 0),
+    is_canonical INTEGER NOT NULL DEFAULT 0 CHECK (is_canonical IN (0, 1)),
+    created_by TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(entity_type, normalized_alias),
+    UNIQUE(id, entity_id),
+    FOREIGN KEY(entity_id, entity_type)
+        REFERENCES canonical_entities(id, entity_type)
+);
+
+CREATE INDEX idx_entity_aliases_entity
+    ON entity_aliases(entity_id, is_canonical DESC, normalized_alias);
+
+CREATE TABLE evidence_entity_mentions (
+    evidence_id TEXT NOT NULL REFERENCES evidence(id),
+    entity_id TEXT NOT NULL REFERENCES canonical_entities(id),
+    alias_id TEXT NOT NULL,
+    mention_text TEXT NOT NULL CHECK (length(trim(mention_text)) > 0),
+    created_by TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(evidence_id, alias_id),
+    FOREIGN KEY(alias_id, entity_id)
+        REFERENCES entity_aliases(id, entity_id)
+);
+
+CREATE INDEX idx_evidence_entity_mentions_entity
+    ON evidence_entity_mentions(entity_id, evidence_id);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -463,6 +519,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (8, applied_at),
+                )
+                applied.add(8)
+            if 9 not in applied:
+                connection.executescript(MIGRATION_9)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (9, applied_at),
                 )
 
     @contextmanager
