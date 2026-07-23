@@ -20,6 +20,12 @@ from .entity_merges import (
     propose_entity_merge,
     review_entity_merge,
 )
+from .entity_relationships import (
+    create_entity_relationship,
+    list_entity_relationships,
+    list_relation_types,
+    retract_entity_relationship,
+)
 from .entity_visibility import get_entity_visibility, list_entity_visibility
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
@@ -267,6 +273,201 @@ class WorkbenchReadService:
                     "visibility": item["visibility"],
                 }
                 for item in visible_entities
+            ],
+        }
+
+    def entity_relationship_page(
+        self,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        status: str = "active",
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        limit, offset = _pagination(limit, offset)
+        status = _entity_relationship_status(status)
+        query = _review_query(query)
+        visible_entities = list_entity_visibility(
+            self.database, web_visible_only=True, limit=500
+        )
+        visible_by_id = {
+            item["entity_id"]: item for item in visible_entities
+        }
+        relationships = list_entity_relationships(
+            self.database, status=status, limit=500
+        )
+        safe_relationships = [
+            relationship
+            for relationship in relationships
+            if relationship["source_entity_id"] in visible_by_id
+            and relationship["target_entity_id"] in visible_by_id
+        ]
+        if query:
+            needle = query.casefold()
+            safe_relationships = [
+                relationship
+                for relationship in safe_relationships
+                if any(
+                    needle in str(value).casefold()
+                    for value in (
+                        relationship["relationship_id"],
+                        relationship["relation_key"],
+                        relationship["label"],
+                        relationship["source_name"],
+                        relationship["target_name"],
+                        relationship["created_by"],
+                    )
+                )
+            ]
+        total = len(safe_relationships)
+        page_rows = safe_relationships[offset : offset + limit]
+        return {
+            "status": status,
+            "query": query,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_previous": offset > 0,
+            "has_next": offset + len(page_rows) < total,
+            "source_limit_reached": len(relationships) == 500,
+            "items": [
+                {
+                    **relationship,
+                    "retraction_confirmation": (
+                        _entity_relationship_retraction_phrase(
+                            relationship["relationship_id"]
+                        )
+                        if relationship["status"] == "active"
+                        else None
+                    ),
+                }
+                for relationship in page_rows
+            ],
+            "relation_types": [
+                {
+                    "relation_key": item["relation_key"],
+                    "label": item["label"],
+                    "inverse_label": item["inverse_label"],
+                    "directed": item["directed"],
+                }
+                for item in list_relation_types(
+                    self.database, status="active", limit=200
+                )
+            ],
+            "entity_options": [
+                {
+                    "entity_id": item["entity_id"],
+                    "canonical_name": item["canonical_name"],
+                    "entity_type": item["entity_type"],
+                    "evidence_count": item["evidence_count"],
+                    "visibility": item["visibility"],
+                }
+                for item in visible_entities
+            ],
+        }
+
+    def entity_relationship_evidence_page(
+        self,
+        source_entity_id: str,
+        target_entity_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        limit, offset = _pagination(limit, offset)
+        query = _review_query(query)
+        source = _web_visible_entity(self.database, source_entity_id)
+        target = _web_visible_entity(self.database, target_entity_id)
+        if source_entity_id == target_entity_id:
+            raise ValueError("业务关系源实体和目标实体不能相同")
+        where = [
+            "e.status = 'verified'",
+            "pr.is_current = 1",
+            "d.current_version_id = dv.id",
+            "d.classification != 'restricted'",
+            """
+            EXISTS (
+                SELECT 1 FROM evidence_entity_mentions source_mention
+                WHERE source_mention.evidence_id = e.id
+                  AND source_mention.entity_id = ?
+            )
+            """,
+            """
+            EXISTS (
+                SELECT 1 FROM evidence_entity_mentions target_mention
+                WHERE target_mention.evidence_id = e.id
+                  AND target_mention.entity_id = ?
+            )
+            """,
+        ]
+        parameters: list[object] = [source_entity_id, target_entity_id]
+        if query:
+            pattern = f"%{_escape_like(query)}%"
+            where.append(
+                """
+                (
+                    e.id LIKE ? ESCAPE '\\'
+                    OR d.original_name LIKE ? ESCAPE '\\'
+                    OR d.classification LIKE ? ESCAPE '\\'
+                )
+                """
+            )
+            parameters.extend([pattern, pattern, pattern])
+        predicate = " AND ".join(where)
+        with self.database.connect() as connection:
+            total = connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT e.id)
+                FROM evidence e
+                JOIN processing_runs pr ON pr.id = e.processing_run_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE {predicate}
+                """,
+                parameters,
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT e.id, d.original_name, d.classification,
+                       e.updated_at
+                FROM evidence e
+                JOIN processing_runs pr ON pr.id = e.processing_run_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE {predicate}
+                ORDER BY e.updated_at DESC, e.id
+                LIMIT ? OFFSET ?
+                """,
+                [*parameters, limit, offset],
+            ).fetchall()
+        return {
+            "source_entity": {
+                "entity_id": source["entity_id"],
+                "canonical_name": source["canonical_name"],
+                "entity_type": source["entity_type"],
+                "visibility": source["visibility"],
+            },
+            "target_entity": {
+                "entity_id": target["entity_id"],
+                "canonical_name": target["canonical_name"],
+                "entity_type": target["entity_type"],
+                "visibility": target["visibility"],
+            },
+            "query": query,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_previous": offset > 0,
+            "has_next": offset + len(rows) < total,
+            "items": [
+                {
+                    "evidence_id": row["id"],
+                    "document_name": row["original_name"],
+                    "classification": row["classification"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
             ],
         }
 
@@ -1121,6 +1322,85 @@ class WorkbenchActionService:
             **result,
         }
 
+    def create_entity_relationship_web(
+        self,
+        relation_key: str,
+        source_entity_id: str,
+        target_entity_id: str,
+        evidence_ids: list[str],
+        *,
+        actor: str,
+        note: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        relation_key = relation_key.strip().casefold()
+        source_entity_id = source_entity_id.strip()
+        target_entity_id = target_entity_id.strip()
+        if not relation_key or not source_entity_id or not target_entity_id:
+            raise ValueError("关系类型、源实体和目标实体不能为空")
+        if source_entity_id == target_entity_id:
+            raise ValueError("业务关系源实体和目标实体不能相同")
+        note = _required_entity_relationship_note(note, "业务关系登记说明")
+        _required_entity_relationship_creation_confirmation(
+            confirmation,
+            relation_key,
+            source_entity_id,
+            target_entity_id,
+        )
+        self._require_web_visible_entity(source_entity_id)
+        self._require_web_visible_entity(target_entity_id)
+        support_ids = _web_evidence_ids(evidence_ids)
+        self._require_web_safe_relationship_evidence(support_ids)
+        relationship_id = create_entity_relationship(
+            self.database,
+            relation_key,
+            source_entity_id,
+            target_entity_id,
+            support_ids,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "entity_relationship",
+            "entity_id": relationship_id,
+            "relationship_id": relationship_id,
+            "relation_key": relation_key,
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "status": "active",
+            "actor": actor,
+        }
+
+    def retract_entity_relationship_web(
+        self,
+        relationship_id: str,
+        *,
+        actor: str,
+        note: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        note = _required_entity_relationship_note(note, "业务关系撤销说明")
+        _required_entity_relationship_retraction_confirmation(
+            confirmation, relationship_id
+        )
+        relationship = self._entity_relationship(relationship_id)
+        self._require_web_visible_entity(relationship["source_entity_id"])
+        self._require_web_visible_entity(relationship["target_entity_id"])
+        result = retract_entity_relationship(
+            self.database,
+            relationship_id,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "entity_relationship",
+            "entity_id": relationship_id,
+            "actor": actor,
+            **result,
+        }
+
     def update_conflict_candidate_label(
         self,
         pack_id: str,
@@ -1387,6 +1667,47 @@ class WorkbenchActionService:
             raise KnowledgeWorkbenchError(f"实体合并请求不存在：{request_id}")
         return row
 
+    def _entity_relationship(self, relationship_id: str):
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, status, source_entity_id, target_entity_id
+                FROM entity_relationships
+                WHERE id = ?
+                """,
+                (relationship_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(
+                f"业务关系不存在：{relationship_id}"
+            )
+        return row
+
+    def _require_web_safe_relationship_evidence(
+        self, evidence_ids: list[str]
+    ) -> None:
+        placeholders = ", ".join("?" for _ in evidence_ids)
+        with self.database.connect() as connection:
+            safe_count = connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT e.id)
+                FROM evidence e
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d
+                  ON d.id = dv.document_id AND d.current_version_id = dv.id
+                WHERE e.id IN ({placeholders})
+                  AND e.status = 'verified'
+                  AND d.classification != 'restricted'
+                """,
+                evidence_ids,
+            ).fetchone()[0]
+        if safe_count != len(evidence_ids):
+            raise PermissionError(
+                "Web 只能引用当前、verified 且非 restricted 的关系证据"
+            )
+
     def _require_web_visible_entity(self, entity_id: str) -> dict:
         visibility = get_entity_visibility(self.database, entity_id)
         if not visibility["web_visible"]:
@@ -1453,6 +1774,29 @@ def _entity_candidate_status(value: str | None) -> str | None:
     return status
 
 
+def _entity_relationship_status(value: str) -> str:
+    status = value.strip()
+    if status not in {"active", "retracted"}:
+        raise ValueError(f"业务关系不支持状态：{status}")
+    return status
+
+
+def _web_visible_entity(database: Database, entity_id: str) -> dict:
+    entity_id = entity_id.strip()
+    if not entity_id:
+        raise ValueError("entity_id 不能为空")
+    visibility = get_entity_visibility(database, entity_id)
+    if not visibility["web_visible"]:
+        raise PermissionError(
+            "该规范实体没有可用于 Web 的非受限证据密级，请通过 CLI 处理"
+        )
+    return visibility
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _read_revision_content(
     paths: WorkspacePaths, relative_path: str, *, expected_sha256: str
 ) -> str:
@@ -1509,6 +1853,69 @@ def _required_entity_merge_note(value: str, label: str) -> str:
     if len(note) > 2000:
         raise ValueError(f"{label}不能超过 2000 个字符")
     return note
+
+
+def _required_entity_relationship_note(value: str, label: str) -> str:
+    note = value.strip()
+    if not note:
+        raise ValueError(f"{label}不能为空")
+    if len(note) > 2000:
+        raise ValueError(f"{label}不能超过 2000 个字符")
+    return note
+
+
+def _web_evidence_ids(value: list[str]) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError("evidence_ids 必须是数组")
+    evidence_ids = sorted(
+        {
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        }
+    )
+    if not evidence_ids:
+        raise ValueError("业务关系必须至少选择一条证据")
+    if len(evidence_ids) > 50:
+        raise ValueError("Web 单次最多选择 50 条业务关系证据")
+    if any(len(item) > 120 for item in evidence_ids):
+        raise ValueError("evidence_id 长度无效")
+    return evidence_ids
+
+
+def _entity_relationship_creation_phrase(
+    relation_key: str, source_entity_id: str, target_entity_id: str
+) -> str:
+    return f"登记 {relation_key} {source_entity_id} {target_entity_id}"
+
+
+def _required_entity_relationship_creation_confirmation(
+    value: str,
+    relation_key: str,
+    source_entity_id: str,
+    target_entity_id: str,
+) -> str:
+    confirmation = value.strip()
+    expected = _entity_relationship_creation_phrase(
+        relation_key, source_entity_id, target_entity_id
+    )
+    if confirmation != expected:
+        raise ValueError(f"登记业务关系前必须完整输入确认短语：{expected}")
+    return confirmation
+
+
+def _entity_relationship_retraction_phrase(relationship_id: str) -> str:
+    return f"撤销 {relationship_id}"
+
+
+def _required_entity_relationship_retraction_confirmation(
+    value: str, relationship_id: str
+) -> str:
+    confirmation = value.strip()
+    expected = _entity_relationship_retraction_phrase(relationship_id)
+    if confirmation != expected:
+        raise ValueError(f"撤销业务关系前必须完整输入确认短语：{expected}")
+    return confirmation
 
 
 def _entity_merge_confirmation_phrase(request_id: str) -> str:

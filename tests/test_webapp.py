@@ -14,6 +14,10 @@ from knowledge_workbench.conflict_candidates import (
 from knowledge_workbench.database import Database
 from knowledge_workbench.entities import create_entity, link_evidence_entity
 from knowledge_workbench.entity_candidates import import_entity_candidates
+from knowledge_workbench.entity_relationships import (
+    create_entity_relationship,
+    create_relation_type,
+)
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
@@ -1486,6 +1490,267 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(entity_statuses[target_entity], "active")
             self.assertEqual(entity_statuses[restricted_entity], "active")
             self.assertEqual(entity_statuses[unclassified_entity], "active")
+
+    def test_entity_relationship_web_filters_restricted_and_requires_confirmations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "internal-relation.md"
+            restricted = root / "restricted-relation.md"
+            internal.write_text("甲公司负责甲项目。", encoding="utf-8")
+            restricted.write_text(
+                "火星公司负责火星项目。", encoding="utf-8"
+            )
+            internal_result = ingest_file(
+                internal, paths, Classification.INTERNAL
+            )
+            restricted_result = ingest_file(
+                restricted, paths, Classification.RESTRICTED
+            )
+            database = Database(paths.database)
+            with database.connect() as connection:
+                internal_evidence = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (internal_result.processing_run_id,),
+                ).fetchone()[0]
+                restricted_evidence = connection.execute(
+                    "SELECT id FROM evidence WHERE processing_run_id = ?",
+                    (restricted_result.processing_run_id,),
+                ).fetchone()[0]
+            internal_source = create_entity(
+                database, "甲公司", "organization", actor="curator-01"
+            )
+            internal_target = create_entity(
+                database, "甲项目", "project", actor="curator-01"
+            )
+            restricted_source = create_entity(
+                database, "火星公司", "organization", actor="curator-01"
+            )
+            restricted_target = create_entity(
+                database, "火星项目", "project", actor="curator-01"
+            )
+            unclassified = create_entity(
+                database, "未分类项目", "project", actor="curator-01"
+            )
+            for entity_id, evidence_id, mention in (
+                (internal_source, internal_evidence, "甲公司"),
+                (internal_target, internal_evidence, "甲项目"),
+                (restricted_source, restricted_evidence, "火星公司"),
+                (restricted_target, restricted_evidence, "火星项目"),
+            ):
+                link_evidence_entity(
+                    database,
+                    entity_id,
+                    evidence_id,
+                    mention,
+                    actor="curator-01",
+                )
+            for evidence_id in (internal_evidence, restricted_evidence):
+                transition_evidence(
+                    database,
+                    evidence_id,
+                    EvidenceStatus.REVIEWING,
+                    actor="reviewer-01",
+                )
+                transition_evidence(
+                    database,
+                    evidence_id,
+                    EvidenceStatus.VERIFIED,
+                    actor="reviewer-01",
+                )
+            create_relation_type(
+                database,
+                "responsible_for",
+                "负责",
+                inverse_label="由其负责",
+                actor="curator-01",
+            )
+            restricted_relationship = create_entity_relationship(
+                database,
+                "responsible_for",
+                restricted_source,
+                restricted_target,
+                [restricted_evidence],
+                actor="curator-01",
+                note="受限关系",
+            )
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="relationship-token",
+            )
+            headers = {
+                "Content-Type": "application/json",
+                "X-Workbench-CSRF": "relationship-token",
+            }
+
+            empty = application.handle("GET", "/api/v1/entity-relationships")
+            empty_payload = json.loads(empty.body)
+            self.assertEqual(empty_payload["total"], 0)
+            self.assertEqual(
+                {
+                    item["entity_id"]
+                    for item in empty_payload["entity_options"]
+                },
+                {internal_source, internal_target},
+            )
+            serialized = empty.body.decode("utf-8")
+            self.assertNotIn("火星公司", serialized)
+            self.assertNotIn("火星项目", serialized)
+            self.assertNotIn("未分类项目", serialized)
+            self.assertEqual(
+                empty_payload["relation_types"][0]["relation_key"],
+                "responsible_for",
+            )
+
+            candidates = application.handle(
+                "GET",
+                "/api/v1/entity-relationships/evidence"
+                f"?source_entity_id={internal_source}"
+                f"&target_entity_id={internal_target}",
+            )
+            candidate_payload = json.loads(candidates.body)
+            self.assertEqual(candidate_payload["total"], 1)
+            self.assertEqual(
+                candidate_payload["items"][0]["evidence_id"],
+                internal_evidence,
+            )
+            self.assertNotIn("excerpt", candidates.body.decode("utf-8"))
+            restricted_candidates = application.handle(
+                "GET",
+                "/api/v1/entity-relationships/evidence"
+                f"?source_entity_id={restricted_source}"
+                f"&target_entity_id={restricted_target}",
+            )
+            self.assertEqual(restricted_candidates.status, 403)
+
+            confirmation = (
+                f"登记 responsible_for {internal_source} {internal_target}"
+            )
+            create_route = "/api/v1/entity-relationships/create"
+            wrong_confirmation = application.handle(
+                "POST",
+                create_route,
+                body=json.dumps(
+                    {
+                        "actor": "curator-02",
+                        "relation_key": "responsible_for",
+                        "source_entity_id": internal_source,
+                        "target_entity_id": internal_target,
+                        "evidence_ids": [internal_evidence],
+                        "note": "已回源核对",
+                        "confirmation": "登记错误关系",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(wrong_confirmation.status, 400)
+            blocked_evidence = application.handle(
+                "POST",
+                create_route,
+                body=json.dumps(
+                    {
+                        "actor": "curator-02",
+                        "relation_key": "responsible_for",
+                        "source_entity_id": internal_source,
+                        "target_entity_id": internal_target,
+                        "evidence_ids": [restricted_evidence],
+                        "note": "伪造受限证据",
+                        "confirmation": confirmation,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(blocked_evidence.status, 403)
+            created = application.handle(
+                "POST",
+                create_route,
+                body=json.dumps(
+                    {
+                        "actor": "curator-02",
+                        "relation_key": "responsible_for",
+                        "source_entity_id": internal_source,
+                        "target_entity_id": internal_target,
+                        "evidence_ids": [internal_evidence],
+                        "note": "已回源核对",
+                        "confirmation": confirmation,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(created.status, 200)
+            relationship_id = json.loads(created.body)["result"][
+                "relationship_id"
+            ]
+            active_page = json.loads(
+                application.handle(
+                    "GET", "/api/v1/entity-relationships?q=甲公司"
+                ).body
+            )
+            self.assertEqual(active_page["total"], 1)
+            self.assertEqual(
+                active_page["items"][0]["retraction_confirmation"],
+                f"撤销 {relationship_id}",
+            )
+
+            restricted_retract = application.handle(
+                "POST",
+                f"/api/v1/entity-relationships/{restricted_relationship}/retract",
+                body=json.dumps(
+                    {
+                        "actor": "curator-03",
+                        "note": "尝试撤销受限关系",
+                        "confirmation": f"撤销 {restricted_relationship}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(restricted_retract.status, 403)
+            retract_route = (
+                f"/api/v1/entity-relationships/{relationship_id}/retract"
+            )
+            wrong_retraction = application.handle(
+                "POST",
+                retract_route,
+                body=json.dumps(
+                    {
+                        "actor": "curator-03",
+                        "note": "适用期结束",
+                        "confirmation": "撤销错误关系",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(wrong_retraction.status, 400)
+            retracted = application.handle(
+                "POST",
+                retract_route,
+                body=json.dumps(
+                    {
+                        "actor": "curator-03",
+                        "note": "适用期结束",
+                        "confirmation": f"撤销 {relationship_id}",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(retracted.status, 200)
+            history = json.loads(
+                application.handle(
+                    "GET", "/api/v1/entity-relationships?status=retracted"
+                ).body
+            )
+            self.assertEqual(history["total"], 1)
+            self.assertEqual(
+                history["items"][0]["relationship_id"], relationship_id
+            )
+            self.assertEqual(history["items"][0]["status"], "retracted")
 
     def test_http_server_sets_security_headers_and_binds_loopback(self):
         with tempfile.TemporaryDirectory() as temporary:

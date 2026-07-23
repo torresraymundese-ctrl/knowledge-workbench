@@ -35,6 +35,9 @@ const eventLabels = {
   entity_merge_rejected: "实体合并已驳回",
   entity_merge_approved: "实体合并已批准",
   canonical_entities_merged: "规范实体已合并",
+  entity_relation_type_created: "业务关系类型已登记",
+  entity_relationship_created: "业务关系已登记",
+  entity_relationship_retracted: "业务关系已撤销",
   worker_started: "后台工作器已启动",
   worker_stopped: "后台工作器已停止",
   labeling_session_created: "黄金标注已创建",
@@ -74,6 +77,15 @@ const entityMergeState = {
   offset: 0,
   query: "",
   entityOptions: [],
+};
+const entityRelationshipState = {
+  limit: 10,
+  offset: 0,
+  status: "active",
+  query: "",
+  entityOptions: [],
+  relationTypes: [],
+  evidenceItems: [],
 };
 const candidatePhaseLabels = {
   labeling: "标注中",
@@ -884,6 +896,242 @@ async function refreshEntityMerges() {
   }
 }
 
+function relationshipEntityOptionLabel(item) {
+  return `${item.canonical_name} · ${item.entity_type} · ${item.visibility} · ${item.evidence_count} 条证据`;
+}
+
+function updateEntityRelationshipConfirmationHint() {
+  const relationKey = document.querySelector("#entity-relationship-type").value;
+  const sourceId = document.querySelector("#entity-relationship-source").value;
+  const targetId = document.querySelector("#entity-relationship-target").value;
+  const input = document.querySelector("#entity-relationship-confirmation");
+  input.value = "";
+  input.placeholder = relationKey && sourceId && targetId
+    ? `登记 ${relationKey} ${sourceId} ${targetId}`
+    : "选择关系类型和两个实体后生成";
+}
+
+function populateEntityRelationshipOptions(page) {
+  entityRelationshipState.entityOptions = page.entity_options;
+  entityRelationshipState.relationTypes = page.relation_types;
+  const typeSelect = document.querySelector("#entity-relationship-type");
+  const sourceSelect = document.querySelector("#entity-relationship-source");
+  const targetSelect = document.querySelector("#entity-relationship-target");
+  const previousType = typeSelect.value;
+  const previousSource = sourceSelect.value;
+  const previousTarget = targetSelect.value;
+
+  typeSelect.replaceChildren(element("option", "", page.relation_types.length ? "选择关系类型" : "暂无类型，请先使用 CLI 登记"));
+  typeSelect.firstChild.value = "";
+  page.relation_types.forEach((item) => {
+    const direction = item.directed ? "有向" : "无向";
+    const option = element("option", "", `${item.label} · ${item.relation_key} · ${direction}`);
+    option.value = item.relation_key;
+    typeSelect.append(option);
+  });
+  if (page.relation_types.some((item) => item.relation_key === previousType)) typeSelect.value = previousType;
+
+  sourceSelect.replaceChildren(element("option", "", page.entity_options.length ? "选择源实体" : "暂无 Web 可见实体"));
+  sourceSelect.firstChild.value = "";
+  page.entity_options.forEach((item) => {
+    const option = element("option", "", relationshipEntityOptionLabel(item));
+    option.value = item.entity_id;
+    sourceSelect.append(option);
+  });
+  if (page.entity_options.some((item) => item.entity_id === previousSource)) sourceSelect.value = previousSource;
+
+  const targets = page.entity_options.filter((item) => item.entity_id !== sourceSelect.value);
+  targetSelect.replaceChildren(element("option", "", sourceSelect.value ? (targets.length ? "选择目标实体" : "没有可用目标实体") : "请先选择源实体"));
+  targetSelect.firstChild.value = "";
+  targets.forEach((item) => {
+    const option = element("option", "", relationshipEntityOptionLabel(item));
+    option.value = item.entity_id;
+    targetSelect.append(option);
+  });
+  if (targets.some((item) => item.entity_id === previousTarget)) targetSelect.value = previousTarget;
+  updateEntityRelationshipConfirmationHint();
+}
+
+function renderEntityRelationshipEvidence(page) {
+  entityRelationshipState.evidenceItems = page.items;
+  const root = document.querySelector("#entity-relationship-evidence");
+  root.replaceChildren();
+  document.querySelector("#entity-relationship-evidence-summary").textContent = page.total
+    ? `${page.total} 条共同证据；当前显示 ${page.items.length} 条`
+    : "没有同时关联两个实体的当前 verified 非受限证据";
+  if (!page.items.length) {
+    root.append(element("span", "muted", "暂无可选证据"));
+    return;
+  }
+  page.items.forEach((item) => {
+    const label = element("label", "relationship-evidence-option");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = item.evidence_id;
+    checkbox.name = "relationship-evidence";
+    const text = element("span");
+    text.append(
+      element("strong", "", `${item.document_name} · ${item.classification}`),
+      element("small", "", item.evidence_id),
+    );
+    label.append(checkbox, text);
+    root.append(label);
+  });
+}
+
+async function loadEntityRelationshipEvidence() {
+  const sourceId = document.querySelector("#entity-relationship-source").value;
+  const targetId = document.querySelector("#entity-relationship-target").value;
+  const root = document.querySelector("#entity-relationship-evidence");
+  if (!sourceId || !targetId) {
+    entityRelationshipState.evidenceItems = [];
+    root.replaceChildren();
+    document.querySelector("#entity-relationship-evidence-summary").textContent = "选择两个实体后读取候选";
+    updateEntityRelationshipConfirmationHint();
+    return;
+  }
+  const parameters = new URLSearchParams({
+    source_entity_id: sourceId,
+    target_entity_id: targetId,
+    limit: "50",
+  });
+  const response = await fetch(`/api/v1/entity-relationships/evidence?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `关系证据读取失败（HTTP ${response.status}）`);
+  renderEntityRelationshipEvidence(page);
+  updateEntityRelationshipConfirmationHint();
+}
+
+async function retractEntityRelationship(relationship, noteInput, confirmationInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const note = noteInput.value.trim();
+  if (!note) {
+    showBanner("撤销业务关系必须填写说明");
+    noteInput.focus();
+    return;
+  }
+  if (confirmationInput.value.trim() !== relationship.retraction_confirmation) {
+    showBanner(`撤销前必须完整输入确认短语：${relationship.retraction_confirmation}`);
+    confirmationInput.focus();
+    return;
+  }
+  if (!window.confirm(`确认撤销“${relationship.source_name} ${relationship.label} ${relationship.target_name}”？历史证据不会删除。`)) return;
+  try {
+    await postTransition(`/api/v1/entity-relationships/${encodeURIComponent(relationship.relationship_id)}/retract`, {
+      actor,
+      note,
+      confirmation: confirmationInput.value.trim(),
+    });
+    await loadDashboard();
+    showBanner(`业务关系已撤销，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "业务关系撤销失败");
+  }
+}
+
+function renderEntityRelationships(page) {
+  document.querySelector("#entity-relationship-count").textContent = `${page.total} 项`;
+  populateEntityRelationshipOptions(page);
+  const list = document.querySelector("#entity-relationship-list");
+  list.replaceChildren();
+  if (!page.items.length) {
+    list.append(element("div", "panel empty", "当前筛选没有可见业务关系"));
+  }
+  page.items.forEach((relationship) => {
+    const card = element("article", "entity-candidate-card panel");
+    const heading = element("header", "entity-candidate-heading");
+    const title = element("div");
+    title.append(
+      element("h3", "", relationship.label),
+      element("small", "", `${relationship.relationship_id} · ${relationship.relation_key}`),
+    );
+    const badges = element("div", "entity-candidate-badges");
+    badges.append(
+      element("span", "tag", relationship.directed ? "有向" : "无向"),
+      element("span", `tag ${relationship.status === "active" ? "internal" : ""}`, relationship.status === "active" ? "生效中" : "已撤销"),
+    );
+    relationship.classifications.forEach((classification) => badges.append(element("span", `tag ${classification}`, classification)));
+    heading.append(title, badges);
+
+    const route = element("div", "relationship-route");
+    const source = element("div", "entity-merge-side");
+    source.append(
+      element("small", "", "源实体"),
+      element("strong", "", relationship.source_name),
+      element("small", "", `${relationship.source_entity_type} · ${shortId(relationship.source_entity_id)}`),
+    );
+    const target = element("div", "entity-merge-side");
+    target.append(
+      element("small", "", "目标实体"),
+      element("strong", "", relationship.target_name),
+      element("small", "", `${relationship.target_entity_type} · ${shortId(relationship.target_entity_id)}`),
+    );
+    route.append(source, element("span", "entity-merge-arrow", relationship.directed ? "→" : "↔"), target);
+    const support = element(
+      "div",
+      "relationship-support",
+      `历史证据 ${relationship.supporting_evidence_count} 条 · 当前 verified ${relationship.current_verified_supporting_evidence_count} 条 · 登记人 ${relationship.created_by} · ${formatTime(relationship.created_at)}`,
+    );
+    card.append(heading, route, support);
+    if (relationship.status === "active") {
+      const retract = element("div", "relationship-retract");
+      const note = element("textarea");
+      note.maxLength = 2000;
+      note.rows = 2;
+      note.placeholder = "撤销说明（必填，仅保存 SHA-256）";
+      const confirmation = element("input");
+      confirmation.maxLength = 220;
+      confirmation.placeholder = relationship.retraction_confirmation;
+      retract.append(
+        note,
+        confirmation,
+        button("撤销关系", "danger", () => retractEntityRelationship(relationship, note, confirmation)),
+      );
+      card.append(retract);
+    } else {
+      card.append(element("div", "relationship-support", `撤销人 ${relationship.retracted_by || "未知"} · ${formatTime(relationship.retracted_at)}`));
+    }
+    list.append(card);
+  });
+
+  const pagination = document.querySelector("#entity-relationship-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    entityRelationshipState.offset = Math.max(0, page.offset - page.limit);
+    await refreshEntityRelationships();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    entityRelationshipState.offset = page.offset + page.limit;
+    await refreshEntityRelationships();
+  });
+  next.disabled = !page.has_next;
+  pagination.replaceChildren(previous, element("span", "", `第 ${pageNumber}/${pageCount} 页 · ${page.total} 项`), next);
+}
+
+async function loadEntityRelationships() {
+  const parameters = new URLSearchParams({
+    limit: String(entityRelationshipState.limit),
+    offset: String(entityRelationshipState.offset),
+    status: entityRelationshipState.status,
+  });
+  if (entityRelationshipState.query) parameters.set("q", entityRelationshipState.query);
+  const response = await fetch(`/api/v1/entity-relationships?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `业务关系读取失败（HTTP ${response.status}）`);
+  renderEntityRelationships(page);
+}
+
+async function refreshEntityRelationships() {
+  try {
+    await loadEntityRelationships();
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "业务关系读取失败");
+  }
+}
+
 function candidateSide(side, label) {
   const root = element("section", "candidate-side");
   const heading = element("div", "candidate-side-heading");
@@ -1193,7 +1441,13 @@ async function loadDashboard() {
       document.querySelector("#entity-merge-pagination").replaceChildren();
       showBanner(message);
     });
-    await Promise.all([loadReviewQueues(), candidateLoad, entityCandidateLoad, entityMergeLoad]);
+    const entityRelationshipLoad = loadEntityRelationships().catch((cause) => {
+      const message = cause instanceof Error ? cause.message : "业务关系读取失败";
+      document.querySelector("#entity-relationship-list").replaceChildren(element("div", "panel empty", message));
+      document.querySelector("#entity-relationship-pagination").replaceChildren();
+      showBanner(message);
+    });
+    await Promise.all([loadReviewQueues(), candidateLoad, entityCandidateLoad, entityMergeLoad, entityRelationshipLoad]);
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -1295,6 +1549,86 @@ document.querySelector("#clear-entity-merge-filter").addEventListener("click", a
   entityMergeState.query = "";
   entityMergeState.offset = 0;
   await refreshEntityMerges();
+});
+document.querySelector("#entity-relationship-type").addEventListener("change", updateEntityRelationshipConfirmationHint);
+document.querySelector("#entity-relationship-source").addEventListener("change", async () => {
+  populateEntityRelationshipOptions({
+    entity_options: entityRelationshipState.entityOptions,
+    relation_types: entityRelationshipState.relationTypes,
+  });
+  try { await loadEntityRelationshipEvidence(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "关系证据读取失败");
+  }
+});
+document.querySelector("#entity-relationship-target").addEventListener("change", async () => {
+  try { await loadEntityRelationshipEvidence(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "关系证据读取失败");
+  }
+});
+document.querySelector("#entity-relationship-create").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const relationKey = document.querySelector("#entity-relationship-type").value;
+  const sourceEntityId = document.querySelector("#entity-relationship-source").value;
+  const targetEntityId = document.querySelector("#entity-relationship-target").value;
+  const note = document.querySelector("#entity-relationship-note").value.trim();
+  const confirmationInput = document.querySelector("#entity-relationship-confirmation");
+  const evidenceIds = [...document.querySelectorAll('input[name="relationship-evidence"]:checked')].map((item) => item.value);
+  if (!relationKey || !sourceEntityId || !targetEntityId) {
+    showBanner("请选择关系类型、源实体和目标实体");
+    return;
+  }
+  if (!evidenceIds.length) {
+    showBanner("请至少选择一条共同 verified 证据");
+    return;
+  }
+  if (!note) {
+    showBanner("业务关系登记说明不能为空");
+    document.querySelector("#entity-relationship-note").focus();
+    return;
+  }
+  const expected = `登记 ${relationKey} ${sourceEntityId} ${targetEntityId}`;
+  if (confirmationInput.value.trim() !== expected) {
+    showBanner(`登记前必须完整输入确认短语：${expected}`);
+    confirmationInput.focus();
+    return;
+  }
+  if (!window.confirm(`确认登记该业务关系并引用 ${evidenceIds.length} 条已验证证据？`)) return;
+  try {
+    await postTransition("/api/v1/entity-relationships/create", {
+      actor,
+      relation_key: relationKey,
+      source_entity_id: sourceEntityId,
+      target_entity_id: targetEntityId,
+      evidence_ids: evidenceIds,
+      note,
+      confirmation: confirmationInput.value.trim(),
+    });
+    document.querySelector("#entity-relationship-note").value = "";
+    confirmationInput.value = "";
+    entityRelationshipState.status = "active";
+    entityRelationshipState.offset = 0;
+    await loadDashboard();
+    showBanner(`业务关系已登记，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "业务关系登记失败");
+  }
+});
+document.querySelector("#entity-relationship-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  entityRelationshipState.status = document.querySelector("#entity-relationship-status").value;
+  entityRelationshipState.query = document.querySelector("#entity-relationship-query").value.trim();
+  entityRelationshipState.offset = 0;
+  await refreshEntityRelationships();
+});
+document.querySelector("#clear-entity-relationship-filter").addEventListener("click", async () => {
+  document.querySelector("#entity-relationship-status").value = "active";
+  document.querySelector("#entity-relationship-query").value = "";
+  entityRelationshipState.status = "active";
+  entityRelationshipState.query = "";
+  entityRelationshipState.offset = 0;
+  await refreshEntityRelationships();
 });
 document.querySelector("#candidate-filters").addEventListener("submit", async (event) => {
   event.preventDefault();

@@ -89,6 +89,8 @@ class WorkbenchWebApplication:
                         "entity-candidate-reject",
                         "entity-merge-propose",
                         "entity-merge-review",
+                        "entity-relationship-create",
+                        "entity-relationship-retract",
                     ],
                 }
                 return self._json(200, payload)
@@ -167,6 +169,27 @@ class WorkbenchWebApplication:
                         query=_string_query(query, "q"),
                     ),
                 )
+            if parsed.path == "/api/v1/entity-relationships":
+                return self._json(
+                    200,
+                    self.read_service.entity_relationship_page(
+                        limit=_integer_query(query, "limit", 10),
+                        offset=_integer_query(query, "offset", 0),
+                        status=_string_query(query, "status") or "active",
+                        query=_string_query(query, "q"),
+                    ),
+                )
+            if parsed.path == "/api/v1/entity-relationships/evidence":
+                return self._json(
+                    200,
+                    self.read_service.entity_relationship_evidence_page(
+                        _string_query(query, "source_entity_id") or "",
+                        _string_query(query, "target_entity_id") or "",
+                        limit=_integer_query(query, "limit", 50),
+                        offset=_integer_query(query, "offset", 0),
+                        query=_string_query(query, "q"),
+                    ),
+                )
             candidate_pack_id = _route_entity_id(
                 parsed.path, entity="conflict-candidate-packs", action="detail"
             )
@@ -240,6 +263,12 @@ class WorkbenchWebApplication:
         entity_merge_review_id = _route_entity_id(
             path, entity="entity-merges", action="review"
         )
+        entity_relationship_create = (
+            path == "/api/v1/entity-relationships/create"
+        )
+        entity_relationship_retract_id = _route_entity_id(
+            path, entity="entity-relationships", action="retract"
+        )
         if (
             evidence_id is None
             and conflict_id is None
@@ -253,6 +282,8 @@ class WorkbenchWebApplication:
             and entity_candidate_reject_id is None
             and not entity_merge_propose
             and entity_merge_review_id is None
+            and not entity_relationship_create
+            and entity_relationship_retract_id is None
         ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
@@ -361,10 +392,27 @@ class WorkbenchWebApplication:
                     actor=actor,
                     note=str(payload.get("note", "")),
                 )
-            else:
+            elif entity_merge_review_id is not None:
                 result = self.action_service.review_entity_merge_web(
-                    entity_merge_review_id or "",
+                    entity_merge_review_id,
                     str(payload.get("decision", "")),
+                    actor=actor,
+                    note=str(payload.get("note", "")),
+                    confirmation=str(payload.get("confirmation", "")),
+                )
+            elif entity_relationship_create:
+                result = self.action_service.create_entity_relationship_web(
+                    str(payload.get("relation_key", "")),
+                    str(payload.get("source_entity_id", "")),
+                    str(payload.get("target_entity_id", "")),
+                    payload.get("evidence_ids", []),
+                    actor=actor,
+                    note=str(payload.get("note", "")),
+                    confirmation=str(payload.get("confirmation", "")),
+                )
+            else:
+                result = self.action_service.retract_entity_relationship_web(
+                    entity_relationship_retract_id or "",
                     actor=actor,
                     note=str(payload.get("note", "")),
                     confirmation=str(payload.get("confirmation", "")),

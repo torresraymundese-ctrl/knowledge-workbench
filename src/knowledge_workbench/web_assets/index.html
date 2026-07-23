@@ -21,9 +21,10 @@
         <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
         <a class="nav-item" href="#entity-candidates"><span>实体候选</span><kbd>4</kbd></a>
         <a class="nav-item" href="#entity-merges"><span>实体合并</span><kbd>5</kbd></a>
-        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>6</kbd></a>
-        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>7</kbd></a>
-        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>8</kbd></a>
+        <a class="nav-item" href="#entity-relationships"><span>业务关系</span><kbd>6</kbd></a>
+        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>7</kbd></a>
+        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>8</kbd></a>
+        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>9</kbd></a>
       </nav>
       <div class="local-lock">
         <span class="status-dot" aria-hidden="true"></span>
@@ -207,6 +208,64 @@
         <p class="entity-candidate-boundary">仅开放两个 Web 可见、同类型 active 实体。批准会归档源实体并迁移别名、证据提及和已接受候选，必须由不同于提议人的操作者复核并输入绑定请求 ID 的确认短语。</p>
         <div id="entity-merge-list" class="entity-candidate-list" aria-live="polite"></div>
         <div id="entity-merge-pagination" class="candidate-pagination panel"></div>
+      </section>
+
+      <section id="entity-relationships" aria-labelledby="entity-relationships-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">BUSINESS RELATIONSHIPS</p><h2 id="entity-relationships-title">人工业务关系</h2></div>
+          <span id="entity-relationship-count" class="count-pill">—</span>
+        </div>
+        <form id="entity-relationship-create" class="entity-relationship-create panel">
+          <label>
+            <span>关系类型</span>
+            <select id="entity-relationship-type" required></select>
+          </label>
+          <label>
+            <span>源实体</span>
+            <select id="entity-relationship-source" required></select>
+          </label>
+          <span class="merge-direction" aria-hidden="true">→</span>
+          <label>
+            <span>目标实体</span>
+            <select id="entity-relationship-target" required></select>
+          </label>
+          <div class="relationship-evidence-field">
+            <div>
+              <strong>共同 verified 证据</strong>
+              <small id="entity-relationship-evidence-summary">选择两个实体后读取候选</small>
+            </div>
+            <div id="entity-relationship-evidence" class="relationship-evidence-list"></div>
+          </div>
+          <label>
+            <span>登记说明</span>
+            <textarea id="entity-relationship-note" maxlength="2000" rows="2" required placeholder="回源核对关系语义与方向；正文只保存 SHA-256"></textarea>
+          </label>
+          <label>
+            <span>确认短语</span>
+            <input id="entity-relationship-confirmation" type="text" maxlength="300" autocomplete="off" required placeholder="选择关系类型和两个实体后生成">
+          </label>
+          <button class="primary-filter" type="submit">登记业务关系</button>
+        </form>
+        <form id="entity-relationship-filters" class="candidate-toolbar entity-relationship-toolbar" role="search">
+          <label>
+            <span>状态</span>
+            <select id="entity-relationship-status">
+              <option value="active">生效中</option>
+              <option value="retracted">已撤销</option>
+            </select>
+          </label>
+          <label>
+            <span>搜索</span>
+            <input id="entity-relationship-query" type="search" maxlength="120" placeholder="关系名、实体名、关系 ID 或登记人">
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">查询</button>
+            <button id="clear-entity-relationship-filter" type="button">清除</button>
+          </div>
+        </form>
+        <p class="entity-candidate-boundary">关系类型仍由 CLI 管理。Web 仅显示可见实体和当前 verified 非受限共同证据，不批量返回证据原文；登记与撤销均需输入绑定稳定 ID 的确认短语。</p>
+        <div id="entity-relationship-list" class="entity-candidate-list" aria-live="polite"></div>
+        <div id="entity-relationship-pagination" class="candidate-pagination panel"></div>
       </section>
 
       <section id="conflict-labeling" aria-labelledby="conflict-labeling-title">
