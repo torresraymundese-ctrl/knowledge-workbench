@@ -110,11 +110,13 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe conflict batch-status .\workspace\evaluations\cross-document-conflict-labeling-plan-实际时间.json
 # 逐批导出 Obsidian 兼容工作包；填写全部勾选项、冲突类型和 JSON 字符串意见后原子回写
 .\.venv\Scripts\knowledge.exe conflict batch-annotation-export cplan_计划ID batch_001 .\workspace\evaluations\batch_001-annotation.md --actor annotator-01
+.\.venv\Scripts\knowledge.exe conflict batch-work-pack-status .\workspace\evaluations\batch_001-annotation.md
 .\.venv\Scripts\knowledge.exe conflict batch-annotation-apply .\workspace\evaluations\batch_001-annotation.md --actor annotator-01
 # 完成全部批次后提交整包，标签随即锁定
 .\.venv\Scripts\knowledge.exe conflict submit-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor annotator-01
 # 由另一人逐批复核；全部批次完成后固化
 .\.venv\Scripts\knowledge.exe conflict batch-review-export cplan_计划ID batch_001 .\workspace\evaluations\batch_001-review.md --actor reviewer-01
+.\.venv\Scripts\knowledge.exe conflict batch-work-pack-status .\workspace\evaluations\batch_001-review.md
 .\.venv\Scripts\knowledge.exe conflict batch-review-apply .\workspace\evaluations\batch_001-review.md --actor reviewer-01
 .\.venv\Scripts\knowledge.exe conflict finalize-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json .\workspace\evaluations\cross-document-conflict-v1.json --name "真实跨文档冲突基线" --reviewer reviewer-01
 .\.venv\Scripts\knowledge.exe conflict-evaluate .\evaluation\conflict-sample.json
@@ -223,7 +225,7 @@ Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审�
 
 `conflict batch-plan` 不抽样、不复制证据原文，也不建立第二套标签文件。它只接受未截断且来源仍有效的完整候选包，按“预测类型 × 高/中/低相似度”将每个候选 ID 确定性分配到一个且仅一个小批次；相同 seed 得到相同分配。计划只能新增到 `workspace/evaluations/`，内容哈希、路径、来源包不可变身份和 seed 哈希写入审计。`batch-status` 重验计划身份、生成审计、来源当前性和全量覆盖，再从原候选包动态统计每批标注与异人复核进度，因此人工决定仍只有原候选包这一套真相源。
 
-`batch-annotation-export/apply` 和 `batch-review-export/apply` 把一个经审计批次导出为本地 Obsidian 兼容 Markdown，内含左右证据原文、定位、规则预测以及必须人工填写的决定。工作包只能位于当前 `workspace/evaluations/`，禁止覆盖，并绑定计划、批次、actor、导出路径、来源候选包 ID 与完整 SHA-256；复制文件、跨 actor 应用、遗漏或重复字段、候选增删换序以及来源包并发变化都会整体阻断。应用以单次原子替换写回原候选包，任一候选无效时本批零写入；审计只记录候选 ID、计数、工作包哈希和意见哈希，不保存原文或意见正文。由于每次应用都会改变来源候选包哈希，工作包必须逐个串行应用（批次编号次序不限）：其他批次已保存后，旧工作包应使用新路径重新导出。规则预测只用于召回和排序，不能代替人工回源判断。
+`batch-annotation-export/apply` 和 `batch-review-export/apply` 把一个经审计批次导出为本地 Obsidian 兼容 Markdown，内含左右证据原文、定位、规则预测以及必须人工填写的决定。工作包只能位于当前 `workspace/evaluations/`，禁止覆盖，并绑定计划、批次、actor、导出路径、来源候选包 ID、完整 SHA-256 和受保护模板哈希；只有决定勾选、冲突类型和对应 JSON 意见可以编辑，修改展示的原文、定位、人工标签、规则预测或其他说明会整体阻断。复制文件、跨 actor 应用、遗漏或重复字段、候选增删换序以及来源包并发变化同样不能写入。`batch-work-pack-status` 可只读检查标注或复核 Markdown 内的完成数、缺失/冲突决定、无效冲突类型、驳回意见、来源阶段、职责分离及 `apply_ready`，不写候选包或审计，也不会采纳规则预测。应用以单次原子替换写回原候选包，任一候选无效时本批零写入；审计只记录候选 ID、计数、工作包哈希和意见哈希，不保存原文或意见正文。由于每次应用都会改变来源候选包哈希，工作包必须逐个串行应用（批次编号次序不限）：其他批次已保存后，旧工作包应使用新路径重新导出。规则预测只用于召回和排序，不能代替人工回源判断。
 
 `quality status` 每次从 SQLite、经审计的冲突计划、图谱试点包和本地黄金数据集重新计算真实进度，不缓存人工决定，也不使用单一百分比掩盖不同门槛。当前共检查工作区完整性、10份黄金基线、可配置黄金扩充目标、完整冲突计划、冲突标注、异人冲突复核、图谱试点快照、证据审核、实体提及、业务关系和图谱黄金评测11项。黄金扩充门槛同时报告已批准当前资料数、当前总资料数、未覆盖资料 ID、距目标尚需批准数，以及即使全部现有资料都获批后仍至少需要新导入的数量；它不把“已导入”误报为“已批准”，也不判断演示样例是否适合作为真实黄金资料。每项独立返回 `passed/pending`、要求、实际计数和下一动作；默认扩充目标为20份。使用 `--output` 时必须提供 actor，报告只能新增到 `workspace/evaluations/`，内容哈希、门槛结果和待办 ID 写入审计，报告与审计均不包含证据原文或资料路径。
 

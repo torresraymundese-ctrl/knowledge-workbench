@@ -127,6 +127,7 @@ from .conflict_batch_workpacks import (
     apply_conflict_batch_review_pack,
     export_conflict_batch_annotation_pack,
     export_conflict_batch_review_pack,
+    inspect_conflict_batch_work_pack,
 )
 from .conflict_evaluation import evaluate_conflict_dataset
 from .citation_evaluation import evaluate_citation_dataset
@@ -689,6 +690,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="校验冲突标注批次计划并查看动态标注复核进度",
     )
     conflict_batch_status.add_argument("plan", type=Path)
+    conflict_batch_work_pack_status = conflict_sub.add_parser(
+        "batch-work-pack-status",
+        help="只读检查冲突批次标注或复核 Markdown 的完成度",
+    )
+    conflict_batch_work_pack_status.add_argument("pack", type=Path)
     conflict_batch_annotation_export = conflict_sub.add_parser(
         "batch-annotation-export",
         help="导出一个冲突批次的本地 Obsidian 标注工作包",
@@ -1989,6 +1995,12 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
     if args.conflict_command == "batch-status":
         result = inspect_conflict_labeling_plan(
             database, paths, args.plan
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.conflict_command == "batch-work-pack-status":
+        result = inspect_conflict_batch_work_pack(
+            database, paths, args.pack
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

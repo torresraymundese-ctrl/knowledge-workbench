@@ -9,6 +9,7 @@ from knowledge_workbench.conflict_batch_workpacks import (
     apply_conflict_batch_review_pack,
     export_conflict_batch_annotation_pack,
     export_conflict_batch_review_pack,
+    inspect_conflict_batch_work_pack,
 )
 from knowledge_workbench.conflict_candidates import (
     create_cross_document_candidate_pack,
@@ -83,6 +84,36 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
             )
             self.assertIn("规则预测只用于召回与排序", content)
             self.assertIn("甲项目年度预算", content)
+            with database.connect() as connection:
+                audit_count_before_status = connection.execute(
+                    "SELECT COUNT(*) FROM audit_log"
+                ).fetchone()[0]
+            blank_status = inspect_conflict_batch_work_pack(
+                database, paths, first_path
+            )
+            self.assertEqual(
+                blank_status["work_pack_type"], "annotation"
+            )
+            self.assertEqual(
+                blank_status["candidate_count"],
+                len(first_batch["candidate_ids"]),
+            )
+            self.assertEqual(
+                blank_status["decision_counts"]["undecided"],
+                len(first_batch["candidate_ids"]),
+            )
+            self.assertTrue(blank_status["integrity_valid"])
+            self.assertEqual(
+                blank_status["source_phase"], "labeling"
+            )
+            self.assertFalse(blank_status["apply_ready"])
+            with database.connect() as connection:
+                audit_count_after_status = connection.execute(
+                    "SELECT COUNT(*) FROM audit_log"
+                ).fetchone()[0]
+            self.assertEqual(
+                audit_count_after_status, audit_count_before_status
+            )
 
             incomplete = self._fill_annotation_pack(
                 content,
@@ -90,6 +121,13 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 first_batch["candidate_ids"][:-1],
             )
             first_path.write_text(incomplete, encoding="utf-8")
+            incomplete_status = inspect_conflict_batch_work_pack(
+                database, paths, first_path
+            )
+            self.assertEqual(
+                incomplete_status["remaining_decision_count"], 1
+            )
+            self.assertFalse(incomplete_status["apply_ready"])
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "必须且只能选择"
             ):
@@ -107,6 +145,15 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 first_batch["candidate_ids"],
             )
             first_path.write_text(complete, encoding="utf-8")
+            ready_status = inspect_conflict_batch_work_pack(
+                database, paths, first_path
+            )
+            self.assertEqual(
+                ready_status["complete_decision_count"],
+                len(first_batch["candidate_ids"]),
+            )
+            self.assertEqual(ready_status["issue_codes"], [])
+            self.assertTrue(ready_status["apply_ready"])
             copied = paths.evaluations / "copied-annotation.md"
             copied.write_text(complete, encoding="utf-8")
             with self.assertRaisesRegex(
@@ -148,6 +195,14 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
             stale_second_path.write_text(
                 stale_content, encoding="utf-8"
             )
+            stale_status = inspect_conflict_batch_work_pack(
+                database, paths, stale_second_path
+            )
+            self.assertFalse(stale_status["integrity_valid"])
+            self.assertIn(
+                "source_content_drift", stale_status["issue_codes"]
+            )
+            self.assertFalse(stale_status["apply_ready"])
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "重新导出"
             ):
@@ -219,6 +274,16 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 first_batch["candidate_ids"],
             )
             review_path.write_text(review_content, encoding="utf-8")
+            review_status = inspect_conflict_batch_work_pack(
+                database, paths, review_path
+            )
+            self.assertEqual(review_status["work_pack_type"], "review")
+            self.assertTrue(review_status["actor_separation_valid"])
+            self.assertEqual(
+                review_status["complete_decision_count"],
+                len(first_batch["candidate_ids"]),
+            )
+            self.assertTrue(review_status["apply_ready"])
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "复核人.*actor"
             ):
@@ -332,6 +397,28 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 candidate_pack,
                 plan["batches"][0]["candidate_ids"],
             )
+            protected_tamper = completed.replace(
+                "甲项目年度预算", "伪造项目年度预算", 1
+            )
+            output.write_text(protected_tamper, encoding="utf-8")
+            tamper_status = inspect_conflict_batch_work_pack(
+                database, paths, output
+            )
+            self.assertFalse(tamper_status["integrity_valid"])
+            self.assertIn(
+                "export_audit_or_template_invalid",
+                tamper_status["issue_codes"],
+            )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "受保护内容"
+            ):
+                apply_conflict_batch_annotation_pack(
+                    database,
+                    paths,
+                    output,
+                    actor="annotator-01",
+                )
+
             tampered = completed.replace(
                 plan["batches"][0]["candidate_ids"][0],
                 "xdoc_00000000000000000000",

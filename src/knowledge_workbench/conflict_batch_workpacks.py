@@ -160,6 +160,7 @@ def apply_conflict_batch_annotation_pack(
         database,
         paths,
         pack_path,
+        content,
         metadata,
         actor=actor,
         event_type="conflict_batch_annotation_pack_exported",
@@ -332,6 +333,7 @@ def apply_conflict_batch_review_pack(
         database,
         paths,
         pack_path,
+        content,
         metadata,
         actor=actor,
         event_type="conflict_batch_review_pack_exported",
@@ -362,6 +364,264 @@ def apply_conflict_batch_review_pack(
         work_pack_sha256=sha256_text(content),
         actor=actor,
     )
+
+
+def inspect_conflict_batch_work_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    pack_path: Path,
+) -> dict[str, Any]:
+    """Inspect annotation or review progress without changing labels."""
+    pack_path, content = _read_work_pack(
+        paths, pack_path, "冲突批次工作包"
+    )
+    relative_path = pack_path.relative_to(
+        paths.root.resolve()
+    ).as_posix()
+    base = {
+        "schema_version": "1.0",
+        "kind": "conflict-batch-work-pack-status",
+        "work_pack_path": relative_path,
+        "content_sha256": sha256_text(content),
+    }
+    try:
+        metadata, lines, start = _parse_frontmatter(content, None)
+        pack_type = metadata.get("type")
+        if pack_type == _ANNOTATION_PACK_TYPE:
+            role_key = "annotator"
+            event_type = "conflict_batch_annotation_pack_exported"
+            first_label = "冲突"
+            second_label = "非冲突"
+            type_label = "冲突类型"
+            note_label = "标注依据 JSON"
+            first_key = "conflict"
+            second_key = "non_conflict"
+            required_metadata = (
+                "plan_id",
+                "batch_id",
+                "source_pack_id",
+                "source_content_sha256",
+                "annotator",
+            )
+        elif pack_type == _REVIEW_PACK_TYPE:
+            role_key = "reviewer"
+            event_type = "conflict_batch_review_pack_exported"
+            first_label = "批准人工标签"
+            second_label = "驳回人工标签"
+            type_label = None
+            note_label = "复核意见 JSON"
+            first_key = "approve"
+            second_key = "reject"
+            required_metadata = (
+                "plan_id",
+                "batch_id",
+                "source_pack_id",
+                "source_content_sha256",
+                "annotator",
+                "reviewer",
+            )
+        else:
+            raise KnowledgeWorkbenchError(
+                "文件不是预期的冲突批次工作包"
+            )
+        _require_metadata(metadata, required_metadata)
+        actor = _required_actor(metadata[role_key])
+        records = _parse_candidate_sections(
+            lines,
+            start,
+            approved_label=first_label,
+            rejected_label=second_label,
+            type_label=type_label,
+            note_label=note_label,
+        )
+    except KnowledgeWorkbenchError as exc:
+        return {
+            **base,
+            "work_pack_type": "unknown",
+            "integrity_valid": False,
+            "apply_ready": False,
+            "issue_codes": ["invalid_work_pack_format"],
+            "error": str(exc),
+        }
+
+    first_only = [
+        (candidate_id, record)
+        for candidate_id, record in records
+        if record["approved"] and not record["rejected"]
+    ]
+    second_only = [
+        (candidate_id, record)
+        for candidate_id, record in records
+        if record["rejected"] and not record["approved"]
+    ]
+    undecided = [
+        (candidate_id, record)
+        for candidate_id, record in records
+        if not record["approved"] and not record["rejected"]
+    ]
+    conflicting = [
+        (candidate_id, record)
+        for candidate_id, record in records
+        if record["approved"] and record["rejected"]
+    ]
+    invalid_type_ids: list[str] = []
+    missing_note_ids: list[str] = []
+    complete_ids: set[str] = set()
+    if pack_type == _ANNOTATION_PACK_TYPE:
+        for candidate_id, record in first_only:
+            if record["type"] in {"polarity_change", "value_change"}:
+                complete_ids.add(candidate_id)
+            else:
+                invalid_type_ids.append(candidate_id)
+        for candidate_id, record in second_only:
+            if record["type"] == "null":
+                complete_ids.add(candidate_id)
+            else:
+                invalid_type_ids.append(candidate_id)
+    else:
+        complete_ids.update(
+            candidate_id for candidate_id, _ in first_only
+        )
+        for candidate_id, record in second_only:
+            if record["note"]:
+                complete_ids.add(candidate_id)
+            else:
+                missing_note_ids.append(candidate_id)
+    unresolved_ids = [
+        candidate_id
+        for candidate_id, _ in records
+        if candidate_id not in complete_ids
+    ]
+    scope_records = [
+        {"candidate_id": candidate_id}
+        for candidate_id, _ in records
+    ]
+
+    validation_errors: dict[str, str] = {}
+    batch = None
+    try:
+        batch = resolve_conflict_labeling_batch(
+            database,
+            paths,
+            metadata["plan_id"],
+            metadata["batch_id"],
+        )
+        _validate_work_pack_scope(metadata, batch, scope_records)
+    except KnowledgeWorkbenchError as exc:
+        validation_errors["scope"] = str(exc)
+    try:
+        _validate_export_audit(
+            database,
+            paths,
+            pack_path,
+            content,
+            metadata,
+            actor=actor,
+            event_type=event_type,
+        )
+    except KnowledgeWorkbenchError as exc:
+        validation_errors["export_audit"] = str(exc)
+    source_pack = None
+    try:
+        source_path, source_pack = _candidate_pack_by_id(
+            paths, metadata["source_pack_id"]
+        )
+        _require_source_sha256(
+            source_path, metadata["source_content_sha256"]
+        )
+    except KnowledgeWorkbenchError as exc:
+        validation_errors["source_content"] = str(exc)
+
+    phase = None
+    phase_valid = False
+    submission_actor_valid = pack_type != _REVIEW_PACK_TYPE
+    actor_separation_valid = (
+        pack_type != _REVIEW_PACK_TYPE
+        or metadata["annotator"] != metadata["reviewer"]
+    )
+    if source_pack is not None and "source_content" not in validation_errors:
+        submission, drifted = _candidate_submission_state(
+            database, source_pack
+        )
+        phase = _candidate_pack_phase(
+            submission, drifted, _candidate_counts(source_pack)
+        )
+        if pack_type == _ANNOTATION_PACK_TYPE:
+            phase_valid = phase == "labeling"
+        else:
+            phase_valid = phase in {"reviewing", "reviewed"}
+            submission_actor_valid = (
+                submission is not None
+                and submission["actor"] == metadata["annotator"]
+            )
+
+    integrity_valid = not validation_errors
+    issue_codes = []
+    if "scope" in validation_errors:
+        issue_codes.append("scope_invalid")
+    if "export_audit" in validation_errors:
+        issue_codes.append("export_audit_or_template_invalid")
+    if "source_content" in validation_errors:
+        issue_codes.append("source_content_drift")
+    if not phase_valid:
+        issue_codes.append("source_phase_invalid")
+    if undecided:
+        issue_codes.append("decision_missing")
+    if conflicting:
+        issue_codes.append("decision_conflicting")
+    if invalid_type_ids:
+        issue_codes.append("conflict_type_invalid")
+    if missing_note_ids:
+        issue_codes.append("required_note_missing")
+    if not actor_separation_valid:
+        issue_codes.append("actor_separation_conflict")
+    if not submission_actor_valid:
+        issue_codes.append("annotator_audit_mismatch")
+
+    apply_ready = (
+        integrity_valid
+        and phase_valid
+        and actor_separation_valid
+        and submission_actor_valid
+        and not unresolved_ids
+    )
+    payload = {
+        **base,
+        "work_pack_type": (
+            "annotation"
+            if pack_type == _ANNOTATION_PACK_TYPE
+            else "review"
+        ),
+        "plan_id": metadata["plan_id"],
+        "batch_id": metadata["batch_id"],
+        "source_pack_id": metadata["source_pack_id"],
+        "actor_role": role_key,
+        "actor": actor,
+        "candidate_count": len(records),
+        "decision_counts": {
+            first_key: len(first_only),
+            second_key: len(second_only),
+            "undecided": len(undecided),
+            "conflicting": len(conflicting),
+        },
+        "complete_decision_count": len(complete_ids),
+        "remaining_decision_count": len(unresolved_ids),
+        "invalid_conflict_type_count": len(invalid_type_ids),
+        "missing_required_note_count": len(missing_note_ids),
+        "integrity_valid": integrity_valid,
+        "source_phase": phase,
+        "source_phase_valid": phase_valid,
+        "actor_separation_valid": actor_separation_valid,
+        "submission_actor_valid": submission_actor_valid,
+        "next_unresolved_candidate_id": (
+            unresolved_ids[0] if unresolved_ids else None
+        ),
+        "issue_codes": issue_codes,
+        "apply_ready": apply_ready,
+    }
+    if validation_errors:
+        payload["validation_errors"] = validation_errors
+    return payload
 
 
 def _resolved_source(
@@ -515,7 +775,7 @@ def _parse_review_pack(
 
 
 def _parse_frontmatter(
-    content: str, expected_type: str
+    content: str, expected_type: str | None
 ) -> tuple[dict[str, str], list[str], int]:
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -535,7 +795,7 @@ def _parse_frontmatter(
         if ":" in line:
             key, value = line.split(":", 1)
             metadata[key.strip()] = value.strip()
-    if metadata.get("type") != expected_type:
+    if expected_type is not None and metadata.get("type") != expected_type:
         raise KnowledgeWorkbenchError("文件不是预期的系统工作包")
     return metadata, lines, end + 1
 
@@ -685,6 +945,7 @@ def _validate_export_audit(
     database: Database,
     paths: WorkspacePaths,
     pack_path: Path,
+    work_pack_content: str,
     metadata: dict[str, str],
     *,
     actor: str,
@@ -693,6 +954,9 @@ def _validate_export_audit(
     relative_path = pack_path.relative_to(
         paths.root.resolve()
     ).as_posix()
+    template_sha256 = _editable_template_sha256(
+        work_pack_content, event_type
+    )
     entity_id = _batch_entity_id(
         metadata["plan_id"], metadata["batch_id"]
     )
@@ -718,10 +982,12 @@ def _validate_export_audit(
             == metadata["source_pack_id"]
             and details.get("source_content_sha256")
             == metadata["source_content_sha256"]
+            and details.get("template_sha256") == template_sha256
         ):
             return
     raise KnowledgeWorkbenchError(
-        "工作包缺少匹配的系统导出审计记录"
+        "工作包缺少匹配的系统导出审计记录，"
+        "或修改了决定字段以外的受保护内容"
     )
 
 
@@ -748,6 +1014,9 @@ def _write_export(
                     paths.root.resolve()
                 ).as_posix(),
                 "content_sha256": sha256_text(content),
+                "template_sha256": _editable_template_sha256(
+                    content, event_type
+                ),
                 "plan_id": plan_id,
                 "batch_id": batch_id,
                 "source_pack_id": source_pack_id,
@@ -770,6 +1039,54 @@ def _write_export(
 
 def _batch_entity_id(plan_id: str, batch_id: str) -> str:
     return f"{plan_id}:{batch_id}"
+
+
+def _editable_template_sha256(content: str, event_type: str) -> str:
+    if event_type == "conflict_batch_annotation_pack_exported":
+        checkbox_labels = ("冲突", "非冲突")
+        editable_patterns = (
+            (
+                re.compile(r"^-\s+冲突类型：`[^`]+`\s*$"),
+                "- 冲突类型：`null`",
+            ),
+            (
+                re.compile(r"^-\s+标注依据 JSON：.*$"),
+                '- 标注依据 JSON：""',
+            ),
+        )
+    elif event_type == "conflict_batch_review_pack_exported":
+        checkbox_labels = ("批准人工标签", "驳回人工标签")
+        editable_patterns = (
+            (
+                re.compile(r"^-\s+复核意见 JSON：.*$"),
+                '- 复核意见 JSON：""',
+            ),
+        )
+    else:
+        raise KnowledgeWorkbenchError("未知的冲突批次工作包类型")
+    checkbox_patterns = [
+        (
+            re.compile(
+                rf"^-\s+\[[ xX]\]\s+{re.escape(label)}\s*$"
+            ),
+            f"- [ ] {label}",
+        )
+        for label in checkbox_labels
+    ]
+    normalized = []
+    for line in content.splitlines():
+        replacement = None
+        for pattern, value in checkbox_patterns:
+            if pattern.match(line):
+                replacement = value
+                break
+        if replacement is None:
+            for pattern, value in editable_patterns:
+                if pattern.match(line):
+                    replacement = value
+                    break
+        normalized.append(replacement if replacement is not None else line)
+    return sha256_text("\n".join(normalized).rstrip() + "\n")
 
 
 def _require_metadata(
