@@ -38,6 +38,13 @@ from .entity_candidates import (
     list_entity_candidates,
     reject_entity_candidate,
 )
+from .entity_merges import (
+    MERGE_REQUEST_STATUSES,
+    MERGE_REVIEW_DECISIONS,
+    list_entity_merge_requests,
+    propose_entity_merge,
+    review_entity_merge,
+)
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
 from .ingest import ingest_file, initialize_workspace
@@ -209,6 +216,29 @@ def build_parser() -> argparse.ArgumentParser:
     entity_reject.add_argument("candidate_id")
     entity_reject.add_argument("--actor", required=True)
     entity_reject.add_argument("--note", required=True)
+    entity_merge_propose = entity_sub.add_parser(
+        "merge-propose", help="提交两个同类型规范实体的人工合并复核"
+    )
+    entity_merge_propose.add_argument("source_entity_id")
+    entity_merge_propose.add_argument("target_entity_id")
+    entity_merge_propose.add_argument("--actor", required=True)
+    entity_merge_propose.add_argument("--note", required=True, help="合并提议说明")
+    entity_merge_list = entity_sub.add_parser(
+        "merge-list", help="列出实体合并复核请求"
+    )
+    entity_merge_list.add_argument(
+        "--status", choices=MERGE_REQUEST_STATUSES, default="reviewing"
+    )
+    entity_merge_list.add_argument("--limit", type=int, default=50)
+    entity_merge_review = entity_sub.add_parser(
+        "merge-review", help="由不同操作者批准或驳回实体合并"
+    )
+    entity_merge_review.add_argument("request_id")
+    entity_merge_review.add_argument(
+        "--decision", required=True, choices=MERGE_REVIEW_DECISIONS
+    )
+    entity_merge_review.add_argument("--actor", required=True)
+    entity_merge_review.add_argument("--note", required=True, help="必填复核意见")
 
     graph = subparsers.add_parser("graph", help="只读投影人工确认实体的证据共现图")
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
@@ -694,6 +724,9 @@ def _status(database, paths: WorkspacePaths) -> None:
             "pending_entity_candidates": connection.execute(
                 "SELECT COUNT(*) FROM entity_candidates WHERE status = 'pending'"
             ).fetchone()[0],
+            "reviewing_entity_merges": connection.execute(
+                "SELECT COUNT(*) FROM entity_merge_requests WHERE status = 'reviewing'"
+            ).fetchone()[0],
         }
     print(f"工作区：{paths.root}")
     _print_mapping(counts)
@@ -780,6 +813,42 @@ def _handle_evidence(args, database) -> None:
 
 
 def _handle_entity(args, database) -> None:
+    if args.entity_command == "merge-propose":
+        request_id = propose_entity_merge(
+            database,
+            args.source_entity_id,
+            args.target_entity_id,
+            actor=args.actor,
+            note=args.note,
+        )
+        print(f"实体合并已提交复核：{request_id}")
+        return
+    if args.entity_command == "merge-list":
+        rows = list_entity_merge_requests(
+            database, status=args.status, limit=args.limit
+        )
+        if not rows:
+            print("暂无实体合并复核请求。")
+            return
+        for row in rows:
+            print(
+                f"{row['id']}  [{row['status']}/{row['entity_type']}]  "
+                f"{row['source_name']} ({row['source_entity_id']}) -> "
+                f"{row['target_name']} ({row['target_entity_id']})  "
+                f"proposed_by={row['proposed_by']}"
+            )
+        return
+    if args.entity_command == "merge-review":
+        _print_mapping(
+            review_entity_merge(
+                database,
+                args.request_id,
+                args.decision,
+                actor=args.actor,
+                note=args.note,
+            )
+        )
+        return
     if args.entity_command == "import-candidates":
         _print_mapping(
             import_entity_candidates(database, args.analysis, actor=args.actor)

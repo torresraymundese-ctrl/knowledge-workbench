@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 SCHEMA = """
@@ -483,6 +483,50 @@ CREATE INDEX idx_entity_candidates_evidence
 """
 
 
+MIGRATION_11 = """
+ALTER TABLE entity_aliases
+    ADD COLUMN is_merge_anchor INTEGER NOT NULL DEFAULT 0
+    CHECK (is_merge_anchor IN (0, 1));
+
+CREATE TABLE entity_merge_requests (
+    id TEXT PRIMARY KEY,
+    source_entity_id TEXT NOT NULL REFERENCES canonical_entities(id),
+    target_entity_id TEXT NOT NULL REFERENCES canonical_entities(id),
+    entity_type TEXT NOT NULL CHECK (
+        entity_type IN (
+            'person', 'organization', 'project', 'product',
+            'location', 'concept', 'other'
+        )
+    ),
+    status TEXT NOT NULL DEFAULT 'reviewing' CHECK (
+        status IN ('reviewing', 'merged', 'rejected')
+    ),
+    proposed_by TEXT NOT NULL CHECK (length(trim(proposed_by)) > 0),
+    proposal_note_sha256 TEXT NOT NULL CHECK (length(proposal_note_sha256) = 64),
+    reviewed_by TEXT,
+    review_note_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    CHECK (source_entity_id != target_entity_id),
+    CHECK (
+        (status = 'reviewing' AND reviewed_by IS NULL
+         AND review_note_sha256 IS NULL AND reviewed_at IS NULL)
+        OR
+        (status IN ('merged', 'rejected') AND reviewed_by IS NOT NULL
+         AND review_note_sha256 IS NOT NULL AND reviewed_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_entity_merge_requests_review
+    ON entity_merge_requests(status, created_at, id);
+CREATE INDEX idx_entity_merge_requests_source
+    ON entity_merge_requests(source_entity_id, status);
+CREATE INDEX idx_entity_merge_requests_target
+    ON entity_merge_requests(target_entity_id, status);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -580,6 +624,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (10, applied_at),
+                )
+                applied.add(10)
+            if 11 not in applied:
+                connection.executescript(MIGRATION_11)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (11, applied_at),
                 )
 
     @contextmanager

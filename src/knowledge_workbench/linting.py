@@ -29,6 +29,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
     checked_entities = 0
     checked_entity_mentions = 0
     checked_entity_candidates = 0
+    checked_entity_merge_requests = 0
     labeling_sessions = []
     with database.connect() as connection:
         foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -58,11 +59,14 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
         ).fetchall()
         entities = connection.execute(
             """
-            SELECT ce.id, ce.canonical_name, ce.normalized_name,
+            SELECT ce.id, ce.canonical_name, ce.normalized_name, ce.status,
                    SUM(CASE WHEN ea.is_canonical = 1 THEN 1 ELSE 0 END)
                        AS canonical_alias_count,
                    MAX(CASE WHEN ea.is_canonical = 1 THEN ea.normalized_alias END)
-                       AS canonical_alias_normalized
+                       AS canonical_alias_normalized,
+                   (SELECT COUNT(*) FROM entity_merge_requests emr
+                    WHERE emr.source_entity_id = ce.id
+                      AND emr.status = 'merged') AS merged_as_source_count
             FROM canonical_entities ce
             LEFT JOIN entity_aliases ea ON ea.entity_id = ce.id
             GROUP BY ce.id
@@ -71,17 +75,33 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
         ).fetchall()
         checked_entities = len(entities)
         for entity in entities:
-            if (
+            normalized_name_valid = (
+                normalize_entity_name(entity["canonical_name"])
+                == entity["normalized_name"]
+            )
+            if entity["status"] == "active" and (
                 entity["canonical_alias_count"] != 1
                 or entity["canonical_alias_normalized"] != entity["normalized_name"]
-                or normalize_entity_name(entity["canonical_name"])
-                != entity["normalized_name"]
+                or not normalized_name_valid
+                or entity["merged_as_source_count"] != 0
             ):
                 issues.append(
                     LintIssue(
                         "canonical_entity_alias_invalid",
                         entity["id"],
                         "规范实体必须有且仅有一个与规范名称一致的 canonical 别名",
+                    )
+                )
+            if entity["status"] == "archived" and (
+                entity["canonical_alias_count"] != 0
+                or not normalized_name_valid
+                or entity["merged_as_source_count"] != 1
+            ):
+                issues.append(
+                    LintIssue(
+                        "merged_entity_archive_invalid",
+                        entity["id"],
+                        "已归档实体必须由一次已批准合并产生且不再持有别名",
                     )
                 )
         mentions = connection.execute(
@@ -152,6 +172,67 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
                         "accepted_entity_candidate_link_missing",
                         candidate["id"],
                         "已接受实体候选缺少对应别名或证据关联",
+                    )
+                )
+        merge_requests = connection.execute(
+            """
+            SELECT emr.*, source.entity_type AS source_type,
+                   source.status AS source_status,
+                   target.entity_type AS target_type,
+                   target.status AS target_status,
+                   (SELECT COUNT(*) FROM entity_aliases ea
+                    WHERE ea.entity_id = emr.source_entity_id) AS source_alias_count,
+                   (SELECT COUNT(*) FROM evidence_entity_mentions eem
+                    WHERE eem.entity_id = emr.source_entity_id)
+                       AS source_mention_count,
+                   (SELECT COUNT(*) FROM entity_candidates ec
+                    WHERE ec.status = 'accepted'
+                      AND ec.resolved_entity_id = emr.source_entity_id)
+                       AS source_candidate_count
+            FROM entity_merge_requests emr
+            JOIN canonical_entities source ON source.id = emr.source_entity_id
+            JOIN canonical_entities target ON target.id = emr.target_entity_id
+            ORDER BY emr.id
+            """
+        ).fetchall()
+        checked_entity_merge_requests = len(merge_requests)
+        for request in merge_requests:
+            type_valid = (
+                request["source_type"] == request["entity_type"]
+                and request["target_type"] == request["entity_type"]
+            )
+            if request["proposed_by"] == request["reviewed_by"]:
+                issues.append(
+                    LintIssue(
+                        "entity_merge_same_reviewer",
+                        request["id"],
+                        "实体合并提议人不能复核自己的请求",
+                    )
+                )
+            if request["status"] == "reviewing" and (
+                not type_valid
+                or request["source_status"] != "active"
+                or request["target_status"] != "active"
+            ):
+                issues.append(
+                    LintIssue(
+                        "entity_merge_reviewing_invalid",
+                        request["id"],
+                        "待复核实体合并的两端必须仍为同类型 active 实体",
+                    )
+                )
+            if request["status"] == "merged" and (
+                not type_valid
+                or request["source_status"] != "archived"
+                or request["source_alias_count"] != 0
+                or request["source_mention_count"] != 0
+                or request["source_candidate_count"] != 0
+            ):
+                issues.append(
+                    LintIssue(
+                        "entity_merge_projection_invalid",
+                        request["id"],
+                        "已合并源实体仍持有别名、提及或候选指向，或归档状态不正确",
                     )
                 )
         for document in documents:
@@ -262,6 +343,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
             "canonical_entity_count": checked_entities,
             "entity_evidence_mention_count": checked_entity_mentions,
             "entity_candidate_count": checked_entity_candidates,
+            "entity_merge_request_count": checked_entity_merge_requests,
         },
         "issues": [asdict(issue) for issue in issues],
     }

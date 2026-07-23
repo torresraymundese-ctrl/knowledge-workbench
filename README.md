@@ -51,6 +51,10 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe entity candidate-list --status pending
 .\.venv\Scripts\knowledge.exe entity accept-candidate entitycand_复制实际候选ID entity_复制实际实体ID --actor reviewer-01
 .\.venv\Scripts\knowledge.exe entity reject-candidate entitycand_复制实际候选ID --note "非同一实体" --actor reviewer-01
+.\.venv\Scripts\knowledge.exe entity merge-propose entity_源实体ID entity_目标实体ID --note "人工核对为同一实体" --actor curator-01
+.\.venv\Scripts\knowledge.exe entity merge-list --status reviewing
+# 必须由不同于提议人的操作者复核
+.\.venv\Scripts\knowledge.exe entity merge-review entitymerge_复制实际请求ID --decision approve --note "已回源确认" --actor reviewer-02
 .\.venv\Scripts\knowledge.exe graph project
 .\.venv\Scripts\knowledge.exe graph project --entity-id entity_复制实际实体ID
 # 仅用于审核中的探索视图；显式加入 draft/reviewing/conflicted，仍排除 restricted
@@ -113,6 +117,8 @@ SQLite Schema v8 支持一条证据正文对应多个来源定位。`faithful-sc
 SQLite Schema v9 增加人工确认的实体规范化基础层。规范实体创建时自动登记规范名称别名；同一实体类型中的规范化别名只能指向一个实体，不能自动一名多指。证据关联只接受当前文件版本、当前处理运行中的证据，并要求 `--mention` 逐字存在于证据原文且已登记为该实体别名。创建、别名增删和证据关联/解除均要求 actor 并写审计，审计只保存名称或提及哈希；DeepSeek 输出不会自动创建、合并或关联规范实体。
 
 SQLite Schema v10 增加模型实体候选队列。`entity import-candidates` 只读取已存在的 `model_assisted` 阶段一 JSON，不触发模型调用；导入前重验 JSON Schema、来源文件版本、SHA-256、密级和当前处理运行，并按逐字 excerpt 映射数据库证据。候选保持 `pending`，只有人工用 `accept-candidate` 明确选择现有规范实体后，系统才会原子登记无歧义别名并创建证据关联；非逐字候选、过期来源和别名冲突不能接受。`rejected` 和 `accepted` 都是不可重复裁决的终态，复核意见只以 SHA-256 进入数据库与审计。
+
+SQLite Schema v11 增加人工实体合并复核。`merge-propose` 只登记人工选择的同类型源实体和目标实体，不运行相似度模型、不自动合并，并要求提议说明；请求进入 `reviewing` 后只能由不同 actor 用 `merge-review` 批准或驳回。批准时系统在单一事务中把源实体的全部别名、证据逐字提及和已接受模型候选指向迁移到目标实体，再归档源实体；源实体原规范名称成为不可删除、可继续随链式合并迁移的 merge anchor。旧实体 ID、源目标方向、提议人、复核人和哈希意见永久保留在合并请求与审计中。类型变化、实体已归档、并发重复请求、同人自审或任何别名/外键完整性错误都会阻断并整体回滚。合并不删除证据、不修改原文，也不自动建立业务关系。
 
 `graph project` 是不落库的确定性实体共现投影。节点只来自 active 规范实体，边只表示两个实体逐字出现在同一条当前原子证据中，不代表因果、隶属、依赖或其他业务关系。默认只消费 `verified` 证据；`--include-unverified` 仅用于审核探索，会额外加入 draft、reviewing 和 conflicted，但 deprecated、archived 以及所有 `restricted` 支持始终排除。输出只包含实体、状态/密级集合和支持证据 ID，不包含证据原文，也不提供文件导出。
 

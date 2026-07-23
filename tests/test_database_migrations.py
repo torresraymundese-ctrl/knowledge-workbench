@@ -89,7 +89,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations"
                     ).fetchall()
                 }
-                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
                 run = connection.execute(
                     "SELECT * FROM processing_runs WHERE document_version_id = 'ver_1'"
                 ).fetchone()
@@ -140,7 +140,8 @@ class DatabaseMigrationTests(unittest.TestCase):
                         SELECT name FROM sqlite_master
                         WHERE type = 'table' AND name IN (
                             'canonical_entities', 'entity_aliases',
-                            'evidence_entity_mentions', 'entity_candidates'
+                            'evidence_entity_mentions', 'entity_candidates',
+                            'entity_merge_requests'
                         )
                         """
                     ).fetchall()
@@ -152,8 +153,16 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "entity_aliases",
                         "evidence_entity_mentions",
                         "entity_candidates",
+                        "entity_merge_requests",
                     },
                 )
+                alias_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(entity_aliases)"
+                    ).fetchall()
+                }
+                self.assertIn("is_merge_anchor", alias_columns)
 
             database.initialize("t5-repeat")
             with database.connect() as connection:
@@ -184,6 +193,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM schema_migrations WHERE version = 10"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 11"
                     ).fetchone()[0],
                     1,
                 )

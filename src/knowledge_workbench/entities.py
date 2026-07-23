@@ -161,7 +161,7 @@ def remove_entity_alias(
             entity = _active_entity(connection, entity_id)
             row = connection.execute(
                 """
-                SELECT id, is_canonical FROM entity_aliases
+                SELECT id, is_canonical, is_merge_anchor FROM entity_aliases
                 WHERE entity_id = ? AND entity_type = ? AND normalized_alias = ?
                 """,
                 (entity_id, entity["entity_type"], normalized_alias),
@@ -170,6 +170,8 @@ def remove_entity_alias(
                 raise KnowledgeWorkbenchError("该实体没有此别名")
             if row["is_canonical"]:
                 raise KnowledgeWorkbenchError("规范实体名称不能作为普通别名移除")
+            if row["is_merge_anchor"]:
+                raise KnowledgeWorkbenchError("已合并源实体的规范名称别名不能移除")
             connection.execute("DELETE FROM entity_aliases WHERE id = ?", (row["id"],))
             record_event(
                 connection,
@@ -319,7 +321,13 @@ def list_entities(
                     JOIN document_versions dv ON dv.id = e.document_version_id
                     JOIN documents d
                       ON d.id = dv.document_id AND d.current_version_id = dv.id
-                    WHERE eem.entity_id = ce.id) AS current_evidence_count
+                    WHERE eem.entity_id = ce.id) AS current_evidence_count,
+                   (SELECT emr.target_entity_id
+                     FROM entity_merge_requests emr
+                     WHERE emr.source_entity_id = ce.id
+                       AND emr.status = 'merged'
+                     ORDER BY emr.reviewed_at DESC, emr.id DESC LIMIT 1)
+                       AS merged_into_entity_id
             FROM canonical_entities ce
             {where}
             ORDER BY ce.updated_at DESC, ce.canonical_name
@@ -339,7 +347,7 @@ def get_entity(database: Database, entity_id: str) -> dict:
             raise KnowledgeWorkbenchError("规范实体不存在")
         aliases = connection.execute(
             """
-            SELECT id, alias, is_canonical, created_by, created_at
+            SELECT id, alias, is_canonical, is_merge_anchor, created_by, created_at
             FROM entity_aliases WHERE entity_id = ?
             ORDER BY is_canonical DESC, normalized_alias
             """,
@@ -358,9 +366,20 @@ def get_entity(database: Database, entity_id: str) -> dict:
             """,
             (entity_id,),
         ).fetchone()[0]
+        merged_into_entity_id = connection.execute(
+            """
+            SELECT target_entity_id FROM entity_merge_requests
+            WHERE source_entity_id = ? AND status = 'merged'
+            ORDER BY reviewed_at DESC, id DESC LIMIT 1
+            """,
+            (entity_id,),
+        ).fetchone()
     payload = dict(entity)
     payload["aliases"] = [dict(row) for row in aliases]
     payload["current_evidence_count"] = current_evidence_count
+    payload["merged_into_entity_id"] = (
+        merged_into_entity_id[0] if merged_into_entity_id else None
+    )
     return payload
 
 
