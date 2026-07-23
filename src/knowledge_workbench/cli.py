@@ -121,6 +121,11 @@ from .parsers.legacy_word import find_word_executable
 from .pipeline import faithful_analysis, faithful_wiki_generation
 from .providers import AuditedModelGateway, DeepSeekChatModel
 from .parsers import supported_extensions
+from .quality_closure import (
+    DEFAULT_GOLD_DOCUMENT_TARGET,
+    build_quality_closure_status,
+    save_quality_closure_status,
+)
 from .review import (
     publish_revision,
     reject_revision,
@@ -480,6 +485,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit = subparsers.add_parser("audit", help="查看最近的审计事件")
     audit.add_argument("--limit", type=int, default=30)
+
+    quality = subparsers.add_parser(
+        "quality", help="查看真实数据与质量闭环的独立硬门槛"
+    )
+    quality_sub = quality.add_subparsers(
+        dest="quality_command", required=True
+    )
+    quality_status = quality_sub.add_parser(
+        "status", help="汇总黄金资料、冲突、图谱和 Lint 真实进度"
+    )
+    quality_status.add_argument(
+        "--target-gold-documents",
+        type=int,
+        default=DEFAULT_GOLD_DOCUMENT_TARGET,
+    )
+    quality_status.add_argument("--output", type=Path)
+    quality_status.add_argument(
+        "--actor",
+        help="保存报告时必填；只读查看时可省略",
+    )
 
     web = subparsers.add_parser("web", help="启动仅限本机访问的只读 Web 工作台")
     web.add_argument("--host", default="127.0.0.1")
@@ -848,6 +873,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _benchmark(database, paths, args)
         elif args.command == "audit":
             _show_audit(database, args.limit)
+        elif args.command == "quality":
+            _handle_quality(database, paths, args)
         elif args.command == "web":
             serve_web(database, paths, host=args.host, port=args.port)
         elif args.command == "pipeline":
@@ -1589,6 +1616,34 @@ def _show_audit(database, limit: int) -> None:
         )
         if details:
             print("  " + json.dumps(details, ensure_ascii=False, sort_keys=True))
+
+
+def _handle_quality(
+    database: Database,
+    paths: WorkspacePaths,
+    args,
+) -> None:
+    if args.quality_command != "status":
+        raise KnowledgeWorkbenchError("未知质量闭环命令")
+    if args.output is not None:
+        if not args.actor:
+            raise KnowledgeWorkbenchError(
+                "保存质量闭环状态报告时必须提供 --actor"
+            )
+        report = save_quality_closure_status(
+            database,
+            paths,
+            args.output,
+            actor=args.actor,
+            target_gold_documents=args.target_gold_documents,
+        )
+    else:
+        report = build_quality_closure_status(
+            database,
+            paths,
+            target_gold_documents=args.target_gold_documents,
+        )
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _handle_pipeline(database, paths: WorkspacePaths, args) -> None:
