@@ -45,6 +45,7 @@ from .entity_merges import (
     propose_entity_merge,
     review_entity_merge,
 )
+from .entity_similarity import project_similar_entity_candidates
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
 from .graph_projection import project_entity_graph
 from .ingest import ingest_file, initialize_workspace
@@ -239,6 +240,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     entity_merge_review.add_argument("--actor", required=True)
     entity_merge_review.add_argument("--note", required=True, help="必填复核意见")
+    entity_merge_candidates = entity_sub.add_parser(
+        "merge-candidates", help="只读投影同类型规范实体的确定性相似候选"
+    )
+    entity_merge_candidates.add_argument("--type", choices=ENTITY_TYPES)
+    entity_merge_candidates.add_argument(
+        "--minimum-similarity", type=float, default=0.65
+    )
+    entity_merge_candidates.add_argument("--limit", type=int, default=100)
 
     graph = subparsers.add_parser("graph", help="只读投影人工确认实体的证据共现图")
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
@@ -813,6 +822,15 @@ def _handle_evidence(args, database) -> None:
 
 
 def _handle_entity(args, database) -> None:
+    if args.entity_command == "merge-candidates":
+        payload = project_similar_entity_candidates(
+            database,
+            entity_type=args.type,
+            minimum_similarity=args.minimum_similarity,
+            limit=args.limit,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
     if args.entity_command == "merge-propose":
         request_id = propose_entity_merge(
             database,
