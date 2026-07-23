@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Iterable
 
 from .audit import record_event
@@ -14,6 +14,9 @@ from .utils import new_id, sha256_text, utc_now
 RELATIONSHIP_STATUSES = ("active", "retracted")
 RELATION_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 CLASSIFICATION_ORDER = ("public", "internal", "confidential", "restricted")
+PATH_MAX_DEPTH = 4
+PATH_MAX_RESULTS = 100
+PATH_MAX_EXPANSIONS = 20_000
 
 
 def create_relation_type(
@@ -425,6 +428,191 @@ def project_business_relationship_graph(
     }
 
 
+def query_business_relationship_paths(
+    database: Database,
+    source_entity_id: str,
+    *,
+    target_entity_id: str | None = None,
+    max_depth: int = 3,
+    include_inverse: bool = False,
+    limit: int = 50,
+) -> dict:
+    source_entity_id = _required_text(
+        source_entity_id, "起点实体 ID", maximum=120
+    )
+    target_entity_id = (
+        _required_text(target_entity_id, "目标实体 ID", maximum=120)
+        if target_entity_id is not None
+        else None
+    )
+    if target_entity_id == source_entity_id:
+        raise KnowledgeWorkbenchError("起点实体和目标实体不能相同")
+    if max_depth <= 0 or max_depth > PATH_MAX_DEPTH:
+        raise KnowledgeWorkbenchError(
+            f"max-depth 必须在 1 到 {PATH_MAX_DEPTH} 之间"
+        )
+    if limit <= 0 or limit > PATH_MAX_RESULTS:
+        raise KnowledgeWorkbenchError(
+            f"limit 必须在 1 到 {PATH_MAX_RESULTS} 之间"
+        )
+
+    with database.connect() as connection:
+        source = _active_entity_details(connection, source_entity_id)
+        target = (
+            _active_entity_details(connection, target_entity_id)
+            if target_entity_id is not None
+            else None
+        )
+        candidate_relationship_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM entity_relationships
+            WHERE status = 'active'
+            """
+        ).fetchone()[0]
+
+    candidate_limit = 500
+    candidate_edge_limit_reached = (
+        candidate_relationship_count > candidate_limit
+    )
+    relationships = list_entity_relationships(
+        database,
+        status="active",
+        limit=candidate_limit,
+    )
+    eligible = [
+        relationship
+        for relationship in relationships
+        if relationship["projectable_supporting_evidence_ids"]
+        and relationship["relation_type_status"] == "active"
+        and relationship["source_status"] == "active"
+        and relationship["target_status"] == "active"
+    ]
+    nodes = {
+        source["id"]: source,
+        **({target["id"]: target} if target is not None else {}),
+    }
+    adjacency: dict[str, list[dict]] = defaultdict(list)
+    for relationship in eligible:
+        for prefix in ("source", "target"):
+            nodes[relationship[f"{prefix}_entity_id"]] = {
+                "id": relationship[f"{prefix}_entity_id"],
+                "canonical_name": relationship[f"{prefix}_name"],
+                "entity_type": relationship[f"{prefix}_entity_type"],
+            }
+        adjacency[relationship["source_entity_id"]].append(
+            _path_hop(
+                relationship,
+                relationship["source_entity_id"],
+                relationship["target_entity_id"],
+                "forward" if relationship["directed"] else "undirected",
+            )
+        )
+        if not relationship["directed"] or include_inverse:
+            adjacency[relationship["target_entity_id"]].append(
+                _path_hop(
+                    relationship,
+                    relationship["target_entity_id"],
+                    relationship["source_entity_id"],
+                    "reverse" if relationship["directed"] else "undirected",
+                )
+            )
+    for transitions in adjacency.values():
+        transitions.sort(
+            key=lambda hop: (
+                hop["to_entity_id"],
+                hop["relation_key"],
+                hop["relationship_id"],
+                hop["traversal_direction"],
+            )
+        )
+
+    queue = deque([(source_entity_id, (source_entity_id,), tuple())])
+    found: list[dict] = []
+    expanded_transition_count = 0
+    expansion_limit_reached = False
+    path_limit_reached = False
+    while queue:
+        current_entity_id, entity_ids, hops = queue.popleft()
+        if len(hops) >= max_depth:
+            continue
+        for hop in adjacency.get(current_entity_id, []):
+            if expanded_transition_count >= PATH_MAX_EXPANSIONS:
+                expansion_limit_reached = True
+                queue.clear()
+                break
+            expanded_transition_count += 1
+            next_entity_id = hop["to_entity_id"]
+            if next_entity_id in entity_ids:
+                continue
+            next_entity_ids = (*entity_ids, next_entity_id)
+            next_hops = (*hops, hop)
+            matched = (
+                target_entity_id is None
+                or next_entity_id == target_entity_id
+            )
+            if matched:
+                found.append(
+                    _serialize_path(next_entity_ids, next_hops, nodes)
+                )
+                if len(found) > limit:
+                    path_limit_reached = True
+                    queue.clear()
+                    break
+            if (
+                next_entity_id != target_entity_id
+                and len(next_hops) < max_depth
+            ):
+                queue.append((next_entity_id, next_entity_ids, next_hops))
+        if path_limit_reached or expansion_limit_reached:
+            break
+
+    returned = found[:limit]
+    returned_node_ids = {
+        entity_id
+        for path in returned
+        for entity_id in path["entity_ids"]
+    }
+    return {
+        "schema_version": "1.0",
+        "projection_version": "manual-business-relationship-paths-v1",
+        "semantics": {
+            "path_meaning": (
+                "每一跳都是人工登记且仍有合格证据支撑的关系；"
+                "多跳连通性不构成新的业务关系或事实结论"
+            ),
+            "simple_paths_only": True,
+            "inverse_traversal_is_explicit": True,
+        },
+        "filters": {
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "max_depth": max_depth,
+            "include_inverse": bool(include_inverse),
+            "relationship_status": "active",
+            "evidence_status": "verified",
+            "restricted_excluded": True,
+            "current_sources_only": True,
+        },
+        "summary": {
+            "eligible_edge_count": len(eligible),
+            "candidate_relationship_count": candidate_relationship_count,
+            "candidate_edge_limit_reached": candidate_edge_limit_reached,
+            "expanded_transition_count": expanded_transition_count,
+            "returned_path_count": len(returned),
+            "returned_node_count": len(returned_node_ids),
+            "path_limit_reached": path_limit_reached,
+            "expansion_limit_reached": expansion_limit_reached,
+            "truncated": candidate_edge_limit_reached
+            or path_limit_reached
+            or expansion_limit_reached,
+        },
+        "nodes": [
+            nodes[entity_id] for entity_id in sorted(returned_node_ids)
+        ],
+        "paths": returned,
+    }
+
+
 def _serialize_relationship(row, support_rows: list) -> dict:
     evidence_ids = [support["evidence_id"] for support in support_rows]
     current_verified = [
@@ -439,6 +627,13 @@ def _serialize_relationship(row, support_rows: list) -> dict:
         and support["status"] == "verified"
         and support["classification"] != "restricted"
     ]
+    projectable_classifications = {
+        support["classification"]
+        for support in support_rows
+        if support["source_is_current"]
+        and support["status"] == "verified"
+        and support["classification"] != "restricted"
+    }
     classifications = {
         support["classification"] for support in support_rows
     }
@@ -467,6 +662,63 @@ def _serialize_relationship(row, support_rows: list) -> dict:
         "current_verified_supporting_evidence_ids": current_verified,
         "current_verified_supporting_evidence_count": len(current_verified),
         "projectable_supporting_evidence_ids": projectable,
+        "projectable_classifications": _sort_classifications(
+            projectable_classifications
+        ),
+        "classifications": _sort_classifications(classifications),
+    }
+
+
+def _path_hop(
+    relationship: dict,
+    from_entity_id: str,
+    to_entity_id: str,
+    traversal_direction: str,
+) -> dict:
+    traversal_label = relationship["label"]
+    if traversal_direction == "reverse":
+        traversal_label = relationship["inverse_label"]
+    evidence_ids = relationship["projectable_supporting_evidence_ids"]
+    return {
+        "relationship_id": relationship["relationship_id"],
+        "relation_key": relationship["relation_key"],
+        "label": relationship["label"],
+        "inverse_label": relationship["inverse_label"],
+        "directed": relationship["directed"],
+        "relationship_source_entity_id": relationship["source_entity_id"],
+        "relationship_target_entity_id": relationship["target_entity_id"],
+        "from_entity_id": from_entity_id,
+        "to_entity_id": to_entity_id,
+        "traversal_direction": traversal_direction,
+        "traversal_label": traversal_label,
+        "supporting_evidence_ids": evidence_ids,
+        "supporting_evidence_count": len(evidence_ids),
+        "classifications": relationship["projectable_classifications"],
+    }
+
+
+def _serialize_path(
+    entity_ids: tuple[str, ...],
+    hops: tuple[dict, ...],
+    nodes: dict[str, dict],
+) -> dict:
+    evidence_sets = [
+        set(hop["supporting_evidence_ids"]) for hop in hops
+    ]
+    evidence_union = set().union(*evidence_sets)
+    shared_evidence = set.intersection(*evidence_sets)
+    classifications = {
+        classification
+        for hop in hops
+        for classification in hop["classifications"]
+    }
+    return {
+        "depth": len(hops),
+        "entity_ids": list(entity_ids),
+        "entities": [nodes[entity_id] for entity_id in entity_ids],
+        "hops": list(hops),
+        "supporting_evidence_ids": sorted(evidence_union),
+        "shared_supporting_evidence_ids": sorted(shared_evidence),
         "classifications": _sort_classifications(classifications),
     }
 
@@ -528,6 +780,22 @@ def _active_entity(connection: sqlite3.Connection, entity_id: str):
     if not row:
         raise KnowledgeWorkbenchError("规范实体不存在或不是 active 状态")
     return row
+
+
+def _active_entity_details(
+    connection: sqlite3.Connection, entity_id: str
+) -> dict:
+    row = connection.execute(
+        """
+        SELECT id, canonical_name, entity_type
+        FROM canonical_entities
+        WHERE id = ? AND status = 'active'
+        """,
+        (entity_id,),
+    ).fetchone()
+    if not row:
+        raise KnowledgeWorkbenchError("规范实体不存在或不是 active 状态")
+    return dict(row)
 
 
 def _required_relation_key(value: str) -> str:

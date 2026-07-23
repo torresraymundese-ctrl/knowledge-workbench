@@ -19,10 +19,11 @@ from knowledge_workbench.entity_relationships import (
     list_entity_relationships,
     list_relation_types,
     project_business_relationship_graph,
+    query_business_relationship_paths,
     retract_entity_relationship,
 )
 from knowledge_workbench.errors import KnowledgeWorkbenchError
-from knowledge_workbench.ingest import ingest_file
+from knowledge_workbench.ingest import ingest_file, initialize_workspace
 from knowledge_workbench.linting import lint_workspace
 from knowledge_workbench.models import Classification, EvidenceStatus
 from knowledge_workbench.review import transition_evidence
@@ -383,6 +384,210 @@ class EntityRelationshipTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(len(raw["creation_note_sha256"]), 64)
             self.assertEqual(len(raw["retraction_note_sha256"]), 64)
+
+    def test_bounded_paths_preserve_direction_and_exclude_restricted_support(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            database = initialize_workspace(paths)
+            entities = {
+                name: create_entity(
+                    database, name, "organization", actor="curator-01"
+                )
+                for name in ("甲方", "乙方", "丙方", "丁方")
+            }
+
+            def verified_evidence(
+                filename: str,
+                text: str,
+                mentions: tuple[str, str],
+                classification: Classification = Classification.INTERNAL,
+            ) -> str:
+                source = root / filename
+                source.write_text(text, encoding="utf-8")
+                ingestion = ingest_file(source, paths, classification)
+                with database.connect() as connection:
+                    evidence_id = connection.execute(
+                        "SELECT id FROM evidence WHERE processing_run_id = ?",
+                        (ingestion.processing_run_id,),
+                    ).fetchone()[0]
+                for mention in mentions:
+                    link_evidence_entity(
+                        database,
+                        entities[mention],
+                        evidence_id,
+                        mention,
+                        actor="curator-01",
+                    )
+                transition_evidence(
+                    database,
+                    evidence_id,
+                    EvidenceStatus.REVIEWING,
+                    actor="reviewer-01",
+                )
+                transition_evidence(
+                    database,
+                    evidence_id,
+                    EvidenceStatus.VERIFIED,
+                    actor="reviewer-01",
+                )
+                return evidence_id
+
+            evidence_ab = verified_evidence(
+                "ab.md", "甲方关联乙方。", ("甲方", "乙方")
+            )
+            evidence_bc = verified_evidence(
+                "bc.md", "乙方与丙方协作。", ("乙方", "丙方")
+            )
+            evidence_cd = verified_evidence(
+                "cd.md", "丙方关联丁方。", ("丙方", "丁方")
+            )
+            restricted_ad = verified_evidence(
+                "ad.md",
+                "甲方直连丁方。",
+                ("甲方", "丁方"),
+                Classification.RESTRICTED,
+            )
+            create_relation_type(
+                database,
+                "links_to",
+                "关联",
+                inverse_label="被关联",
+                actor="curator-01",
+            )
+            create_relation_type(
+                database,
+                "collaborates_with",
+                "协作",
+                directed=False,
+                actor="curator-01",
+            )
+            create_relation_type(
+                database,
+                "restricted_shortcut",
+                "受限直连",
+                actor="curator-01",
+            )
+            for relation_key, source_name, target_name, evidence_id in (
+                ("links_to", "甲方", "乙方", evidence_ab),
+                ("collaborates_with", "乙方", "丙方", evidence_bc),
+                ("links_to", "丙方", "丁方", evidence_cd),
+                (
+                    "restricted_shortcut",
+                    "甲方",
+                    "丁方",
+                    restricted_ad,
+                ),
+            ):
+                create_entity_relationship(
+                    database,
+                    relation_key,
+                    entities[source_name],
+                    entities[target_name],
+                    [evidence_id],
+                    actor="curator-01",
+                    note="人工回源确认",
+                )
+
+            forward = query_business_relationship_paths(
+                database,
+                entities["甲方"],
+                target_entity_id=entities["丁方"],
+                max_depth=3,
+            )
+            self.assertEqual(forward["summary"]["eligible_edge_count"], 3)
+            self.assertEqual(forward["summary"]["returned_path_count"], 1)
+            path = forward["paths"][0]
+            self.assertEqual(path["depth"], 3)
+            self.assertEqual(
+                path["entity_ids"],
+                [
+                    entities["甲方"],
+                    entities["乙方"],
+                    entities["丙方"],
+                    entities["丁方"],
+                ],
+            )
+            self.assertEqual(
+                [hop["traversal_direction"] for hop in path["hops"]],
+                ["forward", "undirected", "forward"],
+            )
+            self.assertEqual(
+                set(path["supporting_evidence_ids"]),
+                {evidence_ab, evidence_bc, evidence_cd},
+            )
+            self.assertEqual(path["shared_supporting_evidence_ids"], [])
+            self.assertEqual(path["classifications"], ["internal"])
+            self.assertNotIn(
+                restricted_ad,
+                {
+                    evidence_id
+                    for item in forward["paths"]
+                    for evidence_id in item["supporting_evidence_ids"]
+                },
+            )
+            self.assertIn(
+                "不构成新的业务关系",
+                forward["semantics"]["path_meaning"],
+            )
+
+            too_shallow = query_business_relationship_paths(
+                database,
+                entities["甲方"],
+                target_entity_id=entities["丁方"],
+                max_depth=2,
+            )
+            self.assertEqual(too_shallow["paths"], [])
+            reverse_blocked = query_business_relationship_paths(
+                database,
+                entities["丁方"],
+                target_entity_id=entities["甲方"],
+            )
+            self.assertEqual(reverse_blocked["paths"], [])
+            reverse_allowed = query_business_relationship_paths(
+                database,
+                entities["丁方"],
+                target_entity_id=entities["甲方"],
+                include_inverse=True,
+            )
+            self.assertEqual(
+                [
+                    hop["traversal_direction"]
+                    for hop in reverse_allowed["paths"][0]["hops"]
+                ],
+                ["reverse", "undirected", "reverse"],
+            )
+            self.assertEqual(
+                reverse_allowed["paths"][0]["hops"][0]["traversal_label"],
+                "被关联",
+            )
+            self.assertEqual(
+                len(reverse_allowed["paths"][0]["entity_ids"]),
+                len(set(reverse_allowed["paths"][0]["entity_ids"])),
+            )
+            limited = query_business_relationship_paths(
+                database,
+                entities["甲方"],
+                max_depth=3,
+                limit=1,
+            )
+            self.assertEqual(limited["summary"]["returned_path_count"], 1)
+            self.assertTrue(limited["summary"]["path_limit_reached"])
+            self.assertTrue(limited["summary"]["truncated"])
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "不能相同"
+            ):
+                query_business_relationship_paths(
+                    database,
+                    entities["甲方"],
+                    target_entity_id=entities["甲方"],
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "max-depth"
+            ):
+                query_business_relationship_paths(
+                    database, entities["甲方"], max_depth=5
+                )
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ from .entity_relationships import (
     list_entity_relationships,
     list_relation_types,
     project_business_relationship_graph,
+    query_business_relationship_paths,
     retract_entity_relationship,
 )
 from .entity_similarity import project_similar_entity_candidates
@@ -337,6 +338,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     graph_business.add_argument("--entity-id")
     graph_business.add_argument("--limit", type=int, default=100)
+    graph_paths = graph_sub.add_parser(
+        "paths", help="查询有证据支撑的受限深度业务关系路径"
+    )
+    graph_paths.add_argument("source_entity_id")
+    graph_paths.add_argument("--target", dest="target_entity_id")
+    graph_paths.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="最大路径深度，范围 1 到 4",
+    )
+    graph_paths.add_argument(
+        "--include-inverse",
+        action="store_true",
+        help="显式允许反向遍历有向关系",
+    )
+    graph_paths.add_argument("--limit", type=int, default=50)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -1067,6 +1085,17 @@ def _handle_graph(args, database) -> None:
         payload = project_business_relationship_graph(
             database,
             entity_id=args.entity_id,
+            limit=args.limit,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.graph_command == "paths":
+        payload = query_business_relationship_paths(
+            database,
+            args.source_entity_id,
+            target_entity_id=args.target_entity_id,
+            max_depth=args.max_depth,
+            include_inverse=args.include_inverse,
             limit=args.limit,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

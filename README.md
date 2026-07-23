@@ -65,6 +65,10 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe relation add responsible_for entity_源实体ID entity_目标实体ID --evidence-id ev_证据ID --note "回源确认关系方向" --actor curator-01
 .\.venv\Scripts\knowledge.exe relation list --entity-id entity_源实体ID
 .\.venv\Scripts\knowledge.exe graph business
+# 默认只沿有向关系正向查找，最多 4 跳；每一跳保留证据 ID
+.\.venv\Scripts\knowledge.exe graph paths entity_起点ID --target entity_目标ID --max-depth 3
+# 只有显式授权时才允许反向遍历有向关系
+.\.venv\Scripts\knowledge.exe graph paths entity_起点ID --target entity_目标ID --include-inverse
 .\.venv\Scripts\knowledge.exe relation retract entityrel_关系ID --note "适用期结束" --actor curator-02
 .\.venv\Scripts\knowledge.exe page list
 .\.venv\Scripts\knowledge.exe page request-review rev_复制实际修订ID --actor author-01
@@ -137,6 +141,8 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 
 `graph business` 只读投影 active 人工业务关系中仍有“当前文件版本＋当前处理运行＋verified＋非 restricted”支撑的边。旧版本、状态退回或仅 restricted 支撑会使关系退出投影，但不会删除历史记录；Lint 会把失去当前 verified 支撑的 active 关系标为待复核警告。输出保留关系类型、方向和支撑证据 ID，不返回证据原文，也不建立第二套图数据库。
 
+`graph paths` 在同一安全投影上执行确定性、只读的受限深度简单路径查询。默认只沿有向关系的登记方向遍历，无向关系可双向遍历；`--include-inverse` 必须显式给出才允许逆向走有向边。深度限制为1到4跳、结果限制为1到100条，并有20,000次边扩展硬上限；输出会报告候选边、结果或扩展是否截断。每一跳都保留原关系方向、实际遍历方向、关系标签、当前 verified 非 restricted 支撑证据 ID 和密级；路径级证据并集与各跳共同证据分别输出。路径只表示人工关系的逐跳连通性，不能表述为新的业务关系、因果或其他事实结论。
+
 跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
 
 旧版 `.doc` 转换完全在本机完成：Word 以隐藏、只读、禁用宏的方式打开源文件，在临时目录生成 DOCX，解析完成后删除临时文件。原始 `.doc` 的 SHA-256 和只读副本仍是来源真相；每条证据额外保存转换工具、工具版本和临时 DOCX 的 SHA-256。该开关只授权单次命令，不会改变全局默认策略。
@@ -156,7 +162,7 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 
 ## 项目状态
 
-第一条命令行知识链路、全文检索、可选 BGE-M3 语义检索、审核状态机、任务工作器、双向链接、质量评测、人工实体规范化、模型实体候选裁决和只读证据共现图已经可运行。详细边界见 [第一阶段架构](docs/ARCHITECTURE.md)、[性能基线](docs/PERFORMANCE_BASELINE.md)、[质量评测](docs/QUALITY_EVALUATION.md) 和 [下一里程碑](docs/NEXT_MILESTONE.md)。
+第一条命令行知识链路、全文检索、可选 BGE-M3 语义检索、审核状态机、任务工作器、双向链接、质量评测、人工实体规范化、模型实体候选裁决、只读证据共现图、人工业务关系和受限深度路径查询已经可运行。详细边界见 [第一阶段架构](docs/ARCHITECTURE.md)、[性能基线](docs/PERFORMANCE_BASELINE.md)、[质量评测](docs/QUALITY_EVALUATION.md) 和 [下一里程碑](docs/NEXT_MILESTONE.md)。
 
 ## 本地 Web 工作台
 
