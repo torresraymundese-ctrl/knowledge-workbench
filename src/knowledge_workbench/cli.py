@@ -45,6 +45,15 @@ from .entity_merges import (
     propose_entity_merge,
     review_entity_merge,
 )
+from .entity_relationships import (
+    RELATIONSHIP_STATUSES,
+    create_entity_relationship,
+    create_relation_type,
+    list_entity_relationships,
+    list_relation_types,
+    project_business_relationship_graph,
+    retract_entity_relationship,
+)
 from .entity_similarity import project_similar_entity_candidates
 from .entity_visibility import list_entity_visibility
 from .evaluation import build_labeling_candidate_pack, evaluate_dataset
@@ -256,7 +265,59 @@ def build_parser() -> argparse.ArgumentParser:
     entity_visibility.add_argument("--web-visible-only", action="store_true")
     entity_visibility.add_argument("--limit", type=int, default=100)
 
-    graph = subparsers.add_parser("graph", help="只读投影人工确认实体的证据共现图")
+    relation = subparsers.add_parser(
+        "relation", help="人工登记有证据支撑的实体业务关系"
+    )
+    relation_sub = relation.add_subparsers(
+        dest="relation_command", required=True
+    )
+    relation_type_add = relation_sub.add_parser(
+        "type-add", help="登记人工业务关系类型"
+    )
+    relation_type_add.add_argument("relation_key")
+    relation_type_add.add_argument("label")
+    relation_type_add.add_argument("--inverse-label")
+    relation_type_add.add_argument(
+        "--undirected",
+        action="store_true",
+        help="登记为无方向关系；默认是有方向关系",
+    )
+    relation_type_add.add_argument("--actor", required=True)
+    relation_type_list = relation_sub.add_parser(
+        "type-list", help="列出业务关系类型"
+    )
+    relation_type_list.add_argument(
+        "--status", choices=("active", "archived"), default="active"
+    )
+    relation_type_list.add_argument("--limit", type=int, default=100)
+    relation_add = relation_sub.add_parser(
+        "add", help="用同时提及两个实体的 verified 证据登记业务关系"
+    )
+    relation_add.add_argument("relation_key")
+    relation_add.add_argument("source_entity_id")
+    relation_add.add_argument("target_entity_id")
+    relation_add.add_argument("--evidence-id", action="append", required=True)
+    relation_add.add_argument("--actor", required=True)
+    relation_add.add_argument("--note", required=True)
+    relation_list = relation_sub.add_parser(
+        "list", help="列出人工业务关系及证据支持状态"
+    )
+    relation_list.add_argument(
+        "--status", choices=RELATIONSHIP_STATUSES, default="active"
+    )
+    relation_list.add_argument("--type", dest="relation_key")
+    relation_list.add_argument("--entity-id")
+    relation_list.add_argument("--limit", type=int, default=100)
+    relation_retract = relation_sub.add_parser(
+        "retract", help="撤销 active 业务关系并保留历史"
+    )
+    relation_retract.add_argument("relationship_id")
+    relation_retract.add_argument("--actor", required=True)
+    relation_retract.add_argument("--note", required=True)
+
+    graph = subparsers.add_parser(
+        "graph", help="只读投影实体共现图或人工业务关系图"
+    )
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
     graph_project = graph_sub.add_parser("project", help="输出确定性实体共现 JSON")
     graph_project.add_argument("--entity-id")
@@ -271,6 +332,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         help="最大返回边数；无边节点也最多补足至该数量",
     )
+    graph_business = graph_sub.add_parser(
+        "business", help="投影人工登记且有当前 verified 证据支持的业务关系"
+    )
+    graph_business.add_argument("--entity-id")
+    graph_business.add_argument("--limit", type=int, default=100)
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -634,6 +700,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _handle_evidence(args, database)
         elif args.command == "entity":
             _handle_entity(args, database)
+        elif args.command == "relation":
+            _handle_relation(args, database)
         elif args.command == "graph":
             _handle_graph(args, database)
         elif args.command == "page":
@@ -742,6 +810,12 @@ def _status(database, paths: WorkspacePaths) -> None:
             ).fetchone()[0],
             "reviewing_entity_merges": connection.execute(
                 "SELECT COUNT(*) FROM entity_merge_requests WHERE status = 'reviewing'"
+            ).fetchone()[0],
+            "active_entity_relation_types": connection.execute(
+                "SELECT COUNT(*) FROM entity_relation_types WHERE status = 'active'"
+            ).fetchone()[0],
+            "active_entity_relationships": connection.execute(
+                "SELECT COUNT(*) FROM entity_relationships WHERE status = 'active'"
             ).fetchone()[0],
         }
     print(f"工作区：{paths.root}")
@@ -988,6 +1062,69 @@ def _handle_graph(args, database) -> None:
             limit=args.limit,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.graph_command == "business":
+        payload = project_business_relationship_graph(
+            database,
+            entity_id=args.entity_id,
+            limit=args.limit,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _handle_relation(args, database) -> None:
+    if args.relation_command == "type-add":
+        relation_key = create_relation_type(
+            database,
+            args.relation_key,
+            args.label,
+            actor=args.actor,
+            directed=not args.undirected,
+            inverse_label=args.inverse_label,
+        )
+        print(f"业务关系类型已登记：{relation_key}")
+        return
+    if args.relation_command == "type-list":
+        payload = {
+            "kind": "entity-relation-types",
+            "items": list_relation_types(
+                database, status=args.status, limit=args.limit
+            ),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.relation_command == "add":
+        relationship_id = create_entity_relationship(
+            database,
+            args.relation_key,
+            args.source_entity_id,
+            args.target_entity_id,
+            args.evidence_id,
+            actor=args.actor,
+            note=args.note,
+        )
+        print(f"业务关系已登记：{relationship_id}")
+        return
+    if args.relation_command == "retract":
+        payload = retract_entity_relationship(
+            database,
+            args.relationship_id,
+            actor=args.actor,
+            note=args.note,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    payload = {
+        "kind": "entity-business-relationships",
+        "items": list_entity_relationships(
+            database,
+            status=args.status,
+            relation_key=args.relation_key,
+            entity_id=args.entity_id,
+            limit=args.limit,
+        ),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _handle_page(args, database, paths: WorkspacePaths) -> None:

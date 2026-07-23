@@ -30,6 +30,8 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
     checked_entity_mentions = 0
     checked_entity_candidates = 0
     checked_entity_merge_requests = 0
+    checked_entity_relation_types = 0
+    checked_entity_relationships = 0
     labeling_sessions = []
     with database.connect() as connection:
         foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -235,6 +237,91 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
                         "已合并源实体仍持有别名、提及或候选指向，或归档状态不正确",
                     )
                 )
+        checked_entity_relation_types = connection.execute(
+            "SELECT COUNT(*) FROM entity_relation_types"
+        ).fetchone()[0]
+        relationships = connection.execute(
+            """
+            SELECT er.id, er.status, er.source_entity_id,
+                   er.target_entity_id, ert.status AS relation_type_status,
+                   source.status AS source_status,
+                   target.status AS target_status,
+                   COUNT(ere.evidence_id) AS support_count,
+                   SUM(
+                       CASE WHEN ere.evidence_id IS NOT NULL AND (
+                           NOT EXISTS (
+                               SELECT 1 FROM evidence_entity_mentions source_mention
+                               WHERE source_mention.evidence_id = ere.evidence_id
+                                 AND source_mention.entity_id = er.source_entity_id
+                           )
+                           OR NOT EXISTS (
+                               SELECT 1 FROM evidence_entity_mentions target_mention
+                               WHERE target_mention.evidence_id = ere.evidence_id
+                                 AND target_mention.entity_id = er.target_entity_id
+                           )
+                       ) THEN 1 ELSE 0 END
+                   ) AS invalid_support_count,
+                   SUM(
+                       CASE WHEN ere.evidence_id IS NOT NULL
+                                  AND e.status = 'verified'
+                                  AND pr.is_current = 1
+                                  AND d.current_version_id = dv.id
+                            THEN 1 ELSE 0 END
+                   ) AS current_verified_support_count
+            FROM entity_relationships er
+            JOIN entity_relation_types ert
+              ON ert.relation_key = er.relation_key
+            JOIN canonical_entities source
+              ON source.id = er.source_entity_id
+            JOIN canonical_entities target
+              ON target.id = er.target_entity_id
+            LEFT JOIN entity_relationship_evidence ere
+              ON ere.relationship_id = er.id
+            LEFT JOIN evidence e ON e.id = ere.evidence_id
+            LEFT JOIN processing_runs pr ON pr.id = e.processing_run_id
+            LEFT JOIN document_versions dv ON dv.id = e.document_version_id
+            LEFT JOIN documents d ON d.id = dv.document_id
+            GROUP BY er.id
+            ORDER BY er.id
+            """
+        ).fetchall()
+        checked_entity_relationships = len(relationships)
+        for relationship in relationships:
+            if (
+                relationship["support_count"] < 1
+                or relationship["invalid_support_count"] > 0
+            ):
+                issues.append(
+                    LintIssue(
+                        "entity_relationship_support_invalid",
+                        relationship["id"],
+                        "业务关系必须至少有一条同时关联两个端点的证据支持",
+                    )
+                )
+            if relationship["status"] == "active" and (
+                relationship["relation_type_status"] != "active"
+                or relationship["source_status"] != "active"
+                or relationship["target_status"] != "active"
+            ):
+                issues.append(
+                    LintIssue(
+                        "entity_relationship_endpoint_invalid",
+                        relationship["id"],
+                        "active 业务关系的类型和两个端点都必须是 active 状态",
+                    )
+                )
+            if (
+                relationship["status"] == "active"
+                and relationship["current_verified_support_count"] < 1
+            ):
+                issues.append(
+                    LintIssue(
+                        "entity_relationship_needs_revalidation",
+                        relationship["id"],
+                        "active 业务关系已没有当前 verified 证据支持",
+                        severity="warning",
+                    )
+                )
         for document in documents:
             document_id = document["document_id"]
             version_id = document["current_version_id"]
@@ -344,6 +431,8 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
             "entity_evidence_mention_count": checked_entity_mentions,
             "entity_candidate_count": checked_entity_candidates,
             "entity_merge_request_count": checked_entity_merge_requests,
+            "entity_relation_type_count": checked_entity_relation_types,
+            "entity_relationship_count": checked_entity_relationships,
         },
         "issues": [asdict(issue) for issue in issues],
     }

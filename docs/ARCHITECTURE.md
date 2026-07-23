@@ -35,6 +35,7 @@
 | `entity_merges.py` | 同类型规范实体的人工合并请求、异人复核、原子迁移和哈希审计 |
 | `entity_similarity.py` | active 同类型实体的字符片段阻塞、最佳别名相似度和只读合并候选投影 |
 | `entity_visibility.py` | 从全部历史证据提及推导实体最高密级及 Web 可见边界 |
+| `entity_relationships.py` | 人工业务关系类型、证据支撑关系、撤销历史和安全图谱投影 |
 | `graph_projection.py` | 当前非受限证据上的只读实体共现节点、边和支持证据投影 |
 | `ingest.py` | 事务化导入、文件版本、派生重处理、证据、草稿和审计 |
 | `review.py` | 证据与页面修订状态机 |
@@ -77,6 +78,8 @@
 - 相似实体候选是 SQLite 上的纯查询投影，不新增候选表、不写审计，也不触发合并请求。投影仅使用 active、同类型实体的人工别名，按规范化三字符片段建立倒排块后计算最佳 `SequenceMatcher` 相似度；高频块和比较对数均有硬上限，并在结构化统计中暴露跳过、截断和已有人工合并请求状态。候选只表示名称接近，不能证明实体相同，必须由人工另行执行 `merge-propose`。
 - 实体 Web 可见性不是可人工覆盖的第二套密级字段，而是从全部历史 `evidence_entity_mentions` 支持实时取最高资料密级；即使旧证据已不是当前运行，restricted 历史支持仍使实体保持 restricted。没有任何证据支持的 active 实体为 `unclassified`。Web 实体选择只投影 public、internal、confidential，排除 restricted、unclassified 和 archived；写适配器在接受模型候选前按目标实体 ID 再次重算，防止绕过列表直接提交隐藏实体。
 - 实体图谱当前是纯查询投影，不建立第二套图数据库或关系真相。节点来自 active 规范实体；`co_occurs_in_atomic_evidence` 边仅由同一当前原子证据中的人工确认提及确定，携带支持证据 ID、证据状态和密级集合，不能解释为业务关系。默认只使用 verified；显式审核模式可加入 draft、reviewing 和 conflicted，但 deprecated、archived 与 restricted 无条件排除。投影不返回原文、不写数据库、不提供文件导出，文件版本或处理运行变化会使旧支持自动退出。
+- Schema v12 以 `entity_relation_types`、`entity_relationships` 和 `entity_relationship_evidence` 保存人工定义的业务关系真相。关系类型明确有向/无向；登记关系必须引用至少一条当前 verified 证据，且每条证据都已通过 `evidence_entity_mentions` 人工确认同时逐字提及两个 active 端点。无向端点按 ID 规范化，active 关系按类型与方向唯一；关系只允许 `active → retracted`，撤销不删除证据或历史，登记与撤销说明只保存 SHA-256。模型候选、共现投影和相似度候选均不能自动写入业务关系。
+- `manual-business-relationships-v1` 是业务关系的只读安全投影，只返回仍有当前 verified 非 restricted 支撑的 active 边及证据 ID，不返回原文。文件版本或证据状态变化会让过期支撑退出投影而不改写历史；Lint 对没有当前 verified 支撑的 active 关系给出待复核警告，并校验所有历史支撑仍同时关联两个端点。为避免语义被无声改写，已被任何关系历史引用的端点提及不可解除；实体合并在源实体存在任何业务关系历史时阻断，而不是迁移或重写旧关系。
 - `draft` 证据不能跳过 `reviewing` 直接变成 `verified`。
 - 页面发布前必须至少引用一条证据，且所有引用证据都是 `verified`；核心发布函数在事务内再次校验 Markdown 路径和内容哈希。
 - 已发布页面的新资料生成新修订，不覆盖当前已验证修订。
@@ -114,7 +117,7 @@
 ## 尚未实现
 
 - DeepSeek 抽取式提示词已通过短 Markdown 和34单元表格 DOCX；本地证据锚定的阶段一已完成真实复验，仍需覆盖超长文档、跨页表格和跨段冲突；
-- 实体规范化、模型候选裁决、非受限候选 Web 分页审核、确定性相似实体候选、实体合并 CLI/Web 异人复核和只读证据共现图已完成；人工定义的业务关系类型、多跳路径、图谱质量评测，以及更广泛的语义冲突识别仍未实现；
+- 实体规范化、模型候选裁决、非受限候选 Web 分页审核、确定性相似实体候选、实体合并 CLI/Web 异人复核、只读证据共现图及人工证据支撑业务关系已完成；业务关系 Web 审核、多跳路径、图谱质量评测，以及更广泛的语义冲突识别仍未实现；
 - Reranker 和全文/向量/图谱联合排序；
 - OCR、NAS 增量同步、权限主体、部门审批流及其他企业级高影响 Web 写操作；
 - Obsidian 手动编辑回写和并发差异检测。

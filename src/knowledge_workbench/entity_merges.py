@@ -183,6 +183,23 @@ def review_entity_merge(
                 or target["entity_type"] != request["entity_type"]
             ):
                 raise KnowledgeWorkbenchError("合并请求中的实体类型已不一致")
+            relationship_history = connection.execute(
+                """
+                SELECT id FROM entity_relationships
+                WHERE source_entity_id = ? OR target_entity_id = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (
+                    request["source_entity_id"],
+                    request["source_entity_id"],
+                ),
+            ).fetchone()
+            if relationship_history:
+                raise KnowledgeWorkbenchError(
+                    "源实体已有业务关系历史；为避免改写历史关系语义，不能自动合并："
+                    + relationship_history["id"]
+                )
             aliases = connection.execute(
                 """
                 SELECT id FROM entity_aliases

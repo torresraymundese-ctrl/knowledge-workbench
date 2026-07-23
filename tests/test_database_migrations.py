@@ -89,7 +89,9 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations"
                     ).fetchall()
                 }
-                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+                self.assertEqual(
+                    versions, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+                )
                 run = connection.execute(
                     "SELECT * FROM processing_runs WHERE document_version_id = 'ver_1'"
                 ).fetchone()
@@ -141,7 +143,9 @@ class DatabaseMigrationTests(unittest.TestCase):
                         WHERE type = 'table' AND name IN (
                             'canonical_entities', 'entity_aliases',
                             'evidence_entity_mentions', 'entity_candidates',
-                            'entity_merge_requests'
+                            'entity_merge_requests', 'entity_relation_types',
+                            'entity_relationships',
+                            'entity_relationship_evidence'
                         )
                         """
                     ).fetchall()
@@ -154,6 +158,9 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "evidence_entity_mentions",
                         "entity_candidates",
                         "entity_merge_requests",
+                        "entity_relation_types",
+                        "entity_relationships",
+                        "entity_relationship_evidence",
                     },
                 )
                 alias_columns = {
@@ -199,6 +206,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM schema_migrations WHERE version = 11"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 12"
                     ).fetchone()[0],
                     1,
                 )

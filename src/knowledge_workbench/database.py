@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 SCHEMA = """
@@ -527,6 +527,70 @@ CREATE INDEX idx_entity_merge_requests_target
 """
 
 
+MIGRATION_12 = """
+CREATE TABLE entity_relation_types (
+    relation_key TEXT PRIMARY KEY
+        CHECK (length(trim(relation_key)) > 0),
+    label TEXT NOT NULL CHECK (length(trim(label)) > 0),
+    inverse_label TEXT,
+    directed INTEGER NOT NULL CHECK (directed IN (0, 1)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (
+        status IN ('active', 'archived')
+    ),
+    created_by TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE entity_relationships (
+    id TEXT PRIMARY KEY,
+    relation_key TEXT NOT NULL REFERENCES entity_relation_types(relation_key),
+    source_entity_id TEXT NOT NULL REFERENCES canonical_entities(id),
+    target_entity_id TEXT NOT NULL REFERENCES canonical_entities(id),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (
+        status IN ('active', 'retracted')
+    ),
+    created_by TEXT NOT NULL CHECK (length(trim(created_by)) > 0),
+    creation_note_sha256 TEXT NOT NULL CHECK (
+        length(creation_note_sha256) = 64
+    ),
+    retracted_by TEXT,
+    retraction_note_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    retracted_at TEXT,
+    CHECK (source_entity_id != target_entity_id),
+    CHECK (
+        (status = 'active' AND retracted_by IS NULL
+         AND retraction_note_sha256 IS NULL AND retracted_at IS NULL)
+        OR
+        (status = 'retracted' AND retracted_by IS NOT NULL
+         AND retraction_note_sha256 IS NOT NULL AND retracted_at IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX idx_entity_relationships_active_unique
+    ON entity_relationships(relation_key, source_entity_id, target_entity_id)
+    WHERE status = 'active';
+CREATE INDEX idx_entity_relationships_source
+    ON entity_relationships(source_entity_id, status, relation_key);
+CREATE INDEX idx_entity_relationships_target
+    ON entity_relationships(target_entity_id, status, relation_key);
+
+CREATE TABLE entity_relationship_evidence (
+    relationship_id TEXT NOT NULL
+        REFERENCES entity_relationships(id) ON DELETE CASCADE,
+    evidence_id TEXT NOT NULL REFERENCES evidence(id),
+    added_by TEXT NOT NULL CHECK (length(trim(added_by)) > 0),
+    added_at TEXT NOT NULL,
+    PRIMARY KEY(relationship_id, evidence_id)
+);
+
+CREATE INDEX idx_entity_relationship_evidence_evidence
+    ON entity_relationship_evidence(evidence_id, relationship_id);
+"""
+
+
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
 
@@ -631,6 +695,13 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (11, applied_at),
+                )
+                applied.add(11)
+            if 12 not in applied:
+                connection.executescript(MIGRATION_12)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (12, applied_at),
                 )
 
     @contextmanager

@@ -61,6 +61,11 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe graph project --entity-id entity_复制实际实体ID
 # 仅用于审核中的探索视图；显式加入 draft/reviewing/conflicted，仍排除 restricted
 .\.venv\Scripts\knowledge.exe graph project --include-unverified
+.\.venv\Scripts\knowledge.exe relation type-add responsible_for "负责" --inverse-label "由其负责" --actor curator-01
+.\.venv\Scripts\knowledge.exe relation add responsible_for entity_源实体ID entity_目标实体ID --evidence-id ev_证据ID --note "回源确认关系方向" --actor curator-01
+.\.venv\Scripts\knowledge.exe relation list --entity-id entity_源实体ID
+.\.venv\Scripts\knowledge.exe graph business
+.\.venv\Scripts\knowledge.exe relation retract entityrel_关系ID --note "适用期结束" --actor curator-02
 .\.venv\Scripts\knowledge.exe page list
 .\.venv\Scripts\knowledge.exe page request-review rev_复制实际修订ID --actor author-01
 .\.venv\Scripts\knowledge.exe page publish rev_复制实际修订ID --actor reviewer-01
@@ -127,6 +132,10 @@ SQLite Schema v11 增加人工实体合并复核。`merge-propose` 只登记人�
 实体自身不建立第二套人工密级字段；`entity visibility-list` 从该实体全部历史证据提及实时推导最高密级，优先级为 `restricted > confidential > internal > public`，没有证据支持时为 `unclassified`。该策略不会因文件版本更新或证据退出当前运行而降低历史敏感性。Web 只列出具有至少一条非 restricted 证据且最高密级不是 restricted 的 active 实体；`unclassified`、restricted 支持实体及已归档实体保持 CLI 边界。接受实体候选时后端会按目标实体 ID 再次计算可见性，不能通过手工构造请求绕过列表过滤。
 
 `graph project` 是不落库的确定性实体共现投影。节点只来自 active 规范实体，边只表示两个实体逐字出现在同一条当前原子证据中，不代表因果、隶属、依赖或其他业务关系。默认只消费 `verified` 证据；`--include-unverified` 仅用于审核探索，会额外加入 draft、reviewing 和 conflicted，但 deprecated、archived 以及所有 `restricted` 支持始终排除。输出只包含实体、状态/密级集合和支持证据 ID，不包含证据原文，也不提供文件导出。
+
+SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支撑。`relation type-add` 只登记人工定义的有向或无向关系类型；`relation add` 必须显式选择两个 active 实体和至少一条当前 `verified` 证据，并逐条确认该证据已有两个端点的人工逐字提及关联。系统不会把共现、名称相似度或模型候选自动提升为业务关系。无向关系会按实体 ID 规范化方向，重复 active 关系被唯一约束阻断；关系可 `active → retracted`，撤销保留端点、证据和操作者历史，说明正文只以 SHA-256 写入数据库与审计。被任何业务关系历史引用的实体提及不可解除；源实体一旦存在业务关系历史，实体合并也会整体阻断，避免迁移提及时静默改写过去的关系语义。
+
+`graph business` 只读投影 active 人工业务关系中仍有“当前文件版本＋当前处理运行＋verified＋非 restricted”支撑的边。旧版本、状态退回或仅 restricted 支撑会使关系退出投影，但不会删除历史记录；Lint 会把失去当前 verified 支撑的 active 关系标为待复核警告。输出保留关系类型、方向和支撑证据 ID，不返回证据原文，也不建立第二套图数据库。
 
 跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
 

@@ -272,6 +272,26 @@ def unlink_evidence_entity(
         ).fetchall()
         if not rows:
             raise KnowledgeWorkbenchError("该证据没有关联此规范实体")
+        relationship = connection.execute(
+            """
+            SELECT er.id
+            FROM entity_relationship_evidence ere
+            JOIN entity_relationships er ON er.id = ere.relationship_id
+            WHERE ere.evidence_id = ?
+              AND (
+                  er.source_entity_id = ?
+                  OR er.target_entity_id = ?
+              )
+            ORDER BY er.id
+            LIMIT 1
+            """,
+            (evidence_id, entity_id, entity_id),
+        ).fetchone()
+        if relationship:
+            raise KnowledgeWorkbenchError(
+                "该实体提及已被业务关系历史引用，不能解除："
+                + relationship["id"]
+            )
         connection.execute(
             """
             DELETE FROM evidence_entity_mentions
