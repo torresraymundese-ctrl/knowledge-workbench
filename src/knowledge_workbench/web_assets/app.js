@@ -25,6 +25,11 @@ const eventLabels = {
   conflict_candidate_label_updated: "跨文档冲突标签已更新",
   conflict_candidate_review_updated: "跨文档冲突复核已更新",
   conflict_dataset_finalized: "跨文档冲突数据集已固化",
+  entity_candidates_imported: "实体候选已导入",
+  entity_candidate_accepted: "实体候选已接受",
+  entity_candidate_rejected: "实体候选已驳回",
+  entity_alias_added: "实体别名已登记",
+  evidence_entity_linked: "证据已关联实体",
   worker_started: "后台工作器已启动",
   worker_stopped: "后台工作器已停止",
   labeling_session_created: "黄金标注已创建",
@@ -52,6 +57,12 @@ const candidateState = {
   state: "all",
   query: "",
   contentSha256: "",
+};
+const entityCandidateState = {
+  limit: 10,
+  offset: 0,
+  status: "pending",
+  query: "",
 };
 const candidatePhaseLabels = {
   labeling: "标注中",
@@ -549,6 +560,161 @@ async function refreshReviewQueues() {
   }
 }
 
+async function acceptEntityCandidate(candidate, entitySelect, noteInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const entityId = entitySelect.value;
+  if (!entityId) {
+    showBanner("请选择已存在的规范实体");
+    entitySelect.focus();
+    return;
+  }
+  if (!window.confirm(`确认把“${candidate.suggested_name}”作为逐字提及关联到所选规范实体？该操作将以 ${actor} 写入审计日志。`)) return;
+  try {
+    await postTransition(`/api/v1/entity-candidates/${encodeURIComponent(candidate.candidate_id)}/accept`, {
+      actor,
+      entity_id: entityId,
+      note: noteInput.value.trim() || null,
+    });
+    await loadDashboard();
+    showBanner(`实体候选已接受，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "实体候选接受失败");
+  }
+}
+
+async function rejectEntityCandidate(candidate, noteInput) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const note = noteInput.value.trim();
+  if (!note) {
+    showBanner("驳回实体候选必须填写复核意见");
+    noteInput.focus();
+    return;
+  }
+  if (!window.confirm(`确认驳回实体候选“${candidate.suggested_name}”？该终态决定将以 ${actor} 写入审计日志。`)) return;
+  try {
+    await postTransition(`/api/v1/entity-candidates/${encodeURIComponent(candidate.candidate_id)}/reject`, { actor, note });
+    await loadDashboard();
+    showBanner(`实体候选已驳回，审计操作者：${actor}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "实体候选驳回失败");
+  }
+}
+
+function renderEntityCandidates(page) {
+  document.querySelector("#entity-candidate-count").textContent = `${page.total} 项`;
+  const list = document.querySelector("#entity-candidate-list");
+  list.replaceChildren();
+  if (!page.items.length) {
+    list.append(element("div", "panel empty", "当前筛选没有非受限实体候选"));
+  }
+  page.items.forEach((candidate) => {
+    const card = element("article", "entity-candidate-card panel");
+    const heading = element("header", "entity-candidate-heading");
+    const title = element("div");
+    title.append(
+      element("h3", "", candidate.suggested_name),
+      element("small", "", `${shortId(candidate.candidate_id)} · ${candidate.suggested_type}`),
+    );
+    const badges = element("div", "entity-candidate-badges");
+    badges.append(
+      element("span", `tag ${candidate.classification}`, candidate.classification),
+      element("span", "tag", statusLabels[candidate.status] || candidate.status),
+      element("span", `tag ${candidate.verbatim_match ? "internal" : "restricted"}`, candidate.verbatim_match ? "逐字命中" : "非逐字"),
+      element("span", `tag ${candidate.source_is_current ? "internal" : "restricted"}`, candidate.source_is_current ? "来源当前" : "来源过期"),
+    );
+    heading.append(title, badges);
+
+    const body = element("div", "entity-candidate-body");
+    const metadata = element("div", "entity-candidate-metadata");
+    metadata.append(
+      element("span", "", `证据 ID：${candidate.evidence_id}`),
+      element("span", "", `模型候选 ID：${candidate.source_candidate_id}`),
+      element("span", "", `来源：${candidate.provider}${candidate.model ? ` / ${candidate.model}` : ""}`),
+      element("span", "", `提示词版本：${candidate.prompt_version}`),
+      element("span", "", `导入时间：${formatTime(candidate.created_at)}`),
+    );
+    const actions = element("div", "entity-candidate-actions");
+    if (candidate.status === "pending") {
+      const compatibleEntities = [...page.entity_options].sort((left, right) => {
+        const leftMatch = left.entity_type === candidate.suggested_type ? 0 : 1;
+        const rightMatch = right.entity_type === candidate.suggested_type ? 0 : 1;
+        return leftMatch - rightMatch || left.canonical_name.localeCompare(right.canonical_name, "zh-CN");
+      });
+      const entitySelect = element("select");
+      const placeholder = element("option", "", compatibleEntities.length ? "选择规范实体（同类型优先）" : "暂无规范实体，请先使用 CLI 创建");
+      placeholder.value = "";
+      entitySelect.append(placeholder);
+      compatibleEntities.forEach((entityOption) => {
+        const option = element("option", "", `${entityOption.canonical_name} · ${entityOption.entity_type} · ${entityOption.evidence_count} 条证据`);
+        option.value = entityOption.entity_id;
+        entitySelect.append(option);
+      });
+      const acceptNote = element("textarea");
+      acceptNote.maxLength = 2000;
+      acceptNote.rows = 2;
+      acceptNote.placeholder = "接受说明（可选，仅审计保存哈希）";
+      const acceptRow = element("div", "entity-candidate-action-row");
+      const acceptButton = button("接受并关联", "primary", () => acceptEntityCandidate(candidate, entitySelect, acceptNote));
+      acceptButton.disabled = !candidate.verbatim_match || !candidate.source_is_current || !compatibleEntities.length;
+      acceptRow.append(entitySelect, acceptButton);
+
+      const rejectNote = element("textarea");
+      rejectNote.maxLength = 2000;
+      rejectNote.rows = 2;
+      rejectNote.placeholder = "驳回意见（必填，仅审计保存哈希）";
+      const rejectRow = element("div", "entity-candidate-action-row");
+      rejectRow.append(rejectNote, button("驳回候选", "danger", () => rejectEntityCandidate(candidate, rejectNote)));
+      actions.append(acceptNote, acceptRow, rejectRow);
+    } else {
+      const result = candidate.status === "accepted"
+        ? `已关联：${candidate.canonical_name || candidate.resolved_entity_id}`
+        : "已驳回，不可再次流转";
+      actions.append(element("div", "entity-candidate-terminal", `${result} · ${candidate.reviewed_by || "未知审核人"} · ${formatTime(candidate.reviewed_at)}`));
+    }
+    body.append(metadata, actions);
+    card.append(heading, body);
+    list.append(card);
+  });
+
+  const pagination = document.querySelector("#entity-candidate-pagination");
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previous = button("上一页", "", async () => {
+    entityCandidateState.offset = Math.max(0, page.offset - page.limit);
+    await refreshEntityCandidates();
+  });
+  previous.disabled = !page.has_previous;
+  const next = button("下一页", "", async () => {
+    entityCandidateState.offset = page.offset + page.limit;
+    await refreshEntityCandidates();
+  });
+  next.disabled = !page.has_next;
+  pagination.replaceChildren(previous, element("span", "", `第 ${pageNumber}/${pageCount} 页 · ${page.total} 项`), next);
+}
+
+async function loadEntityCandidates() {
+  const parameters = new URLSearchParams({
+    limit: String(entityCandidateState.limit),
+    offset: String(entityCandidateState.offset),
+    status: entityCandidateState.status,
+  });
+  if (entityCandidateState.query) parameters.set("q", entityCandidateState.query);
+  const response = await fetch(`/api/v1/entity-candidates?${parameters}`, { headers: { Accept: "application/json" } });
+  const page = await response.json();
+  if (!response.ok) throw new Error(page.error || `实体候选读取失败（HTTP ${response.status}）`);
+  renderEntityCandidates(page);
+}
+
+async function refreshEntityCandidates() {
+  try {
+    await loadEntityCandidates();
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "实体候选读取失败");
+  }
+}
+
 function candidateSide(side, label) {
   const root = element("section", "candidate-side");
   const heading = element("div", "candidate-side-heading");
@@ -846,7 +1012,13 @@ async function loadDashboard() {
       document.querySelector("#candidate-pagination").replaceChildren();
       showBanner(message);
     });
-    await Promise.all([loadReviewQueues(), candidateLoad]);
+    const entityCandidateLoad = loadEntityCandidates().catch((cause) => {
+      const message = cause instanceof Error ? cause.message : "实体候选读取失败";
+      document.querySelector("#entity-candidate-list").replaceChildren(element("div", "panel empty", message));
+      document.querySelector("#entity-candidate-pagination").replaceChildren();
+      showBanner(message);
+    });
+    await Promise.all([loadReviewQueues(), candidateLoad, entityCandidateLoad]);
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -884,6 +1056,21 @@ document.querySelector("#clear-review-filters").addEventListener("click", async 
   reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
   reviewState.historyOffset = 0;
   await refreshReviewQueues();
+});
+document.querySelector("#entity-candidate-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  entityCandidateState.status = document.querySelector("#entity-candidate-status").value;
+  entityCandidateState.query = document.querySelector("#entity-candidate-query").value.trim();
+  entityCandidateState.offset = 0;
+  await refreshEntityCandidates();
+});
+document.querySelector("#clear-entity-candidate-filters").addEventListener("click", async () => {
+  document.querySelector("#entity-candidate-status").value = "pending";
+  document.querySelector("#entity-candidate-query").value = "";
+  entityCandidateState.status = "pending";
+  entityCandidateState.query = "";
+  entityCandidateState.offset = 0;
+  await refreshEntityCandidates();
 });
 document.querySelector("#candidate-filters").addEventListener("submit", async (event) => {
   event.preventDefault();

@@ -12,6 +12,8 @@ from knowledge_workbench.conflict_candidates import (
     create_cross_document_candidate_pack,
 )
 from knowledge_workbench.database import Database
+from knowledge_workbench.entities import create_entity
+from knowledge_workbench.entity_candidates import import_entity_candidates
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
@@ -1064,6 +1066,168 @@ class WorkbenchWebTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(refreshed.body)["total"], 1)
 
+    def test_entity_candidate_web_review_is_paginated_and_blocks_restricted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal = root / "内部实体.md"
+            restricted = root / "受限实体.md"
+            internal.write_text("甲公司负责甲项目。", encoding="utf-8")
+            restricted.write_text("火星公司负责受限项目。", encoding="utf-8")
+            internal_result = ingest_file(
+                internal, paths, Classification.INTERNAL
+            )
+            restricted_result = ingest_file(
+                restricted, paths, Classification.RESTRICTED
+            )
+            database = Database(paths.database)
+            import_entity_candidates(
+                database,
+                _model_entity_analysis(
+                    paths,
+                    internal_result.processing_run_id,
+                    [
+                        {"name": "甲公司", "type": "organization"},
+                        {"name": "乙公司", "type": "organization"},
+                    ],
+                    suffix="internal",
+                ),
+                actor="curator-01",
+            )
+            import_entity_candidates(
+                database,
+                _model_entity_analysis(
+                    paths,
+                    restricted_result.processing_run_id,
+                    [{"name": "火星公司", "type": "organization"}],
+                    suffix="restricted",
+                ),
+                actor="curator-01",
+            )
+            entity_id = create_entity(
+                database, "甲集团", "organization", actor="curator-01"
+            )
+            with database.connect() as connection:
+                candidate_ids = {
+                    row["suggested_name"]: row["id"]
+                    for row in connection.execute(
+                        "SELECT id, suggested_name FROM entity_candidates"
+                    ).fetchall()
+                }
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+
+            first = application.handle(
+                "GET", "/api/v1/entity-candidates?status=pending&limit=1"
+            )
+            self.assertEqual(first.status, 200)
+            page = json.loads(first.body)
+            self.assertEqual(page["total"], 2)
+            self.assertEqual(len(page["items"]), 1)
+            self.assertTrue(page["has_next"])
+            self.assertEqual(page["entity_options"][0]["entity_id"], entity_id)
+            serialized = first.body.decode("utf-8")
+            self.assertNotIn("火星公司", serialized)
+            self.assertNotIn("受限实体", serialized)
+            self.assertNotIn("excerpt", serialized)
+            self.assertNotIn("source_path", serialized)
+            searched = application.handle(
+                "GET", "/api/v1/entity-candidates?status=pending&q=甲公司"
+            )
+            self.assertEqual(json.loads(searched.body)["total"], 1)
+            invalid = application.handle(
+                "GET", "/api/v1/entity-candidates?status=reviewing"
+            )
+            self.assertEqual(invalid.status, 400)
+
+            headers = {
+                "Content-Type": "application/json",
+                "X-Workbench-CSRF": "csrf",
+            }
+            accept_route = (
+                f"/api/v1/entity-candidates/{candidate_ids['甲公司']}/accept"
+            )
+            accept_body = json.dumps(
+                {
+                    "actor": "reviewer-01",
+                    "entity_id": entity_id,
+                    "note": "确认同一组织",
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            no_csrf = application.handle(
+                "POST",
+                accept_route,
+                body=accept_body,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(no_csrf.status, 403)
+            accepted = application.handle(
+                "POST", accept_route, body=accept_body, headers=headers
+            )
+            self.assertEqual(accepted.status, 200)
+            accepted_payload = json.loads(accepted.body)["result"]
+            self.assertEqual(accepted_payload["entity_id"], candidate_ids["甲公司"])
+            self.assertEqual(accepted_payload["resolved_entity_id"], entity_id)
+
+            non_verbatim_route = (
+                f"/api/v1/entity-candidates/{candidate_ids['乙公司']}/accept"
+            )
+            blocked = application.handle(
+                "POST", non_verbatim_route, body=accept_body, headers=headers
+            )
+            self.assertEqual(blocked.status, 409)
+            reject_route = (
+                f"/api/v1/entity-candidates/{candidate_ids['乙公司']}/reject"
+            )
+            missing_note = application.handle(
+                "POST",
+                reject_route,
+                body=json.dumps({"actor": "reviewer-01"}).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(missing_note.status, 400)
+            rejected = application.handle(
+                "POST",
+                reject_route,
+                body=json.dumps(
+                    {"actor": "reviewer-01", "note": "原文没有该名称"},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                headers=headers,
+            )
+            self.assertEqual(rejected.status, 200)
+
+            restricted_route = (
+                f"/api/v1/entity-candidates/{candidate_ids['火星公司']}/accept"
+            )
+            restricted_write = application.handle(
+                "POST", restricted_route, body=accept_body, headers=headers
+            )
+            self.assertEqual(restricted_write.status, 403)
+            history = application.handle(
+                "GET", "/api/v1/entity-candidates?status=all"
+            )
+            history_payload = json.loads(history.body)
+            self.assertEqual(history_payload["total"], 2)
+            self.assertEqual(
+                {item["status"] for item in history_payload["items"]},
+                {"accepted", "rejected"},
+            )
+            with database.connect() as connection:
+                statuses = {
+                    row["suggested_name"]: row["status"]
+                    for row in connection.execute(
+                        "SELECT suggested_name, status FROM entity_candidates"
+                    ).fetchall()
+                }
+            self.assertEqual(statuses["甲公司"], "accepted")
+            self.assertEqual(statuses["乙公司"], "rejected")
+            self.assertEqual(statuses["火星公司"], "pending")
+
     def test_http_server_sets_security_headers_and_binds_loopback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1138,6 +1302,30 @@ class WorkbenchWebTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+
+def _model_entity_analysis(
+    paths: WorkspacePaths,
+    processing_run_id: str,
+    entities: list[dict],
+    *,
+    suffix: str,
+) -> Path:
+    source_path = paths.analysis / f"{processing_run_id}.analysis.json"
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    payload["provenance"] = {
+        "mode": "model_assisted",
+        "provider": "DeepSeekChatModel",
+        "model": "deepseek-chat",
+        "prompt_version": "analysis-v3-source-anchored",
+    }
+    payload["evidence"][0]["entities"] = entities
+    output = paths.analysis / f"{processing_run_id}.{suffix}.model-analysis.json"
+    output.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return output
 
 
 if __name__ == "__main__":

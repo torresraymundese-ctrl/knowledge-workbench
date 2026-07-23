@@ -85,6 +85,8 @@ class WorkbenchWebApplication:
                         "conflict-candidate-label",
                         "conflict-candidate-submit",
                         "conflict-candidate-review",
+                        "entity-candidate-accept",
+                        "entity-candidate-reject",
                     ],
                 }
                 return self._json(200, payload)
@@ -144,6 +146,16 @@ class WorkbenchWebApplication:
                 )
             if parsed.path == "/api/v1/conflict-candidate-packs":
                 return self._json(200, self.read_service.conflict_candidate_packs())
+            if parsed.path == "/api/v1/entity-candidates":
+                return self._json(
+                    200,
+                    self.read_service.entity_candidate_page(
+                        limit=_integer_query(query, "limit", 10),
+                        offset=_integer_query(query, "offset", 0),
+                        status=_string_query(query, "status") or "pending",
+                        query=_string_query(query, "q"),
+                    ),
+                )
             candidate_pack_id = _route_entity_id(
                 parsed.path, entity="conflict-candidate-packs", action="detail"
             )
@@ -207,6 +219,12 @@ class WorkbenchWebApplication:
         candidate_review_id = _route_entity_id(
             path, entity="conflict-candidate-packs", action="review"
         )
+        entity_candidate_accept_id = _route_entity_id(
+            path, entity="entity-candidates", action="accept"
+        )
+        entity_candidate_reject_id = _route_entity_id(
+            path, entity="entity-candidates", action="reject"
+        )
         if (
             evidence_id is None
             and conflict_id is None
@@ -216,6 +234,8 @@ class WorkbenchWebApplication:
             and candidate_label_id is None
             and candidate_submit_id is None
             and candidate_review_id is None
+            and entity_candidate_accept_id is None
+            and entity_candidate_reject_id is None
         ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
@@ -289,7 +309,7 @@ class WorkbenchWebApplication:
                     ),
                     actor=actor,
                 )
-            else:
+            elif candidate_review_id is not None:
                 result = self.action_service.update_conflict_candidate_review(
                     candidate_review_id or "",
                     str(payload.get("candidate_id", "")),
@@ -299,6 +319,23 @@ class WorkbenchWebApplication:
                     decision=str(payload.get("decision", "")),
                     note=payload.get("note"),
                     actor=actor,
+                )
+            elif entity_candidate_accept_id is not None:
+                result = self.action_service.accept_entity_candidate_web(
+                    entity_candidate_accept_id,
+                    str(payload.get("entity_id", "")),
+                    actor=actor,
+                    note=(
+                        None
+                        if payload.get("note") is None
+                        else str(payload.get("note"))
+                    ),
+                )
+            else:
+                result = self.action_service.reject_entity_candidate_web(
+                    entity_candidate_reject_id or "",
+                    actor=actor,
+                    note=str(payload.get("note", "")),
                 )
             return self._json(200, {"ok": True, "result": result})
         except (UnicodeError, json.JSONDecodeError):

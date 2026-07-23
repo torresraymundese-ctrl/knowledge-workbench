@@ -14,6 +14,7 @@ from .conflict_candidates import (
 )
 from .conflicts import transition_conflict
 from .database import Database
+from .entity_candidates import accept_entity_candidate, reject_entity_candidate
 from .errors import KnowledgeWorkbenchError
 from .models import ConflictStatus, EvidenceStatus
 from .review import (
@@ -69,6 +70,124 @@ class WorkbenchReadService:
             state=state,
             query=query,
         )
+
+    def entity_candidate_page(
+        self,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        status: str | None = "pending",
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        limit, offset = _pagination(limit, offset)
+        status = _entity_candidate_status(status)
+        query = _review_query(query)
+        where = ["d.classification != 'restricted'"]
+        parameters: list[Any] = []
+        if status:
+            where.append("ec.status = ?")
+            parameters.append(status)
+        if query:
+            pattern = f"%{query}%"
+            where.append(
+                "(ec.id LIKE ? OR ec.evidence_id LIKE ? "
+                "OR ec.source_candidate_id LIKE ? OR ec.suggested_name LIKE ? "
+                "OR ec.suggested_type LIKE ? OR ce.canonical_name LIKE ?)"
+            )
+            parameters.extend([pattern] * 6)
+        predicate = " AND ".join(where)
+        with self.database.connect() as connection:
+            total = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM entity_candidates ec
+                JOIN evidence e ON e.id = ec.evidence_id
+                JOIN processing_runs pr ON pr.id = ec.processing_run_id
+                JOIN document_versions dv ON dv.id = ec.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                LEFT JOIN canonical_entities ce ON ce.id = ec.resolved_entity_id
+                WHERE {predicate}
+                """,
+                parameters,
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT ec.id, ec.status, ec.suggested_name, ec.suggested_type,
+                       ec.verbatim_match, ec.evidence_id,
+                       ec.source_candidate_id, ec.provider, ec.model,
+                       ec.prompt_version, ec.resolved_entity_id,
+                       ec.reviewed_by, ec.created_at, ec.reviewed_at,
+                       d.classification, ce.canonical_name,
+                       CASE WHEN d.current_version_id = ec.document_version_id
+                                      AND pr.is_current = 1
+                                      AND pr.document_version_id = ec.document_version_id
+                                      AND e.processing_run_id = ec.processing_run_id
+                                      AND e.document_version_id = ec.document_version_id
+                            THEN 1 ELSE 0 END AS source_is_current
+                FROM entity_candidates ec
+                JOIN evidence e ON e.id = ec.evidence_id
+                JOIN processing_runs pr ON pr.id = ec.processing_run_id
+                JOIN document_versions dv ON dv.id = ec.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                LEFT JOIN canonical_entities ce ON ce.id = ec.resolved_entity_id
+                WHERE {predicate}
+                ORDER BY ec.created_at, ec.id
+                LIMIT ? OFFSET ?
+                """,
+                [*parameters, limit, offset],
+            ).fetchall()
+            entity_rows = connection.execute(
+                """
+                SELECT ce.id, ce.canonical_name, ce.entity_type,
+                       COUNT(DISTINCT eem.evidence_id) AS evidence_count
+                FROM canonical_entities ce
+                LEFT JOIN evidence_entity_mentions eem ON eem.entity_id = ce.id
+                WHERE ce.status = 'active'
+                GROUP BY ce.id
+                ORDER BY ce.entity_type, ce.canonical_name, ce.id
+                LIMIT 200
+                """
+            ).fetchall()
+        return {
+            "status": status,
+            "query": query,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_previous": offset > 0,
+            "has_next": offset + len(rows) < total,
+            "items": [
+                {
+                    "candidate_id": row["id"],
+                    "status": row["status"],
+                    "suggested_name": row["suggested_name"],
+                    "suggested_type": row["suggested_type"],
+                    "verbatim_match": bool(row["verbatim_match"]),
+                    "evidence_id": row["evidence_id"],
+                    "source_candidate_id": row["source_candidate_id"],
+                    "provider": row["provider"],
+                    "model": row["model"],
+                    "prompt_version": row["prompt_version"],
+                    "classification": row["classification"],
+                    "source_is_current": bool(row["source_is_current"]),
+                    "resolved_entity_id": row["resolved_entity_id"],
+                    "canonical_name": row["canonical_name"],
+                    "reviewed_by": row["reviewed_by"],
+                    "created_at": row["created_at"],
+                    "reviewed_at": row["reviewed_at"],
+                }
+                for row in rows
+            ],
+            "entity_options": [
+                {
+                    "entity_id": row["id"],
+                    "canonical_name": row["canonical_name"],
+                    "entity_type": row["entity_type"],
+                    "evidence_count": row["evidence_count"],
+                }
+                for row in entity_rows
+            ],
+        }
 
     def summary(self) -> dict[str, Any]:
         with self.database.connect() as connection:
@@ -793,6 +912,63 @@ class WorkbenchActionService:
             "actor": actor,
         }
 
+    def accept_entity_candidate_web(
+        self,
+        candidate_id: str,
+        entity_id: str,
+        *,
+        actor: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        entity_id = entity_id.strip()
+        if not entity_id:
+            raise ValueError("entity_id 不能为空")
+        note = _optional_note(note)
+        if self._entity_candidate_classification(candidate_id) == "restricted":
+            raise PermissionError("restricted 实体候选只能通过 CLI 审核")
+        result = accept_entity_candidate(
+            self.database,
+            candidate_id,
+            entity_id,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "entity_candidate",
+            "entity_id": candidate_id,
+            "candidate_id": candidate_id,
+            "resolved_entity_id": entity_id,
+            "status": "accepted",
+            "actor": actor,
+            "alias_created": result["alias_created"],
+            "evidence_link_created": result["evidence_link_created"],
+        }
+
+    def reject_entity_candidate_web(
+        self,
+        candidate_id: str,
+        *,
+        actor: str,
+        note: str,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        note = _required_entity_candidate_note(note)
+        if self._entity_candidate_classification(candidate_id) == "restricted":
+            raise PermissionError("restricted 实体候选只能通过 CLI 审核")
+        reject_entity_candidate(
+            self.database,
+            candidate_id,
+            actor=actor,
+            note=note,
+        )
+        return {
+            "entity_type": "entity_candidate",
+            "entity_id": candidate_id,
+            "status": "rejected",
+            "actor": actor,
+        }
+
     def update_conflict_candidate_label(
         self,
         pack_id: str,
@@ -1029,6 +1205,22 @@ class WorkbenchActionService:
             raise KnowledgeWorkbenchError(f"冲突不存在：{conflict_id}")
         return row["classification"]
 
+    def _entity_candidate_classification(self, candidate_id: str) -> str:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT d.classification
+                FROM entity_candidates ec
+                JOIN document_versions dv ON dv.id = ec.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE ec.id = ?
+                """,
+                (candidate_id,),
+            ).fetchone()
+        if not row:
+            raise KnowledgeWorkbenchError(f"实体候选不存在：{candidate_id}")
+        return row["classification"]
+
 
 def _pagination(limit: int, offset: int) -> tuple[int, int]:
     if limit < 1 or limit > 200:
@@ -1076,6 +1268,17 @@ def _review_query(value: str | None) -> str | None:
     return query
 
 
+def _entity_candidate_status(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    status = value.strip()
+    if status == "all":
+        return None
+    if status not in {"pending", "accepted", "rejected"}:
+        raise ValueError(f"实体候选不支持状态：{status}")
+    return status
+
+
 def _read_revision_content(
     paths: WorkspacePaths, relative_path: str, *, expected_sha256: str
 ) -> str:
@@ -1113,6 +1316,15 @@ def _required_review_note(value: str) -> str:
         raise ValueError("驳回 Wiki 修订必须填写复核意见")
     if len(note) > 2000:
         raise ValueError("Wiki 修订复核意见不能超过 2000 个字符")
+    return note
+
+
+def _required_entity_candidate_note(value: str) -> str:
+    note = value.strip()
+    if not note:
+        raise ValueError("驳回实体候选必须填写复核意见")
+    if len(note) > 2000:
+        raise ValueError("实体候选复核意见不能超过 2000 个字符")
     return note
 
 

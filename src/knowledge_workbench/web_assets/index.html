@@ -19,9 +19,10 @@
         <a class="nav-item active" href="#overview"><span>总览</span><kbd>1</kbd></a>
         <a class="nav-item" href="#documents"><span>资料</span><kbd>2</kbd></a>
         <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
-        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>4</kbd></a>
-        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>5</kbd></a>
-        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>6</kbd></a>
+        <a class="nav-item" href="#entity-candidates"><span>实体候选</span><kbd>4</kbd></a>
+        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>5</kbd></a>
+        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>6</kbd></a>
+        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>7</kbd></a>
       </nav>
       <div class="local-lock">
         <span class="status-dot" aria-hidden="true"></span>
@@ -140,6 +141,35 @@
           <span id="rejected-history-count" class="count-pill">—</span>
         </div>
         <div id="rejected-history" class="rejected-history panel"></div>
+      </section>
+
+      <section id="entity-candidates" aria-labelledby="entity-candidates-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">ENTITY CANDIDATES</p><h2 id="entity-candidates-title">实体候选审核</h2></div>
+          <span id="entity-candidate-count" class="count-pill">—</span>
+        </div>
+        <form id="entity-candidate-filters" class="candidate-toolbar entity-candidate-toolbar" role="search">
+          <label>
+            <span>状态</span>
+            <select id="entity-candidate-status">
+              <option value="pending">待处理</option>
+              <option value="accepted">已接受</option>
+              <option value="rejected">已驳回</option>
+              <option value="all">全部非受限候选</option>
+            </select>
+          </label>
+          <label>
+            <span>搜索</span>
+            <input id="entity-candidate-query" type="search" maxlength="120" placeholder="候选名称、类型、候选 ID 或证据 ID">
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">查询</button>
+            <button id="clear-entity-candidate-filters" type="button">清除</button>
+          </div>
+        </form>
+        <p class="entity-candidate-boundary">仅显示非 restricted 元数据；接受候选只会把逐字提及关联到已存在的规范实体，不会自动创建实体。</p>
+        <div id="entity-candidate-list" class="entity-candidate-list" aria-live="polite"></div>
+        <div id="entity-candidate-pagination" class="candidate-pagination panel"></div>
       </section>
 
       <section id="conflict-labeling" aria-labelledby="conflict-labeling-title">
