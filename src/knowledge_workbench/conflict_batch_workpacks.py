@@ -35,6 +35,8 @@ from .wiki import write_text_atomic
 
 _ANNOTATION_PACK_TYPE = "conflict-batch-annotation-pack"
 _REVIEW_PACK_TYPE = "conflict-batch-review-pack"
+ANNOTATION_PACK_TYPE = _ANNOTATION_PACK_TYPE
+REVIEW_PACK_TYPE = _REVIEW_PACK_TYPE
 
 
 def export_conflict_batch_annotation_pack(
@@ -485,6 +487,14 @@ def inspect_conflict_batch_work_pack(
             if pack_type == _REVIEW_PACK_TYPE
             else None
         )
+        already_applied = _work_pack_already_applied(
+            database,
+            metadata,
+            pack_type=pack_type,
+            actor=actor,
+            relative_path=relative_path,
+            content_sha256=sha256_text(content),
+        )
         records = _parse_candidate_sections(
             lines,
             start,
@@ -647,6 +657,8 @@ def inspect_conflict_batch_work_pack(
         issue_codes.append("review_actor_policy_conflict")
     if not submission_actor_valid:
         issue_codes.append("annotator_audit_mismatch")
+    if already_applied:
+        issue_codes.append("work_pack_already_applied")
 
     apply_ready = (
         integrity_valid
@@ -654,6 +666,7 @@ def inspect_conflict_batch_work_pack(
         and review_actor_policy_valid_value
         and submission_actor_valid
         and not unresolved_ids
+        and not already_applied
     )
     payload = {
         **base,
@@ -693,6 +706,7 @@ def inspect_conflict_batch_work_pack(
         ),
         "review_actor_policy_valid": review_actor_policy_valid_value,
         "submission_actor_valid": submission_actor_valid,
+        "already_applied": already_applied,
         "next_unresolved_candidate_id": (
             unresolved_ids[0] if unresolved_ids else None
         ),
@@ -702,6 +716,50 @@ def inspect_conflict_batch_work_pack(
     if validation_errors:
         payload["validation_errors"] = validation_errors
     return payload
+
+
+def _work_pack_already_applied(
+    database: Database,
+    metadata: dict[str, str],
+    *,
+    pack_type: str,
+    actor: str,
+    relative_path: str,
+    content_sha256: str,
+) -> bool:
+    event_type = (
+        "conflict_candidate_label_batch_applied"
+        if pack_type == _ANNOTATION_PACK_TYPE
+        else "conflict_candidate_review_batch_applied"
+    )
+    with database.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT details_json FROM audit_log
+            WHERE event_type = ?
+              AND entity_type = 'conflict_candidate_pack'
+              AND entity_id = ?
+              AND actor = ?
+            """,
+            (
+                event_type,
+                metadata["source_pack_id"],
+                actor,
+            ),
+        ).fetchall()
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"])
+        except json.JSONDecodeError:
+            continue
+        if (
+            details.get("plan_id") == metadata["plan_id"]
+            and details.get("batch_id") == metadata["batch_id"]
+            and details.get("work_pack_path") == relative_path
+            and details.get("work_pack_sha256") == content_sha256
+        ):
+            return True
+    return False
 
 
 def _resolved_source(

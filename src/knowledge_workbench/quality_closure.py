@@ -6,6 +6,11 @@ from typing import Any
 
 from .audit import record_event
 from .config import WorkspacePaths
+from .conflict_batch_workpacks import (
+    ANNOTATION_PACK_TYPE as CONFLICT_ANNOTATION_PACK_TYPE,
+    REVIEW_PACK_TYPE as CONFLICT_REVIEW_PACK_TYPE,
+    inspect_conflict_batch_work_pack,
+)
 from .conflict_labeling_plan import list_conflict_labeling_plans
 from .database import Database
 from .entity_relationships import project_business_relationship_graph
@@ -155,8 +160,22 @@ def build_quality_closure_status(
                 "labeled_count": conflict["labeled_count"],
                 "candidate_count": conflict["candidate_count"],
                 "unlabeled_count": conflict["unlabeled_count"],
+                "annotation_work_pack_ready_count": work_packs[
+                    "conflict_annotation_ready_count"
+                ],
+                "annotation_work_pack_incomplete_count": work_packs[
+                    "conflict_annotation_incomplete_count"
+                ],
+                "annotation_work_pack_invalid_count": work_packs[
+                    "conflict_annotation_invalid_count"
+                ],
+                "annotation_work_pack_applied_count": work_packs[
+                    "conflict_annotation_applied_count"
+                ],
             },
-            next_action="逐批人工回源标注跨文档冲突候选",
+            next_action=_conflict_annotation_next_action(
+                work_packs
+            ),
             phase="human_data",
         ),
         _gate(
@@ -191,10 +210,21 @@ def build_quality_closure_status(
                 ],
                 "candidate_count": conflict["candidate_count"],
                 "unreviewed_count": conflict["unreviewed_count"],
+                "review_work_pack_ready_count": work_packs[
+                    "conflict_review_ready_count"
+                ],
+                "review_work_pack_incomplete_count": work_packs[
+                    "conflict_review_incomplete_count"
+                ],
+                "review_work_pack_invalid_count": work_packs[
+                    "conflict_review_invalid_count"
+                ],
+                "review_work_pack_applied_count": work_packs[
+                    "conflict_review_applied_count"
+                ],
             },
-            next_action=(
-                "提交整包后逐批人工复核；单人模式必须显式记录"
-                " solo_attested，不能冒充独立复核"
+            next_action=_conflict_review_next_action(
+                conflict, work_packs
             ),
             phase="human_data",
         ),
@@ -842,6 +872,9 @@ def _work_pack_status(
     graph_gold_work_packs = _graph_gold_work_pack_status(
         database, paths
     )
+    conflict_work_packs = _conflict_work_pack_status(
+        database, paths
+    )
     return {
         "conflict_annotation_export_count": counts.get(
             "conflict_batch_annotation_pack_exported", 0
@@ -879,8 +912,72 @@ def _work_pack_status(
         "graph_gold_dataset_finalized_count": counts.get(
             "graph_gold_dataset_finalized", 0
         ),
+        **conflict_work_packs,
         **graph_gold_work_packs,
     }
+
+
+def _conflict_work_pack_status(
+    database: Database,
+    paths: WorkspacePaths,
+) -> dict[str, int]:
+    metrics = {
+        "conflict_annotation_work_pack_count": 0,
+        "conflict_annotation_ready_count": 0,
+        "conflict_annotation_incomplete_count": 0,
+        "conflict_annotation_invalid_count": 0,
+        "conflict_annotation_applied_count": 0,
+        "conflict_review_work_pack_count": 0,
+        "conflict_review_ready_count": 0,
+        "conflict_review_incomplete_count": 0,
+        "conflict_review_invalid_count": 0,
+        "conflict_review_applied_count": 0,
+    }
+    if not paths.evaluations.exists():
+        return metrics
+    declarations = {
+        CONFLICT_ANNOTATION_PACK_TYPE: "annotation",
+        CONFLICT_REVIEW_PACK_TYPE: "review",
+    }
+    invalid_issue_codes = {
+        "invalid_work_pack_format",
+        "scope_invalid",
+        "export_audit_or_template_invalid",
+        "source_content_drift",
+        "source_phase_invalid",
+        "review_actor_policy_conflict",
+        "annotator_audit_mismatch",
+    }
+    for path in sorted(paths.evaluations.glob("*.md")):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        work_pack_type = _declared_work_pack_type(
+            content, declarations
+        )
+        if work_pack_type is None:
+            continue
+        prefix = f"conflict_{work_pack_type}"
+        metrics[f"{prefix}_work_pack_count"] += 1
+        try:
+            status = inspect_conflict_batch_work_pack(
+                database, paths, path
+            )
+        except KnowledgeWorkbenchError:
+            metrics[f"{prefix}_invalid_count"] += 1
+            continue
+        if status.get("already_applied", False):
+            metrics[f"{prefix}_applied_count"] += 1
+        elif invalid_issue_codes.intersection(
+            status.get("issue_codes", [])
+        ):
+            metrics[f"{prefix}_invalid_count"] += 1
+        elif status["apply_ready"]:
+            metrics[f"{prefix}_ready_count"] += 1
+        else:
+            metrics[f"{prefix}_incomplete_count"] += 1
+    return metrics
 
 
 def _graph_gold_work_pack_status(
@@ -906,8 +1003,12 @@ def _graph_gold_work_pack_status(
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        work_pack_type = _declared_graph_gold_work_pack_type(
-            content
+        work_pack_type = _declared_work_pack_type(
+            content,
+            {
+                ANNOTATION_PACK_TYPE: "annotation",
+                REVIEW_PACK_TYPE: "review",
+            },
         )
         if work_pack_type is None:
             continue
@@ -931,8 +1032,9 @@ def _graph_gold_work_pack_status(
     return metrics
 
 
-def _declared_graph_gold_work_pack_type(
+def _declared_work_pack_type(
     content: str,
+    declarations: dict[str, str],
 ) -> str | None:
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -952,10 +1054,41 @@ def _declared_graph_gold_work_pack_type(
         key, value = line.split(":", 1)
         if key.strip() == "type":
             declared_type = value.strip()
-    return {
-        ANNOTATION_PACK_TYPE: "annotation",
-        REVIEW_PACK_TYPE: "review",
-    }.get(declared_type)
+    return declarations.get(declared_type)
+
+
+def _conflict_annotation_next_action(
+    work_packs: dict[str, int],
+) -> str:
+    if work_packs["conflict_annotation_ready_count"] > 0:
+        return "应用已完成的冲突标注批次工作包"
+    if work_packs["conflict_annotation_incomplete_count"] > 0:
+        return (
+            "继续逐条回源填写现有冲突标注批次，再运行只读预检"
+        )
+    if work_packs["conflict_annotation_invalid_count"] > 0:
+        return "重新导出来源漂移或完整性失效的冲突标注批次"
+    return "导出下一批冲突候选并逐条人工回源标注"
+
+
+def _conflict_review_next_action(
+    conflict: dict[str, Any],
+    work_packs: dict[str, int],
+) -> str:
+    if not conflict["annotation_complete"]:
+        return "先完成全部冲突候选标注，再提交整包进入人工复核"
+    if work_packs["conflict_review_ready_count"] > 0:
+        return "应用已完成的冲突人工复核批次工作包"
+    if work_packs["conflict_review_incomplete_count"] > 0:
+        return (
+            "继续逐案填写现有冲突复核批次，再运行只读预检"
+        )
+    if work_packs["conflict_review_invalid_count"] > 0:
+        return "重新导出来源漂移或完整性失效的冲突复核批次"
+    return (
+        "提交完整候选包并导出人工复核批次；单人模式必须"
+        "显式记录 solo_attested"
+    )
 
 
 def _graph_gold_next_action(work_packs: dict[str, int]) -> str:

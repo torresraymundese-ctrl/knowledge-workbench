@@ -154,6 +154,16 @@ class QualityClosureStatusTests(unittest.TestCase):
                 0,
             )
             for metric in (
+                "conflict_annotation_work_pack_count",
+                "conflict_annotation_ready_count",
+                "conflict_annotation_incomplete_count",
+                "conflict_annotation_invalid_count",
+                "conflict_annotation_applied_count",
+                "conflict_review_work_pack_count",
+                "conflict_review_ready_count",
+                "conflict_review_incomplete_count",
+                "conflict_review_invalid_count",
+                "conflict_review_applied_count",
                 "graph_entity_curation_export_count",
                 "graph_entity_curation_applied_count",
                 "graph_relationship_curation_export_count",

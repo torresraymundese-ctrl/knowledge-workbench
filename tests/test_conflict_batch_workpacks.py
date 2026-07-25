@@ -26,6 +26,9 @@ from knowledge_workbench.errors import (
 )
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
+from knowledge_workbench.quality_closure import (
+    build_quality_closure_status,
+)
 from knowledge_workbench.review_assurance import (
     SOLO_ATTESTATION_PHRASE,
 )
@@ -297,6 +300,15 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 blank_status["source_phase"], "labeling"
             )
             self.assertFalse(blank_status["apply_ready"])
+            blank_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            self.assertEqual(
+                blank_quality["metrics"]["work_packs"][
+                    "conflict_annotation_incomplete_count"
+                ],
+                2,
+            )
             with database.connect() as connection:
                 audit_count_after_status = connection.execute(
                     "SELECT COUNT(*) FROM audit_log"
@@ -369,6 +381,39 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 len(applied_first["candidate_ids"]),
                 len(first_batch["candidate_ids"]),
             )
+            applied_first_work_pack = (
+                inspect_conflict_batch_work_pack(
+                    database, paths, first_path
+                )
+            )
+            self.assertTrue(
+                applied_first_work_pack["already_applied"]
+            )
+            self.assertFalse(
+                applied_first_work_pack["apply_ready"]
+            )
+            self.assertIn(
+                "work_pack_already_applied",
+                applied_first_work_pack["issue_codes"],
+            )
+            applied_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            applied_work_packs = applied_quality["metrics"][
+                "work_packs"
+            ]
+            self.assertEqual(
+                applied_work_packs[
+                    "conflict_annotation_applied_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                applied_work_packs[
+                    "conflict_annotation_invalid_count"
+                ],
+                2,
+            )
             first_status = inspect_conflict_labeling_plan(
                 database, paths, plan_path
             )
@@ -418,6 +463,19 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
                 second_batch["candidate_ids"],
             )
             second_path.write_text(second_content, encoding="utf-8")
+            ready_second = inspect_conflict_batch_work_pack(
+                database, paths, second_path
+            )
+            self.assertTrue(ready_second["apply_ready"])
+            ready_second_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            self.assertEqual(
+                ready_second_quality["metrics"]["work_packs"][
+                    "conflict_annotation_ready_count"
+                ],
+                1,
+            )
             apply_conflict_batch_annotation_pack(
                 database,
                 paths,
@@ -492,6 +550,17 @@ class ConflictBatchWorkPackTests(unittest.TestCase):
             self.assertEqual(
                 len(reviewed["candidate_ids"]),
                 len(first_batch["candidate_ids"]),
+            )
+            applied_review_work_pack = (
+                inspect_conflict_batch_work_pack(
+                    database, paths, review_path
+                )
+            )
+            self.assertTrue(
+                applied_review_work_pack["already_applied"]
+            )
+            self.assertFalse(
+                applied_review_work_pack["apply_ready"]
             )
             reviewed_status = inspect_conflict_labeling_plan(
                 database, paths, plan_path
