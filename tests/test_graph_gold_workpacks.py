@@ -24,6 +24,7 @@ from knowledge_workbench.graph_gold_workpacks import (
     apply_graph_gold_review_work_pack,
     export_graph_gold_annotation_work_pack,
     export_graph_gold_review_work_pack,
+    inspect_graph_gold_work_pack,
 )
 from knowledge_workbench.graph_pilot import build_graph_pilot_pack
 from knowledge_workbench.ingest import ingest_file
@@ -105,6 +106,21 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             )
             review_content = review_path.read_text(encoding="utf-8")
             self.assertIn("非独立复核", review_content)
+            solo_blank_status = inspect_graph_gold_work_pack(
+                database, paths, review_path
+            )
+            self.assertEqual(
+                solo_blank_status["review_mode"], "solo_attested"
+            )
+            self.assertFalse(
+                solo_blank_status["independent_review"]
+            )
+            self.assertTrue(
+                solo_blank_status["solo_attestation_required"]
+            )
+            self.assertTrue(
+                solo_blank_status["review_actor_policy_valid"]
+            )
             review_path.write_text(
                 self._fill_review(
                     review_content,
@@ -117,6 +133,10 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            solo_ready_status = inspect_graph_gold_work_pack(
+                database, paths, review_path
+            )
+            self.assertTrue(solo_ready_status["apply_ready"])
             output = paths.evaluations / "solo-gold.json"
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "确认声明"
@@ -225,10 +245,44 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                 evidence_id, company_id, platform_id
             )
             original = annotation_path.read_text(encoding="utf-8")
+            with database.connect() as connection:
+                audit_count_before_status = connection.execute(
+                    "SELECT COUNT(*) FROM audit_log"
+                ).fetchone()[0]
+            blank_status = inspect_graph_gold_work_pack(
+                database, paths, annotation_path
+            )
+            self.assertEqual(
+                blank_status["work_pack_type"], "annotation"
+            )
+            self.assertTrue(blank_status["integrity_valid"])
+            self.assertTrue(blank_status["source_snapshot_valid"])
+            self.assertEqual(blank_status["case_count"], 0)
+            self.assertFalse(blank_status["annotation_valid"])
+            self.assertIn(
+                "dataset_name_missing", blank_status["issue_codes"]
+            )
+            self.assertIn("case_missing", blank_status["issue_codes"])
+            self.assertFalse(blank_status["apply_ready"])
+            with database.connect() as connection:
+                audit_count_after_status = connection.execute(
+                    "SELECT COUNT(*) FROM audit_log"
+                ).fetchone()[0]
+            self.assertEqual(
+                audit_count_before_status, audit_count_after_status
+            )
             annotation_path.write_text(
                 self._fill_annotation(original, annotation),
                 encoding="utf-8",
             )
+            ready_annotation = inspect_graph_gold_work_pack(
+                database, paths, annotation_path
+            )
+            self.assertTrue(ready_annotation["annotation_valid"])
+            self.assertEqual(ready_annotation["relation_case_count"], 2)
+            self.assertEqual(ready_annotation["path_case_count"], 1)
+            self.assertEqual(ready_annotation["issue_codes"], [])
+            self.assertTrue(ready_annotation["apply_ready"])
             candidate_path = paths.evaluations / "gold-candidate.json"
             saved = apply_graph_gold_annotation_work_pack(
                 database,
@@ -239,6 +293,11 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             )
             self.assertEqual(saved["relation_case_count"], 2)
             self.assertEqual(saved["path_case_count"], 1)
+            applied_annotation = inspect_graph_gold_work_pack(
+                database, paths, annotation_path
+            )
+            self.assertTrue(applied_annotation["already_applied"])
+            self.assertFalse(applied_annotation["apply_ready"])
             with self.assertRaisesRegex(
                 InvalidTransitionError, "已经应用"
             ):
@@ -284,6 +343,17 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                 actor="graph-reviewer",
             )
             review_content = review_path.read_text(encoding="utf-8")
+            blank_review = inspect_graph_gold_work_pack(
+                database, paths, review_path
+            )
+            self.assertEqual(blank_review["work_pack_type"], "review")
+            self.assertTrue(blank_review["integrity_valid"])
+            self.assertEqual(blank_review["case_count"], 3)
+            self.assertEqual(
+                blank_review["decision_counts"]["undecided"], 3
+            )
+            self.assertFalse(blank_review["decisions_complete"])
+            self.assertFalse(blank_review["apply_ready"])
             review_path.write_text(
                 self._fill_review(
                     review_content,
@@ -296,6 +366,17 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            ready_review = inspect_graph_gold_work_pack(
+                database, paths, review_path
+            )
+            self.assertEqual(ready_review["review_mode"], "independent")
+            self.assertTrue(ready_review["independent_review"])
+            self.assertEqual(
+                ready_review["decision_counts"]["approved"], 3
+            )
+            self.assertTrue(ready_review["decisions_complete"])
+            self.assertEqual(ready_review["issue_codes"], [])
+            self.assertTrue(ready_review["apply_ready"])
             dataset_path = paths.evaluations / "graph-gold-v1.json"
             result = apply_graph_gold_review_work_pack(
                 database,
@@ -307,6 +388,11 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             self.assertTrue(result["approved"])
             self.assertEqual(result["evaluation"]["case_count"], 3)
             self.assertEqual(result["evaluation"]["pass_rate"], 1.0)
+            applied_review = inspect_graph_gold_work_pack(
+                database, paths, review_path
+            )
+            self.assertTrue(applied_review["already_applied"])
+            self.assertFalse(applied_review["apply_ready"])
             dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 dataset["provenance"]["annotator"], "graph-annotator"
@@ -386,6 +472,14 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             annotation_path.write_text(
                 completed.replace("甲公司", "伪造公司", 1),
                 encoding="utf-8",
+            )
+            tampered_status = inspect_graph_gold_work_pack(
+                database, paths, annotation_path
+            )
+            self.assertFalse(tampered_status["integrity_valid"])
+            self.assertIn(
+                "protected_content_or_export_audit_invalid",
+                tampered_status["issue_codes"],
             )
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "受保护内容"
@@ -531,6 +625,14 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                 candidate_path,
                 actor="graph-annotator",
             )
+            review_path = paths.evaluations / "review-before-drift.md"
+            export_graph_gold_review_work_pack(
+                database,
+                paths,
+                candidate_path,
+                review_path,
+                actor="graph-reviewer",
+            )
             relationship_id = list_entity_relationships(database)[0][
                 "relationship_id"
             ]
@@ -540,6 +642,18 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                 actor="external-curator",
                 note="外部并发撤销",
             )
+            drifted_status = inspect_graph_gold_work_pack(
+                database, paths, review_path
+            )
+            self.assertFalse(
+                drifted_status["source_snapshot_valid"]
+            )
+            self.assertFalse(drifted_status["integrity_valid"])
+            self.assertFalse(drifted_status["apply_ready"])
+            self.assertIn(
+                "source_snapshot_invalid",
+                drifted_status["issue_codes"],
+            )
             with self.assertRaisesRegex(
                 KnowledgeWorkbenchError, "来源或业务图快照已变化"
             ):
@@ -547,7 +661,7 @@ class GraphGoldWorkPackTests(unittest.TestCase):
                     database,
                     paths,
                     candidate_path,
-                    paths.evaluations / "review.md",
+                    paths.evaluations / "review-after-drift.md",
                     actor="graph-reviewer",
                 )
 

@@ -81,6 +81,7 @@ from .graph_gold_workpacks import (
     apply_graph_gold_review_work_pack,
     export_graph_gold_annotation_work_pack,
     export_graph_gold_review_work_pack,
+    inspect_graph_gold_work_pack,
 )
 from .ingest import ingest_file, initialize_workspace
 from .linting import lint_workspace
@@ -485,6 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
     graph_pilot_relationship_apply.add_argument(
         "--actor", required=True
     )
+    graph_gold_work_pack_status = graph_sub.add_parser(
+        "pilot-gold-work-pack-status",
+        help="只读预检图谱黄金标注或人工复核工作包",
+    )
+    graph_gold_work_pack_status.add_argument(
+        "work_pack", type=Path
+    )
     graph_gold_annotation_export = graph_sub.add_parser(
         "pilot-gold-annotation-export",
         help="导出绑定当前业务图快照的图谱黄金标注工作包",
@@ -514,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     graph_gold_review_apply = graph_sub.add_parser(
         "pilot-gold-review-apply",
-        help="应用异人复核并在全部批准后固化、评测图谱黄金集",
+        help="应用人工复核并在全部批准后固化、评测图谱黄金集",
     )
     graph_gold_review_apply.add_argument("work_pack", type=Path)
     graph_gold_review_apply.add_argument("output", type=Path)
@@ -1479,6 +1487,19 @@ def _handle_graph(
         )
         print("图谱试点业务关系裁决已原子应用。")
         _print_mapping(payload)
+        return
+    if args.graph_command == "pilot-gold-work-pack-status":
+        payload = inspect_graph_gold_work_pack(
+            database, paths, args.work_pack
+        )
+        print(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
     if args.graph_command == "pilot-gold-annotation-export":
         output = export_graph_gold_annotation_work_pack(

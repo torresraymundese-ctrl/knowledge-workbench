@@ -28,6 +28,7 @@ from .review_assurance import (
     SOLO_ATTESTATION_PHRASE,
     SOLO_ATTESTED_REVIEW_MODE,
     required_review_mode,
+    review_actor_policy_valid,
     review_audit_context,
     review_mode_from_metadata,
     validate_review_actor_policy,
@@ -45,6 +46,27 @@ CANDIDATE_SAVED_EVENT = "graph_gold_candidate_saved"
 REVIEW_EXPORT_EVENT = "graph_gold_review_pack_exported"
 REVIEW_APPLIED_EVENT = "graph_gold_review_applied"
 DATASET_FINALIZED_EVENT = "graph_gold_dataset_finalized"
+
+
+def inspect_graph_gold_work_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    work_pack_path: Path,
+) -> dict[str, Any]:
+    work_pack_path, content = _read_work_pack(
+        paths, work_pack_path, "图谱黄金工作包"
+    )
+    metadata, _, _ = _parse_frontmatter_metadata(content)
+    pack_type = metadata.get("type")
+    if pack_type == ANNOTATION_PACK_TYPE:
+        return _inspect_annotation_work_pack(
+            database, paths, work_pack_path, content
+        )
+    if pack_type == REVIEW_PACK_TYPE:
+        return _inspect_review_work_pack(
+            database, paths, work_pack_path, content
+        )
+    raise KnowledgeWorkbenchError("工作包类型不正确")
 
 
 def export_graph_gold_annotation_work_pack(
@@ -923,6 +945,15 @@ def _parse_review_pack(
 def _parse_frontmatter(
     content: str, expected_type: str
 ) -> tuple[dict[str, str], list[str], int]:
+    metadata, lines, start = _parse_frontmatter_metadata(content)
+    if metadata.get("type") != expected_type:
+        raise KnowledgeWorkbenchError("工作包类型不正确")
+    return metadata, lines, start
+
+
+def _parse_frontmatter_metadata(
+    content: str,
+) -> tuple[dict[str, str], list[str], int]:
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
         raise KnowledgeWorkbenchError("工作包缺少 YAML Frontmatter")
@@ -941,9 +972,409 @@ def _parse_frontmatter(
         if ":" in line:
             key, value = line.split(":", 1)
             metadata[key.strip()] = value.strip()
-    if metadata.get("type") != expected_type:
-        raise KnowledgeWorkbenchError("工作包类型不正确")
     return metadata, lines, end + 1
+
+
+def _inspect_annotation_work_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    work_pack_path: Path,
+    content: str,
+) -> dict[str, Any]:
+    issue_codes: list[str] = []
+    metadata: dict[str, str] = {}
+    annotation: dict[str, Any] = {}
+    structure_valid = True
+    try:
+        metadata, annotation = _parse_annotation_pack(content)
+    except KnowledgeWorkbenchError:
+        structure_valid = False
+        issue_codes.append("annotation_structure_invalid")
+
+    context = None
+    source_snapshot_valid = False
+    export_audit_valid = False
+    if structure_valid:
+        try:
+            source_path = _source_path(
+                paths, metadata["source_pack_path"]
+            )
+            context = _graph_context(database, paths, source_path)
+            _validate_context_metadata(metadata, context)
+            source_snapshot_valid = True
+        except (KeyError, KnowledgeWorkbenchError):
+            issue_codes.append("source_snapshot_invalid")
+        if context is not None and source_snapshot_valid:
+            try:
+                _validate_annotation_export(
+                    database,
+                    paths,
+                    work_pack_path,
+                    content,
+                    metadata,
+                    context,
+                    actor=metadata["annotator"],
+                )
+                export_audit_valid = True
+            except (KeyError, KnowledgeWorkbenchError):
+                issue_codes.append(
+                    "protected_content_or_export_audit_invalid"
+                )
+
+    name_present = bool(
+        isinstance(annotation.get("name"), str)
+        and annotation["name"].strip()
+    )
+    relation_cases = annotation.get("relation_cases")
+    path_cases = annotation.get("path_cases")
+    relation_case_count = (
+        len(relation_cases) if isinstance(relation_cases, list) else 0
+    )
+    path_case_count = (
+        len(path_cases) if isinstance(path_cases, list) else 0
+    )
+    case_count = relation_case_count + path_case_count
+    if structure_valid and not name_present:
+        issue_codes.append("dataset_name_missing")
+    if structure_valid and case_count == 0:
+        issue_codes.append("case_missing")
+
+    annotation_valid = False
+    if (
+        structure_valid
+        and source_snapshot_valid
+        and name_present
+        and case_count > 0
+        and context is not None
+    ):
+        preview = {
+            "schema_version": "1.0",
+            "pack_type": "graph-gold-candidate-pack",
+            "candidate_id": "graphgold_" + "0" * 32,
+            "status": "reviewing",
+            "name": annotation["name"],
+            "source": {
+                "graph_pilot_pack_id": context["pack"]["pack_id"],
+                "graph_pilot_pack_path": context["source_relative"],
+                "graph_pilot_pack_sha256": context["source_sha256"],
+                "graph_snapshot_sha256": context[
+                    "graph_snapshot_sha256"
+                ],
+            },
+            "annotator": metadata.get("annotator", ""),
+            "annotated_at": metadata.get("generated_at", utc_now()),
+            "relation_cases": relation_cases,
+            "path_cases": path_cases,
+        }
+        try:
+            _validate_candidate(database, context, preview)
+            annotation_valid = True
+        except KnowledgeWorkbenchError:
+            issue_codes.append("annotation_semantics_invalid")
+
+    already_applied = False
+    if structure_valid:
+        try:
+            _ensure_annotation_not_applied(
+                database, _relative(paths, work_pack_path)
+            )
+        except InvalidTransitionError:
+            already_applied = True
+            issue_codes.append("work_pack_already_applied")
+
+    integrity_valid = (
+        structure_valid
+        and source_snapshot_valid
+        and export_audit_valid
+    )
+    return {
+        "schema_version": "1.0",
+        "kind": "graph-gold-work-pack-status",
+        "work_pack_path": _relative(paths, work_pack_path),
+        "content_sha256": sha256_text(content),
+        "work_pack_type": "annotation",
+        "graph_pilot_pack_id": metadata.get(
+            "graph_pilot_pack_id"
+        ),
+        "actor_role": "annotator",
+        "actor": metadata.get("annotator"),
+        "structure_valid": structure_valid,
+        "source_snapshot_valid": source_snapshot_valid,
+        "export_audit_valid": export_audit_valid,
+        "integrity_valid": integrity_valid,
+        "dataset_name_present": name_present,
+        "relation_case_count": relation_case_count,
+        "path_case_count": path_case_count,
+        "case_count": case_count,
+        "annotation_valid": annotation_valid,
+        "already_applied": already_applied,
+        "issue_codes": list(dict.fromkeys(issue_codes)),
+        "apply_ready": (
+            integrity_valid
+            and annotation_valid
+            and not already_applied
+        ),
+    }
+
+
+def _inspect_review_work_pack(
+    database: Database,
+    paths: WorkspacePaths,
+    work_pack_path: Path,
+    content: str,
+) -> dict[str, Any]:
+    issue_codes: list[str] = []
+    try:
+        metadata, records = _inspect_review_records(content)
+        structure_valid = True
+    except KnowledgeWorkbenchError:
+        metadata = {}
+        records = []
+        structure_valid = False
+        issue_codes.append("review_structure_invalid")
+
+    review_mode = None
+    actor_policy_valid = False
+    if structure_valid:
+        try:
+            review_mode = review_mode_from_metadata(metadata)
+            actor_policy_valid = review_actor_policy_valid(
+                submitter=metadata["annotator"],
+                reviewer=metadata["reviewer"],
+                review_mode=review_mode,
+            )
+        except (KeyError, KnowledgeWorkbenchError):
+            actor_policy_valid = False
+        if not actor_policy_valid:
+            issue_codes.append("review_actor_policy_invalid")
+
+    source_snapshot_valid = False
+    export_audit_valid = False
+    case_scope_valid = False
+    candidate = None
+    if structure_valid:
+        try:
+            candidate_path = _source_path(
+                paths, metadata["candidate_path"]
+            )
+            (
+                _,
+                candidate_content,
+                candidate,
+                context,
+            ) = _resolve_candidate(database, paths, candidate_path)
+            if (
+                candidate["candidate_id"]
+                != metadata["graph_gold_candidate_id"]
+                or sha256_text(candidate_content)
+                != metadata["candidate_content_sha256"]
+                or context["graph_snapshot_sha256"]
+                != metadata["graph_snapshot_sha256"]
+            ):
+                raise KnowledgeWorkbenchError(
+                    "图谱黄金候选包或业务图快照已变化"
+                )
+            source_snapshot_valid = True
+            expected_ids = [
+                case["case_id"]
+                for _, case in _candidate_cases(candidate)
+            ]
+            case_scope_valid = [
+                item["case_id"] for item in records
+            ] == expected_ids
+            if not case_scope_valid:
+                issue_codes.append("case_scope_invalid")
+            try:
+                _validate_review_export(
+                    database,
+                    paths,
+                    work_pack_path,
+                    content,
+                    metadata,
+                    candidate,
+                    actor=metadata["reviewer"],
+                )
+                export_audit_valid = True
+            except KnowledgeWorkbenchError:
+                issue_codes.append(
+                    "protected_content_or_export_audit_invalid"
+                )
+        except (KeyError, KnowledgeWorkbenchError):
+            issue_codes.append("source_snapshot_invalid")
+
+    decision_counts = {
+        "approved": 0,
+        "rejected": 0,
+        "undecided": 0,
+        "conflicting": 0,
+    }
+    missing_note_count = 0
+    for record in records:
+        if record["approved"] is True:
+            decision_counts["approved"] += 1
+        elif record["approved"] is False:
+            decision_counts["rejected"] += 1
+            if not record["note"]:
+                missing_note_count += 1
+        elif record["decision_conflicting"]:
+            decision_counts["conflicting"] += 1
+        else:
+            decision_counts["undecided"] += 1
+    if decision_counts["undecided"]:
+        issue_codes.append("decision_missing")
+    if decision_counts["conflicting"]:
+        issue_codes.append("decision_conflicting")
+    if missing_note_count:
+        issue_codes.append("required_note_missing")
+
+    already_applied = False
+    if candidate is not None:
+        try:
+            _ensure_review_not_applied(
+                database,
+                candidate["candidate_id"],
+                _relative(paths, work_pack_path),
+            )
+        except InvalidTransitionError:
+            already_applied = True
+            issue_codes.append("work_pack_already_applied")
+
+    decisions_complete = (
+        len(records) > 0
+        and decision_counts["undecided"] == 0
+        and decision_counts["conflicting"] == 0
+        and missing_note_count == 0
+    )
+    integrity_valid = (
+        structure_valid
+        and source_snapshot_valid
+        and export_audit_valid
+        and case_scope_valid
+        and actor_policy_valid
+    )
+    return {
+        "schema_version": "1.0",
+        "kind": "graph-gold-work-pack-status",
+        "work_pack_path": _relative(paths, work_pack_path),
+        "content_sha256": sha256_text(content),
+        "work_pack_type": "review",
+        "graph_gold_candidate_id": metadata.get(
+            "graph_gold_candidate_id"
+        ),
+        "actor_role": "reviewer",
+        "actor": metadata.get("reviewer"),
+        "review_mode": review_mode,
+        "independent_review": (
+            review_mode == INDEPENDENT_REVIEW_MODE
+            if review_mode is not None
+            else None
+        ),
+        "solo_attestation_required": (
+            review_mode == SOLO_ATTESTED_REVIEW_MODE
+        ),
+        "review_actor_policy_valid": actor_policy_valid,
+        "structure_valid": structure_valid,
+        "source_snapshot_valid": source_snapshot_valid,
+        "export_audit_valid": export_audit_valid,
+        "case_scope_valid": case_scope_valid,
+        "integrity_valid": integrity_valid,
+        "case_count": len(records),
+        "decision_counts": decision_counts,
+        "missing_required_note_count": missing_note_count,
+        "decisions_complete": decisions_complete,
+        "already_applied": already_applied,
+        "issue_codes": list(dict.fromkeys(issue_codes)),
+        "apply_ready": (
+            integrity_valid
+            and decisions_complete
+            and not already_applied
+        ),
+    }
+
+
+def _inspect_review_records(
+    content: str,
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    metadata, lines, start = _parse_frontmatter(
+        content, REVIEW_PACK_TYPE
+    )
+    heading = re.compile(r"^##\s+Case\s+(\d{4})\s*$")
+    case_id_pattern = re.compile(r"^-\s+Case ID JSON：(.*)$")
+    approve_pattern = re.compile(r"^-\s+\[([ xX])\]\s+批准\s*$")
+    reject_pattern = re.compile(r"^-\s+\[([ xX])\]\s+驳回\s*$")
+    note_pattern = re.compile(r"^-\s+复核意见 JSON：(.*)$")
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines[start:]:
+        if match := heading.match(line):
+            if int(match.group(1)) != len(blocks) + 1:
+                raise KnowledgeWorkbenchError("复核用例编号不连续")
+            current = []
+            blocks.append(current)
+            continue
+        if current is not None:
+            current.append(line)
+    if not blocks:
+        raise KnowledgeWorkbenchError("复核工作包不包含用例")
+
+    records = []
+    for block in blocks:
+        case_values = [
+            match.group(1)
+            for line in block
+            if (match := case_id_pattern.match(line))
+        ]
+        approve_values = [
+            match.group(1)
+            for line in block
+            if (match := approve_pattern.match(line))
+        ]
+        reject_values = [
+            match.group(1)
+            for line in block
+            if (match := reject_pattern.match(line))
+        ]
+        note_values = [
+            match.group(1)
+            for line in block
+            if (match := note_pattern.match(line))
+        ]
+        if not (
+            len(case_values)
+            == len(approve_values)
+            == len(reject_values)
+            == len(note_values)
+            == 1
+        ):
+            raise KnowledgeWorkbenchError("复核用例字段不完整或重复")
+        try:
+            case_id = json.loads(case_values[0])
+        except json.JSONDecodeError as exc:
+            raise KnowledgeWorkbenchError(
+                "复核用例 case_id 不是有效 JSON 字符串"
+            ) from exc
+        if not isinstance(case_id, str):
+            raise KnowledgeWorkbenchError(
+                "复核用例 case_id 必须是字符串"
+            )
+        note = _json_note(note_values[0])
+        approve = approve_values[0].lower() == "x"
+        reject = reject_values[0].lower() == "x"
+        records.append(
+            {
+                "case_id": case_id,
+                "approved": (
+                    True
+                    if approve and not reject
+                    else False
+                    if reject and not approve
+                    else None
+                ),
+                "decision_conflicting": approve and reject,
+                "note": note,
+            }
+        )
+    return metadata, records
 
 
 def _validate_context_metadata(
