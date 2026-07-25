@@ -10,6 +10,10 @@ from jsonschema.exceptions import ValidationError
 from .errors import KnowledgeWorkbenchError
 from .citation_support import MINIMUM_CITATION_SUPPORT, assess_generation_citations
 from .models import ParsedUnit
+from .review_assurance import (
+    INDEPENDENT_REVIEW_MODE,
+    validate_review_actor_policy,
+)
 
 
 def load_schema(name: str) -> dict:
@@ -209,8 +213,30 @@ def validate_graph_evaluation_dataset(payload: dict) -> None:
     reviewer = provenance["reviewer"].strip()
     if not annotator or not reviewer:
         raise KnowledgeWorkbenchError("图谱评测标注人与复核人不能为空")
-    if annotator == reviewer:
-        raise KnowledgeWorkbenchError("图谱评测标注人与复核人必须不同")
+    review_mode = provenance.get(
+        "review_mode", INDEPENDENT_REVIEW_MODE
+    )
+    validate_review_actor_policy(
+        submitter=annotator,
+        reviewer=reviewer,
+        review_mode=review_mode,
+    )
+    if "review_mode" in provenance:
+        if "independent_review" not in provenance:
+            raise KnowledgeWorkbenchError(
+                "图谱评测复核保证级别缺少 independent_review"
+            )
+        expected_independent = (
+            review_mode == INDEPENDENT_REVIEW_MODE
+        )
+        if provenance["independent_review"] is not expected_independent:
+            raise KnowledgeWorkbenchError(
+                "图谱评测复核保证级别与 independent_review 不一致"
+            )
+    elif "independent_review" in provenance:
+        raise KnowledgeWorkbenchError(
+            "图谱评测 independent_review 缺少 review_mode"
+        )
     cases = [*payload["relation_cases"], *payload["path_cases"]]
     if not cases:
         raise KnowledgeWorkbenchError("图谱评测数据集至少需要一个用例")

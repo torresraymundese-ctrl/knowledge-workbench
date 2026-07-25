@@ -501,11 +501,17 @@ def build_parser() -> argparse.ArgumentParser:
     graph_gold_annotation_apply.add_argument("--actor", required=True)
     graph_gold_review_export = graph_sub.add_parser(
         "pilot-gold-review-export",
-        help="由不同 actor 导出图谱黄金逐案复核工作包",
+        help="导出图谱黄金逐案人工复核工作包",
     )
     graph_gold_review_export.add_argument("candidate", type=Path)
     graph_gold_review_export.add_argument("output", type=Path)
     graph_gold_review_export.add_argument("--actor", required=True)
+    graph_gold_review_export.add_argument(
+        "--review-mode",
+        choices=("independent", "solo-attested"),
+        default="independent",
+        help="默认异人复核；单人开发可显式选择非独立二次确认",
+    )
     graph_gold_review_apply = graph_sub.add_parser(
         "pilot-gold-review-apply",
         help="应用异人复核并在全部批准后固化、评测图谱黄金集",
@@ -513,6 +519,10 @@ def build_parser() -> argparse.ArgumentParser:
     graph_gold_review_apply.add_argument("work_pack", type=Path)
     graph_gold_review_apply.add_argument("output", type=Path)
     graph_gold_review_apply.add_argument("--actor", required=True)
+    graph_gold_review_apply.add_argument(
+        "--solo-attestation",
+        help="solo-attested 模式要求的精确确认短语",
+    )
 
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
@@ -721,18 +731,28 @@ def build_parser() -> argparse.ArgumentParser:
     conflict_batch_annotation_apply.add_argument("--actor", required=True)
     conflict_batch_review_export = conflict_sub.add_parser(
         "batch-review-export",
-        help="由不同复核人导出一个冲突批次的本地复核工作包",
+        help="导出一个冲突批次的本地人工复核工作包",
     )
     conflict_batch_review_export.add_argument("plan_id")
     conflict_batch_review_export.add_argument("batch_id")
     conflict_batch_review_export.add_argument("output", type=Path)
     conflict_batch_review_export.add_argument("--actor", required=True)
+    conflict_batch_review_export.add_argument(
+        "--review-mode",
+        choices=("independent", "solo-attested"),
+        default="independent",
+        help="默认异人复核；单人开发可显式选择非独立二次确认",
+    )
     conflict_batch_review_apply = conflict_sub.add_parser(
         "batch-review-apply",
         help="原子应用一个完整冲突批次的异人复核决定",
     )
     conflict_batch_review_apply.add_argument("pack", type=Path)
     conflict_batch_review_apply.add_argument("--actor", required=True)
+    conflict_batch_review_apply.add_argument(
+        "--solo-attestation",
+        help="solo-attested 模式要求的精确确认短语",
+    )
     conflict_submit = conflict_sub.add_parser(
         "submit-pack", help="提交候选包中的人工冲突标签并写入审计"
     )
@@ -745,6 +765,16 @@ def build_parser() -> argparse.ArgumentParser:
     conflict_finalize.add_argument("output", type=Path)
     conflict_finalize.add_argument("--name", required=True)
     conflict_finalize.add_argument("--reviewer", required=True)
+    conflict_finalize.add_argument(
+        "--review-mode",
+        choices=("independent", "solo-attested"),
+        default="independent",
+        help="默认异人复核；单人开发可显式选择非独立二次确认",
+    )
+    conflict_finalize.add_argument(
+        "--solo-attestation",
+        help="solo-attested 模式要求的精确确认短语",
+    )
 
     conflict_evaluate = subparsers.add_parser(
         "conflict-evaluate", help="评测冲突检测精确率、召回率和类型准确率"
@@ -762,7 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     graph_evaluate = subparsers.add_parser(
         "graph-evaluate",
-        help="用双人复核黄金集评测业务关系、路径方向和证据覆盖",
+        help="用受控人工复核黄金集评测业务关系、路径方向和证据覆盖",
     )
     graph_evaluate.add_argument("dataset", type=Path)
     graph_evaluate.add_argument("--output", type=Path)
@@ -1478,8 +1508,9 @@ def _handle_graph(
             args.candidate,
             args.output,
             actor=args.actor,
+            review_mode=args.review_mode,
         )
-        print(f"图谱黄金异人复核工作包：{output}")
+        print(f"图谱黄金人工复核工作包：{output}")
         return
     if args.graph_command == "pilot-gold-review-apply":
         payload = apply_graph_gold_review_work_pack(
@@ -1488,8 +1519,9 @@ def _handle_graph(
             args.work_pack,
             args.output,
             actor=args.actor,
+            solo_attestation=args.solo_attestation,
         )
-        print("图谱黄金异人复核已应用。")
+        print("图谱黄金人工复核已应用。")
         _print_mapping(payload)
         return
 
@@ -2042,12 +2074,17 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
             args.batch_id,
             args.output,
             actor=args.actor,
+            review_mode=args.review_mode,
         )
         print(f"冲突批次复核工作包：{output}")
         return
     if args.conflict_command == "batch-review-apply":
         result = apply_conflict_batch_review_pack(
-            database, paths, args.pack, actor=args.actor
+            database,
+            paths,
+            args.pack,
+            actor=args.actor,
+            solo_attestation=args.solo_attestation,
         )
         print("冲突批次复核决定已原子应用。")
         _print_mapping(result)
@@ -2070,6 +2107,8 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
             args.output,
             name=args.name,
             reviewer=args.reviewer,
+            review_mode=args.review_mode,
+            solo_attestation=args.solo_attestation,
         )
         print(f"跨文档冲突评测数据集：{args.output.expanduser().resolve()}")
         print(f"case_count: {len(dataset['cases'])}")

@@ -26,10 +26,200 @@ from knowledge_workbench.errors import (
 )
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
-from knowledge_workbench.utils import sha256_file
+from knowledge_workbench.review_assurance import (
+    SOLO_ATTESTATION_PHRASE,
+)
+from knowledge_workbench.utils import sha256_file, sha256_text
 
 
 class ConflictBatchWorkPackTests(unittest.TestCase):
+    def test_solo_review_is_attested_but_never_counted_as_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            self._ingest_sources(root, paths)
+            database = Database(paths.database)
+            candidate_path = paths.evaluations / "solo-candidates.json"
+            candidate_pack = create_cross_document_candidate_pack(
+                database,
+                paths,
+                candidate_path,
+                actor="pack-builder",
+                limit=100,
+                minimum_similarity=0.5,
+            )
+            plan_path = paths.evaluations / "solo-plan.json"
+            plan = create_conflict_labeling_plan(
+                database,
+                paths,
+                candidate_path,
+                plan_path,
+                actor="solo-owner",
+                batch_size=100,
+            )
+            batch = plan["batches"][0]
+            annotation_path = (
+                paths.evaluations / "solo-annotation.md"
+            )
+            export_conflict_batch_annotation_pack(
+                database,
+                paths,
+                plan["plan_id"],
+                batch["batch_id"],
+                annotation_path,
+                actor="solo-owner",
+            )
+            annotation_path.write_text(
+                self._fill_annotation_pack(
+                    annotation_path.read_text(encoding="utf-8"),
+                    candidate_pack,
+                    batch["candidate_ids"],
+                ),
+                encoding="utf-8",
+            )
+            apply_conflict_batch_annotation_pack(
+                database,
+                paths,
+                annotation_path,
+                actor="solo-owner",
+            )
+            submit_cross_document_candidate_annotations_by_id(
+                database,
+                paths,
+                candidate_pack["pack_id"],
+                expected_content_sha256=sha256_file(candidate_path),
+                actor="solo-owner",
+            )
+
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "必须不同"
+            ):
+                export_conflict_batch_review_pack(
+                    database,
+                    paths,
+                    plan["plan_id"],
+                    batch["batch_id"],
+                    paths.evaluations / "false-independent.md",
+                    actor="solo-owner",
+                )
+            review_path = paths.evaluations / "solo-review.md"
+            export_conflict_batch_review_pack(
+                database,
+                paths,
+                plan["plan_id"],
+                batch["batch_id"],
+                review_path,
+                actor="solo-owner",
+                review_mode="solo_attested",
+            )
+            content = review_path.read_text(encoding="utf-8")
+            self.assertIn("非独立复核", content)
+            self.assertIn(SOLO_ATTESTATION_PHRASE, content)
+            review_path.write_text(
+                self._approve_review_pack(
+                    content, batch["candidate_ids"]
+                ),
+                encoding="utf-8",
+            )
+            status = inspect_conflict_batch_work_pack(
+                database, paths, review_path
+            )
+            self.assertEqual(status["review_mode"], "solo_attested")
+            self.assertFalse(status["independent_review"])
+            self.assertFalse(status["actor_separation_valid"])
+            self.assertTrue(status["review_actor_policy_valid"])
+            self.assertTrue(status["solo_attestation_required"])
+            self.assertTrue(status["apply_ready"])
+
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "确认声明"
+            ):
+                apply_conflict_batch_review_pack(
+                    database,
+                    paths,
+                    review_path,
+                    actor="solo-owner",
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "确认短语"
+            ):
+                apply_conflict_batch_review_pack(
+                    database,
+                    paths,
+                    review_path,
+                    actor="solo-owner",
+                    solo_attestation="我确认",
+                )
+            apply_conflict_batch_review_pack(
+                database,
+                paths,
+                review_path,
+                actor="solo-owner",
+                solo_attestation=SOLO_ATTESTATION_PHRASE,
+            )
+            plan_status = inspect_conflict_labeling_plan(
+                database, paths, plan_path
+            )
+            summary = plan_status["summary"]
+            self.assertEqual(
+                summary["solo_attested_approved_count"],
+                len(batch["candidate_ids"]),
+            )
+            self.assertEqual(
+                summary["independent_approved_count"], 0
+            )
+            self.assertTrue(summary["human_attested_review_complete"])
+            self.assertFalse(summary["independent_review_complete"])
+            with database.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT details_json FROM audit_log
+                    WHERE event_type =
+                      'conflict_candidate_review_batch_applied'
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
+            details = json.loads(row["details_json"])
+            self.assertEqual(details["review_mode"], "solo_attested")
+            self.assertFalse(details["independent_review"])
+            self.assertEqual(
+                details["solo_attestation_sha256"],
+                sha256_text(SOLO_ATTESTATION_PHRASE),
+            )
+            self.assertNotIn(
+                SOLO_ATTESTATION_PHRASE, row["details_json"]
+            )
+            tampered = json.loads(
+                candidate_path.read_text(encoding="utf-8")
+            )
+            tampered["candidates"][0]["review"]["note"] = (
+                "绕过受控入口修改"
+            )
+            candidate_path.write_text(
+                json.dumps(
+                    tampered,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tampered_status = inspect_conflict_labeling_plan(
+                database, paths, plan_path
+            )["summary"]
+            self.assertFalse(tampered_status["review_audit_current"])
+            self.assertEqual(
+                tampered_status["human_attested_approved_count"], 0
+            )
+            self.assertEqual(
+                tampered_status["unattributed_approved_count"],
+                len(batch["candidate_ids"]),
+            )
+            self.assertFalse(
+                tampered_status["human_attested_review_complete"]
+            )
+
     def test_annotation_and_review_work_packs_round_trip_atomically(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

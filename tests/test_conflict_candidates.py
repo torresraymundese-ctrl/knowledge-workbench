@@ -19,6 +19,10 @@ from knowledge_workbench.database import Database
 from knowledge_workbench.errors import KnowledgeWorkbenchError
 from knowledge_workbench.ingest import ingest_file
 from knowledge_workbench.models import Classification
+from knowledge_workbench.review_assurance import (
+    SOLO_ATTESTATION_PHRASE,
+)
+from knowledge_workbench.utils import sha256_text
 
 
 class CrossDocumentConflictCandidateTests(unittest.TestCase):
@@ -188,6 +192,100 @@ class CrossDocumentConflictCandidateTests(unittest.TestCase):
             self.assertEqual(audit["actor"], "reviewer-01")
             self.assertEqual(details["annotator"], "annotator-01")
             self.assertEqual(details["case_count"], 3)
+            self.assertEqual(details["review_mode"], "independent")
+            self.assertTrue(details["independent_review"])
+
+    def test_finalize_solo_mode_requires_exact_attestation_and_audits_hash(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            self._ingest_sources(root, paths)
+            database = Database(paths.database)
+            pack_path = paths.evaluations / "solo-candidates.json"
+            pack = create_cross_document_candidate_pack(
+                database,
+                paths,
+                pack_path,
+                actor="pack-builder",
+                limit=20,
+                minimum_similarity=0.5,
+            )
+            for candidate in pack["candidates"]:
+                candidate["label"]["expected_conflict"] = candidate[
+                    "predicted_conflict"
+                ]
+                candidate["label"]["expected_type"] = candidate[
+                    "predicted_type"
+                ]
+            pack_path.write_text(
+                json.dumps(pack, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            submit_cross_document_candidate_annotations(
+                database, paths, pack_path, actor="solo-owner"
+            )
+            for candidate in pack["candidates"]:
+                candidate["review"]["decision"] = "approved"
+                candidate["review"]["note"] = "同一责任人二次回源核对。"
+            pack_path.write_text(
+                json.dumps(pack, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            output = paths.evaluations / "solo-dataset.json"
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "必须不同"
+            ):
+                finalize_cross_document_candidate_pack(
+                    database,
+                    paths,
+                    pack_path,
+                    output,
+                    name="单人确认冲突基线",
+                    reviewer="solo-owner",
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "确认声明"
+            ):
+                finalize_cross_document_candidate_pack(
+                    database,
+                    paths,
+                    pack_path,
+                    output,
+                    name="单人确认冲突基线",
+                    reviewer="solo-owner",
+                    review_mode="solo_attested",
+                )
+            dataset = finalize_cross_document_candidate_pack(
+                database,
+                paths,
+                pack_path,
+                output,
+                name="单人确认冲突基线",
+                reviewer="solo-owner",
+                review_mode="solo_attested",
+                solo_attestation=SOLO_ATTESTATION_PHRASE,
+            )
+            self.assertEqual(len(dataset["cases"]), 3)
+            with database.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT details_json FROM audit_log
+                    WHERE event_type = 'conflict_dataset_finalized'
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
+            details = json.loads(row["details_json"])
+            self.assertEqual(details["review_mode"], "solo_attested")
+            self.assertFalse(details["independent_review"])
+            self.assertEqual(
+                details["solo_attestation_sha256"],
+                sha256_text(SOLO_ATTESTATION_PHRASE),
+            )
+            self.assertNotIn(
+                SOLO_ATTESTATION_PHRASE, row["details_json"]
+            )
 
     def test_truncated_pack_cannot_be_finalized_as_complete_baseline(self):
         with tempfile.TemporaryDirectory() as temporary:

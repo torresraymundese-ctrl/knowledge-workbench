@@ -39,9 +39,169 @@ from knowledge_workbench.quality_closure import (
     build_quality_closure_status,
 )
 from knowledge_workbench.review import transition_evidence
+from knowledge_workbench.review_assurance import (
+    SOLO_ATTESTATION_PHRASE,
+)
+from knowledge_workbench.utils import sha256_text
 
 
 class GraphGoldWorkPackTests(unittest.TestCase):
+    def test_solo_review_finalizes_with_explicit_non_independent_provenance(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._build_graph(Path(temporary))
+            (
+                paths,
+                database,
+                pilot_path,
+                evidence_id,
+                company_id,
+                platform_id,
+            ) = fixture
+            annotation_path = paths.evaluations / "solo-annotation.md"
+            export_graph_gold_annotation_work_pack(
+                database,
+                paths,
+                pilot_path,
+                annotation_path,
+                actor="solo-owner",
+            )
+            annotation_path.write_text(
+                self._fill_annotation(
+                    annotation_path.read_text(encoding="utf-8"),
+                    self._annotation(
+                        evidence_id, company_id, platform_id
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            candidate_path = paths.evaluations / "solo-candidate.json"
+            apply_graph_gold_annotation_work_pack(
+                database,
+                paths,
+                annotation_path,
+                candidate_path,
+                actor="solo-owner",
+            )
+            with self.assertRaisesRegex(
+                InvalidTransitionError, "必须不同"
+            ):
+                export_graph_gold_review_work_pack(
+                    database,
+                    paths,
+                    candidate_path,
+                    paths.evaluations / "false-independent.md",
+                    actor="solo-owner",
+                )
+            review_path = paths.evaluations / "solo-review.md"
+            export_graph_gold_review_work_pack(
+                database,
+                paths,
+                candidate_path,
+                review_path,
+                actor="solo-owner",
+                review_mode="solo_attested",
+            )
+            review_content = review_path.read_text(encoding="utf-8")
+            self.assertIn("非独立复核", review_content)
+            review_path.write_text(
+                self._fill_review(
+                    review_content,
+                    approve_ids={
+                        "relation-positive",
+                        "relation-negative",
+                        "path-positive",
+                    },
+                    reject_notes={},
+                ),
+                encoding="utf-8",
+            )
+            output = paths.evaluations / "solo-gold.json"
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "确认声明"
+            ):
+                apply_graph_gold_review_work_pack(
+                    database,
+                    paths,
+                    review_path,
+                    output,
+                    actor="solo-owner",
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "确认短语"
+            ):
+                apply_graph_gold_review_work_pack(
+                    database,
+                    paths,
+                    review_path,
+                    output,
+                    actor="solo-owner",
+                    solo_attestation="我确认",
+                )
+            result = apply_graph_gold_review_work_pack(
+                database,
+                paths,
+                review_path,
+                output,
+                actor="solo-owner",
+                solo_attestation=SOLO_ATTESTATION_PHRASE,
+            )
+            self.assertTrue(result["approved"])
+            self.assertEqual(result["review_mode"], "solo_attested")
+            self.assertFalse(result["independent_review"])
+            dataset = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                dataset["provenance"]["review_mode"],
+                "solo_attested",
+            )
+            self.assertFalse(
+                dataset["provenance"]["independent_review"]
+            )
+            quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            graph = quality["metrics"]["graph"]
+            self.assertEqual(
+                graph["solo_attested_passing_graph_gold_dataset_count"],
+                1,
+            )
+            self.assertEqual(
+                graph["independent_passing_graph_gold_dataset_count"],
+                0,
+            )
+            self.assertEqual(
+                graph[
+                    "human_attested_passing_graph_gold_dataset_count"
+                ],
+                1,
+            )
+            with database.connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT details_json FROM audit_log
+                    WHERE event_type IN (
+                      'graph_gold_review_applied',
+                      'graph_gold_dataset_finalized'
+                    )
+                    ORDER BY id
+                    """
+                ).fetchall()
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                details = json.loads(row["details_json"])
+                self.assertEqual(
+                    details["review_mode"], "solo_attested"
+                )
+                self.assertFalse(details["independent_review"])
+                self.assertEqual(
+                    details["solo_attestation_sha256"],
+                    sha256_text(SOLO_ATTESTATION_PHRASE),
+                )
+                self.assertNotIn(
+                    SOLO_ATTESTATION_PHRASE, row["details_json"]
+                )
+
     def test_two_person_workflow_finalizes_and_evaluates_dataset(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self._build_graph(Path(temporary))

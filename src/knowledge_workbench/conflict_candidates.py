@@ -14,6 +14,12 @@ from .config import WorkspacePaths
 from .conflicts import _classify_conflict, _comparison_signature, _normalize
 from .database import Database
 from .errors import KnowledgeWorkbenchError
+from .review_assurance import (
+    INDEPENDENT_REVIEW_MODE,
+    review_audit_context,
+    validate_review_attestation,
+    validate_review_actor_policy,
+)
 from .schema_validation import (
     validate_conflict_candidate_pack,
     validate_conflict_evaluation_dataset,
@@ -337,6 +343,8 @@ def apply_cross_document_candidate_review_batch(
     work_pack_path: str,
     work_pack_sha256: str,
     actor: str,
+    review_mode: str,
+    solo_attestation_sha256: str | None,
 ) -> dict[str, Any]:
     actor = _required_actor(actor)
     plan_id = _required_work_scope_id(plan_id, "plan_id")
@@ -357,8 +365,11 @@ def apply_cross_document_candidate_review_batch(
             )
         if not submission:
             raise KnowledgeWorkbenchError("候选标签尚未提交，不能复核")
-        if submission["actor"] == actor:
-            raise KnowledgeWorkbenchError("标注人与复核人必须不同")
+        validate_review_actor_policy(
+            submitter=submission["actor"],
+            reviewer=actor,
+            review_mode=review_mode,
+        )
         for item in normalized:
             candidate = _candidate_by_id(pack, item["candidate_id"])
             candidate["review"] = {
@@ -384,7 +395,14 @@ def apply_cross_document_candidate_review_batch(
                     item["decision"] == "rejected"
                     for item in normalized
                 ),
+                "decision_by_candidate": {
+                    item["candidate_id"]: item["decision"]
+                    for item in normalized
+                },
                 "annotator": submission["actor"],
+                **review_audit_context(
+                    review_mode, solo_attestation_sha256
+                ),
                 "note_sha256_by_candidate": {
                     item["candidate_id"]: sha256_text(item["note"])
                     for item in normalized
@@ -545,8 +563,13 @@ def finalize_cross_document_candidate_pack(
     *,
     name: str,
     reviewer: str,
+    review_mode: str = INDEPENDENT_REVIEW_MODE,
+    solo_attestation: str | None = None,
 ) -> dict[str, Any]:
     reviewer = _required_actor(reviewer)
+    attestation_sha256 = validate_review_attestation(
+        review_mode, solo_attestation
+    )
     dataset_name = name.strip()
     if not dataset_name:
         raise KnowledgeWorkbenchError("数据集名称不能为空")
@@ -565,8 +588,11 @@ def finalize_cross_document_candidate_pack(
     )
     if annotator is None:
         raise KnowledgeWorkbenchError("当前候选标签尚未通过 submit-pack 提交审计")
-    if annotator == reviewer:
-        raise KnowledgeWorkbenchError("标注人与复核人必须不同")
+    validate_review_actor_policy(
+        submitter=annotator,
+        reviewer=reviewer,
+        review_mode=review_mode,
+    )
     for candidate in pack["candidates"]:
         review = candidate["review"]
         if review["decision"] != "approved":
@@ -595,6 +621,9 @@ def finalize_cross_document_candidate_pack(
                     "case_count": len(cases),
                     "annotator": annotator,
                     "reviewer": reviewer,
+                    **review_audit_context(
+                        review_mode, attestation_sha256
+                    ),
                 },
             )
     except Exception:

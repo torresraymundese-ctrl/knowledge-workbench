@@ -23,6 +23,16 @@ from .graph_pilot_review_workpacks import (
     _require_safe_status,
     _validated_output,
 )
+from .review_assurance import (
+    INDEPENDENT_REVIEW_MODE,
+    SOLO_ATTESTATION_PHRASE,
+    SOLO_ATTESTED_REVIEW_MODE,
+    required_review_mode,
+    review_audit_context,
+    review_mode_from_metadata,
+    validate_review_actor_policy,
+    validate_review_attestation,
+)
 from .schema_validation import validate_graph_gold_candidate_pack
 from .utils import new_id, sha256_text, utc_now
 from .wiki import write_text_atomic
@@ -271,14 +281,22 @@ def export_graph_gold_review_work_pack(
     output: Path,
     *,
     actor: str,
+    review_mode: str = INDEPENDENT_REVIEW_MODE,
 ) -> Path:
     actor = _required_actor(actor)
-    output = _validated_output(paths, output, "图谱黄金异人复核工作包")
+    review_mode = required_review_mode(review_mode)
+    output = _validated_output(paths, output, "图谱黄金人工复核工作包")
     candidate_path, candidate_content, candidate, context = (
         _resolve_candidate(database, paths, candidate_path)
     )
-    if candidate["annotator"] == actor:
-        raise InvalidTransitionError("图谱黄金标注人与复核人必须不同")
+    try:
+        validate_review_actor_policy(
+            submitter=candidate["annotator"],
+            reviewer=actor,
+            review_mode=review_mode,
+        )
+    except KnowledgeWorkbenchError as exc:
+        raise InvalidTransitionError(str(exc)) from exc
     cases = _candidate_cases(candidate)
     evidence = _evidence_details(
         database,
@@ -307,13 +325,22 @@ def export_graph_gold_review_work_pack(
         f"graph_snapshot_sha256: {context['graph_snapshot_sha256']}",
         f"annotator: {candidate['annotator']}",
         f"reviewer: {actor}",
+        f"review_mode: {review_mode}",
         f"generated_at: {utc_now()}",
         "---",
         "",
-        f"# 图谱黄金异人复核：`{candidate['candidate_id']}`",
+        f"# 图谱黄金人工复核：`{candidate['candidate_id']}`",
         "",
         f"- 标注人：`{_markdown_code(candidate['annotator'])}`",
         f"- 复核人：`{_markdown_code(actor)}`",
+        (
+            "- 复核模式：`independent`（标注人与复核人不同）。"
+            if review_mode == INDEPENDENT_REVIEW_MODE
+            else (
+                "- 复核模式：`solo_attested`（同一责任人二次确认，"
+                "不构成独立复核）。"
+            )
+        ),
         f"- 用例数：`{len(cases)}`",
         "- 复核人必须逐案回到实体、方向、黄金证据和当前来源判断。",
         "- 每案必须且只能批准或驳回；驳回意见必填。",
@@ -327,6 +354,12 @@ def export_graph_gold_review_work_pack(
             f"pilot-gold-review-apply {_powershell_literal(str(output))} "
             ".\\workspace\\evaluations\\graph-gold-v1.json "
             f"--actor {_powershell_literal(actor)}"
+            + (
+                " --solo-attestation "
+                + _powershell_literal(SOLO_ATTESTATION_PHRASE)
+                if review_mode == SOLO_ATTESTED_REVIEW_MODE
+                else ""
+            )
         ),
         "```",
         "",
@@ -400,6 +433,7 @@ def export_graph_gold_review_work_pack(
                     "template_sha256": _review_template_sha256(content),
                     "content_sha256": sha256_text(content),
                     "annotator": candidate["annotator"],
+                    **review_audit_context(review_mode, None),
                 },
             )
     except Exception:
@@ -415,18 +449,26 @@ def apply_graph_gold_review_work_pack(
     output: Path,
     *,
     actor: str,
+    solo_attestation: str | None = None,
 ) -> dict[str, Any]:
     actor = _required_actor(actor)
     work_pack_path, content = _read_work_pack(
-        paths, work_pack_path, "图谱黄金异人复核工作包"
+        paths, work_pack_path, "图谱黄金人工复核工作包"
     )
     metadata, decisions = _parse_review_pack(content)
+    review_mode = metadata["review_mode"]
+    attestation_sha256 = validate_review_attestation(
+        review_mode, solo_attestation
+    )
     if metadata["reviewer"] != actor:
         raise KnowledgeWorkbenchError(
             "工作包声明的图谱复核人与当前 actor 不一致"
         )
-    if metadata["annotator"] == actor:
-        raise InvalidTransitionError("图谱黄金标注人与复核人必须不同")
+    validate_review_actor_policy(
+        submitter=metadata["annotator"],
+        reviewer=actor,
+        review_mode=review_mode,
+    )
     candidate_path = _source_path(paths, metadata["candidate_path"])
     candidate_path, candidate_content, candidate, context = (
         _resolve_candidate(database, paths, candidate_path)
@@ -473,6 +515,8 @@ def apply_graph_gold_review_work_pack(
                 decisions,
                 approved=False,
                 output=None,
+                review_mode=review_mode,
+                attestation_sha256=attestation_sha256,
             )
         return {
             "candidate_id": candidate["candidate_id"],
@@ -483,6 +527,7 @@ def apply_graph_gold_review_work_pack(
             ],
             "dataset_written": False,
             "reviewer": actor,
+            **review_audit_context(review_mode, attestation_sha256),
         }
     output = _validated_json_output(paths, output, "图谱黄金评测数据集")
     dataset = {
@@ -493,6 +538,10 @@ def apply_graph_gold_review_work_pack(
             "reviewer": actor,
             "reviewed_at": utc_now(),
             "decision": "approved",
+            "review_mode": review_mode,
+            "independent_review": (
+                review_mode == INDEPENDENT_REVIEW_MODE
+            ),
         },
         "relation_cases": candidate["relation_cases"],
         "path_cases": candidate["path_cases"],
@@ -519,6 +568,8 @@ def apply_graph_gold_review_work_pack(
                 decisions,
                 approved=True,
                 output=_relative(paths, output),
+                review_mode=review_mode,
+                attestation_sha256=attestation_sha256,
             )
             record_event(
                 connection,
@@ -543,6 +594,9 @@ def apply_graph_gold_review_work_pack(
                     "restricted_support_leak_count": report["safety"][
                         "restricted_support_leak_count"
                     ],
+                    **review_audit_context(
+                        review_mode, attestation_sha256
+                    ),
                 },
             )
     except Exception:
@@ -554,6 +608,7 @@ def apply_graph_gold_review_work_pack(
         "dataset_written": True,
         "output": _relative(paths, output),
         "reviewer": actor,
+        **review_audit_context(review_mode, attestation_sha256),
         "evaluation": {
             "case_count": report["aggregate"]["case_count"],
             "passed_cases": report["aggregate"]["passed_cases"],
@@ -861,6 +916,7 @@ def _parse_review_pack(
                 "note": record["note"],
             }
         )
+    metadata["review_mode"] = review_mode_from_metadata(metadata)
     return metadata, decisions
 
 
@@ -1203,6 +1259,8 @@ def _record_review_applied(
     *,
     approved: bool,
     output: str | None,
+    review_mode: str,
+    attestation_sha256: str | None,
 ) -> None:
     record_event(
         connection,
@@ -1232,6 +1290,9 @@ def _record_review_applied(
                 if item["note"]
             },
             "output": output,
+            **review_audit_context(
+                review_mode, attestation_sha256
+            ),
         },
     )
 

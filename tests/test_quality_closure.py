@@ -81,13 +81,26 @@ class QualityClosureStatusTests(unittest.TestCase):
                 self.assertEqual(gates[gate_id]["status"], "passed")
             for gate_id in (
                 "conflict_annotation",
-                "conflict_independent_review",
+                "conflict_review",
                 "graph_evidence_review",
                 "graph_entity_mentions",
                 "graph_business_relationship",
                 "graph_gold_evaluation",
             ):
                 self.assertEqual(gates[gate_id]["status"], "pending")
+            conflict_review = gates["conflict_review"]["actual"]
+            self.assertEqual(
+                conflict_review["human_attested_approved_count"], 0
+            )
+            self.assertEqual(
+                conflict_review["independent_approved_count"], 0
+            )
+            self.assertEqual(
+                conflict_review["solo_attested_approved_count"], 0
+            )
+            self.assertEqual(
+                conflict_review["unattributed_approved_count"], 0
+            )
             self.assertEqual(
                 report["metrics"]["gold"][
                     "approved_current_document_count"

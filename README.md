@@ -117,11 +117,16 @@ Set-Location "D:\全新知识库"
 .\.venv\Scripts\knowledge.exe conflict batch-annotation-apply .\workspace\evaluations\batch_001-annotation.md --actor annotator-01
 # 完成全部批次后提交整包，标签随即锁定
 .\.venv\Scripts\knowledge.exe conflict submit-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json --actor annotator-01
-# 由另一人逐批复核；全部批次完成后固化
+# 默认由另一人逐批复核；全部批次完成后固化
 .\.venv\Scripts\knowledge.exe conflict batch-review-export cplan_计划ID batch_001 .\workspace\evaluations\batch_001-review.md --actor reviewer-01
 .\.venv\Scripts\knowledge.exe conflict batch-work-pack-status .\workspace\evaluations\batch_001-review.md
 .\.venv\Scripts\knowledge.exe conflict batch-review-apply .\workspace\evaluations\batch_001-review.md --actor reviewer-01
 .\.venv\Scripts\knowledge.exe conflict finalize-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json .\workspace\evaluations\cross-document-conflict-v1.json --name "真实跨文档冲突基线" --reviewer reviewer-01
+# 单人原型只能显式记为非独立复核；导出、应用和固化均绑定同一 actor
+$SoloAttestation = "我确认本次由同一责任人完成二次核对，非独立复核"
+.\.venv\Scripts\knowledge.exe conflict batch-review-export cplan_计划ID batch_001 .\workspace\evaluations\batch_001-solo-review.md --actor annotator-01 --review-mode solo-attested
+.\.venv\Scripts\knowledge.exe conflict batch-review-apply .\workspace\evaluations\batch_001-solo-review.md --actor annotator-01 --solo-attestation $SoloAttestation
+.\.venv\Scripts\knowledge.exe conflict finalize-pack .\workspace\evaluations\cross-document-conflict-candidates-实际时间.json .\workspace\evaluations\cross-document-conflict-solo-v1.json --name "单人确认跨文档冲突基线" --reviewer annotator-01 --review-mode solo-attested --solo-attestation $SoloAttestation
 .\.venv\Scripts\knowledge.exe conflict-evaluate .\evaluation\conflict-sample.json
 .\.venv\Scripts\knowledge.exe citation-evaluate .\evaluation\citation-support-sample.json
 .\.venv\Scripts\knowledge.exe lint --output .\workspace\evaluations\workspace-lint.json
@@ -183,7 +188,7 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 
 `graph paths` 在同一安全投影上执行确定性、只读的受限深度简单路径查询。默认只沿有向关系的登记方向遍历，无向关系可双向遍历；`--include-inverse` 必须显式给出才允许逆向走有向边。深度限制为1到4跳、结果限制为1到100条，并有20,000次边扩展硬上限；输出会报告候选边、结果或扩展是否截断。每一跳都保留原关系方向、实际遍历方向、关系标签、当前 verified 非 restricted 支撑证据 ID 和密级；路径级证据并集与各跳共同证据分别输出。路径只表示人工关系的逐跳连通性，不能表述为新的业务关系、因果或其他事实结论。
 
-`graph-evaluate` 读取通过双人复核的图谱黄金集，评测关系精确率/召回率、方向准确率、关系证据覆盖率、路径精确率/召回率、路径路线准确率、路径证据覆盖率和 restricted 支撑泄漏数。黄金集只保存实体、关系与证据 ID，不复制证据原文；标注人与复核人必须不同。评测启动前会重验全部实体仍为 active，全部黄金证据仍属于当前文件版本与当前处理运行、状态为 verified 且不是 restricted；数据过期会整体阻断，不能被计成算法失败。任何候选或路径查询截断也不能作为正式通过。关系、路径或安全指标未全部通过时命令默认返回失败，但仍保存报告；只有诊断时可显式使用 `--allow-failures`。
+`graph-evaluate` 读取通过受控人工复核的图谱黄金集，评测关系精确率/召回率、方向准确率、关系证据覆盖率、路径精确率/召回率、路径路线准确率、路径证据覆盖率和 restricted 支撑泄漏数。黄金集只保存实体、关系与证据 ID，不复制证据原文；默认 `independent` 要求标注人与复核人不同，单人原型只能显式保存为 `solo_attested` 和 `independent_review=false`。评测启动前会重验全部实体仍为 active，全部黄金证据仍属于当前文件版本与当前处理运行、状态为 verified 且不是 restricted；数据过期会整体阻断，不能被计成算法失败。任何候选或路径查询截断也不能作为正式通过。关系、路径或安全指标未全部通过时命令默认返回失败，但仍保存报告；只有诊断时可显式使用 `--allow-failures`。
 
 `graph pilot-pack` 从既有 `approved` 黄金标注会话中提取双人确认过的必要证据，作为人工证据审核、实体建档和关系登记的优先试点池。生成器重验每个用例已批准、来源版本和处理运行仍为当前、密级未漂移，并排除 restricted；包只能写入当前 `workspace/evaluations/`，包含证据原文与全部定位，禁止覆盖。它只生成候选快照，不改变证据状态、不创建实体或关系；审计仅保存包哈希、相对路径和计数，不保存原文。
 
@@ -193,7 +198,7 @@ SQLite Schema v12 增加人工业务关系类型、业务关系及其证据支�
 
 Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审计路径和当前来源快照校验的试点包。列表按试点包内的证据 ID、资料名、序号和黄金用例 ID 搜索并独立分页，只返回定位摘要、状态与实体/关系进度，不批量返回原文；用户必须显式打开单条证据才能查看内容。证据审核继续复用既有 CSRF、actor、密级边界及 `draft → reviewing → verified` 核心状态机，已验证证据仍保留在试点进度中。被篡改、复制、来源过期或密级越界的包不会进入可操作视图。
 
-跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，复核人再填写 `review` 并运行 `conflict finalize-pack`。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和双人分离，生成的数据集可直接交给 `conflict-evaluate`。
+跨文档冲突质量基线使用独立候选包，不会自动创建冲突或修改证据状态。候选只来自“当前文件版本＋当前处理运行”，排除 `restricted` 和已弃用/归档证据；原文候选包及固化数据集只能保存在当前 `workspace/evaluations/`，且不会覆盖已有文件。标注人先填写 `label` 并运行 `conflict submit-pack` 写入标签摘要审计，再逐批完成受控 `review` 并运行 `conflict finalize-pack`。默认 `independent` 强制标注人与复核人不同；单人原型必须显式使用 `solo-attested`，由同一 actor 完成二次回源核对，并在应用和固化时输入精确确认短语。审计只保存短语哈希，质量报告分别统计独立、单人和无归因复核，单人结果不会冒充独立。提交和固化都会重新验证候选仍是数据库当前证据，且原文、密级、文档元数据与全部定位未变化；固化还会校验候选来源身份、标签摘要、完整性、未截断状态和复核 actor 策略，生成的数据集可直接交给 `conflict-evaluate`。
 
 旧版 `.doc` 转换完全在本机完成：Word 以隐藏、只读、禁用宏的方式打开源文件，在临时目录生成 DOCX，解析完成后删除临时文件。原始 `.doc` 的 SHA-256 和只读副本仍是来源真相；每条证据额外保存转换工具、工具版本和临时 DOCX 的 SHA-256。该开关只授权单次命令，不会改变全局默认策略。
 
@@ -226,11 +231,11 @@ Web“图谱试点”区只发现通过 Schema、包身份、内容哈希、审�
 
 “跨文档冲突标注”按候选包安全发现并提供状态筛选、文本搜索和每页10条的证据对比。经审计的完整分层计划会作为可选批次范围出现；计划列表不返回候选 ID 或原文，选择批次后后端重新校验计划身份、审计路径、来源候选包不可变身份、当前证据来源和全量覆盖，再只投影该批候选。标注保存前会重查当前文件版本、当前处理运行、密级、原文和全部定位，并要求客户端提交所见文件的 SHA-256；文件被其他页面或人工编辑后会拒绝覆盖。批次页面不保存标签，所有决定仍写回原候选包；整包标签完整且未截断时才可提交，提交审计固定标签摘要和标注人，此后 Web 锁定标签；只有不同操作者可以逐项复核，驳回必须填写意见。页面不自动采用规则预测、不创建业务冲突，也不开放数据集固化，最终 `finalize-pack` 继续由 CLI 执行。批次切换使用请求序号门禁，较慢的旧请求不能覆盖最后一次选择。
 
-`conflict batch-plan` 不抽样、不复制证据原文，也不建立第二套标签文件。它只接受未截断且来源仍有效的完整候选包，按“预测类型 × 高/中/低相似度”将每个候选 ID 确定性分配到一个且仅一个小批次；相同 seed 得到相同分配。计划只能新增到 `workspace/evaluations/`，内容哈希、路径、来源包不可变身份和 seed 哈希写入审计。`batch-status` 重验计划身份、生成审计、来源当前性和全量覆盖，再从原候选包动态统计每批标注与异人复核进度，因此人工决定仍只有原候选包这一套真相源。
+`conflict batch-plan` 不抽样、不复制证据原文，也不建立第二套标签文件。它只接受未截断且来源仍有效的完整候选包，按“预测类型 × 高/中/低相似度”将每个候选 ID 确定性分配到一个且仅一个小批次；相同 seed 得到相同分配。计划只能新增到 `workspace/evaluations/`，内容哈希、路径、来源包不可变身份和 seed 哈希写入审计。`batch-status` 重验计划身份、生成审计、来源当前性和全量覆盖，再从原候选包动态统计每批标注与人工复核进度，并分别报告 `independent`、`solo_attested` 和无归因数量，因此人工决定仍只有原候选包这一套真相源。
 
 `batch-annotation-export/apply` 和 `batch-review-export/apply` 把一个经审计批次导出为本地 Obsidian 兼容 Markdown，内含左右证据原文、定位、规则预测以及必须人工填写的决定。工作包只能位于当前 `workspace/evaluations/`，禁止覆盖，并绑定计划、批次、actor、导出路径、来源候选包 ID、完整 SHA-256 和受保护模板哈希；只有决定勾选、冲突类型和对应 JSON 意见可以编辑，修改展示的原文、定位、人工标签、规则预测或其他说明会整体阻断。复制文件、跨 actor 应用、遗漏或重复字段、候选增删换序以及来源包并发变化同样不能写入。`batch-work-pack-status` 可只读检查标注或复核 Markdown 内的完成数、缺失/冲突决定、无效冲突类型、驳回意见、来源阶段、职责分离及 `apply_ready`，不写候选包或审计，也不会采纳规则预测。应用以单次原子替换写回原候选包，任一候选无效时本批零写入；审计只记录候选 ID、计数、工作包哈希和意见哈希，不保存原文或意见正文。由于每次应用都会改变来源候选包哈希，工作包必须逐个串行应用（批次编号次序不限）：其他批次已保存后，旧工作包应使用新路径重新导出。规则预测只用于召回和排序，不能代替人工回源判断。
 
-`quality status` 每次从 SQLite、经审计的冲突计划、图谱试点包和本地黄金数据集重新计算真实进度，不缓存人工决定，也不使用单一百分比掩盖不同门槛。当前共检查工作区完整性、10份黄金基线、可配置黄金扩充目标、完整冲突计划、冲突标注、异人冲突复核、图谱试点快照、证据审核、实体提及、业务关系和图谱黄金评测11项。黄金扩充门槛同时报告已批准当前资料数、当前总资料数、未覆盖资料 ID、距目标尚需批准数，以及即使全部现有资料都获批后仍至少需要新导入的数量；它不把“已导入”误报为“已批准”，也不判断演示样例是否适合作为真实黄金资料。每项独立返回 `passed/pending`、要求、实际计数和下一动作；默认扩充目标为20份。使用 `--output` 时必须提供 actor，报告只能新增到 `workspace/evaluations/`，内容哈希、门槛结果和待办 ID 写入审计，报告与审计均不包含证据原文或资料路径。
+`quality status` 每次从 SQLite、经审计的冲突计划、图谱试点包和本地黄金数据集重新计算真实进度，不缓存人工决定，也不使用单一百分比掩盖不同门槛。当前共检查工作区完整性、10份黄金基线、可配置黄金扩充目标、完整冲突计划、冲突标注、人工冲突复核、图谱试点快照、证据审核、实体提及、业务关系和图谱黄金评测11项。冲突、图谱证据和图谱黄金门槛可接受明确归因的 `independent` 或 `solo_attested` 人工结果，但实际计数始终拆分，未归因历史状态不通过人工保证门槛。黄金扩充门槛同时报告已批准当前资料数、当前总资料数、未覆盖资料 ID、距目标尚需批准数，以及即使全部现有资料都获批后仍至少需要新导入的数量；它不把“已导入”误报为“已批准”，也不判断演示样例是否适合作为真实黄金资料。每项独立返回 `passed/pending`、要求、实际计数和下一动作；默认扩充目标为20份。使用 `--output` 时必须提供 actor，报告只能新增到 `workspace/evaluations/`，内容哈希、门槛结果和待办 ID 写入审计，报告与审计均不包含证据原文或资料路径。
 
 `graph pilot-entity-export/apply` 把当前试点包中的 verified 证据导出为本地实体裁决工作包。每条证据必须明确选择“登记实体”或“当前无实体”；后者要求说明，前者必须给出逐字 mention，并显式选择已有实体 ID，或填写新实体的规范名与类型。同类型同规范名只在本包内复用，数据库已有实体不会靠名称自动匹配。应用前会重验来源包、原文、全部定位、密级、证据状态、actor、路径、精确范围和受保护模板哈希；新实体、别名、证据提及和批次审计在同一事务内写入，任一别名冲突、非逐字提及或来源漂移都会整批回滚。工作包不可重放，审计只保存 ID、计数及名称、提及、意见和文件哈希，不复制正文或人工说明。
 

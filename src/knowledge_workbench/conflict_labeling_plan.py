@@ -18,8 +18,12 @@ from .conflict_candidates import (
 )
 from .database import Database
 from .errors import KnowledgeWorkbenchError
+from .review_assurance import (
+    INDEPENDENT_REVIEW_MODE,
+    SOLO_ATTESTED_REVIEW_MODE,
+)
 from .schema_validation import validate_conflict_labeling_plan
-from .utils import sha256_text, utc_now
+from .utils import sha256_file, sha256_text, utc_now
 from .wiki import write_text_atomic
 
 
@@ -121,7 +125,7 @@ def inspect_conflict_labeling_plan(
 ) -> dict[str, Any]:
     plan_path, content, plan = _read_plan(paths, plan_path)
     _validate_plan_audit(database, paths, plan_path, content, plan)
-    _, source_pack = _candidate_pack_by_id(
+    source_path, source_pack = _candidate_pack_by_id(
         paths, plan["source_pack"]["pack_id"]
     )
     _validate_pack_provenance(database, source_pack)
@@ -134,6 +138,13 @@ def inspect_conflict_labeling_plan(
     candidates = {
         item["candidate_id"]: item for item in source_pack["candidates"]
     }
+    review_assurance, review_audit_current = (
+        _review_assurance_by_candidate(
+            database,
+            source_pack["pack_id"],
+            current_content_sha256=sha256_file(source_path),
+        )
+    )
     planned_ids = [
         candidate_id
         for batch in plan["batches"]
@@ -156,6 +167,15 @@ def inspect_conflict_labeling_plan(
             if decision is not None:
                 counts["reviewed"] += 1
                 counts[decision] += 1
+            if decision == "approved":
+                audited = review_assurance.get(candidate_id)
+                assurance = (
+                    audited[0]
+                    if audited is not None
+                    and audited[1] == decision
+                    else "unattributed"
+                )
+                counts[f"{assurance}_approved"] += 1
         counts["total"] = len(batch["candidate_ids"])
         totals.update(counts)
         items.append(
@@ -166,8 +186,24 @@ def inspect_conflict_labeling_plan(
                 "labeled_count": counts["labeled"],
                 "approved_count": counts["approved"],
                 "rejected_count": counts["rejected"],
+                "human_attested_approved_count": (
+                    counts["independent_approved"]
+                    + counts["solo_attested_approved"]
+                ),
+                "independent_approved_count": counts[
+                    "independent_approved"
+                ],
+                "solo_attested_approved_count": counts[
+                    "solo_attested_approved"
+                ],
+                "unattributed_approved_count": counts[
+                    "unattributed_approved"
+                ],
                 "annotation_complete": counts["labeled"] == counts["total"],
                 "review_complete": counts["approved"] == counts["total"],
+                "independent_review_complete": (
+                    counts["independent_approved"] == counts["total"]
+                ),
                 "stratum_counts": batch["stratum_counts"],
             }
         )
@@ -187,13 +223,137 @@ def inspect_conflict_labeling_plan(
             "labeled_count": totals["labeled"],
             "approved_count": totals["approved"],
             "rejected_count": totals["rejected"],
+            "human_attested_approved_count": (
+                totals["independent_approved"]
+                + totals["solo_attested_approved"]
+            ),
+            "independent_approved_count": totals[
+                "independent_approved"
+            ],
+            "solo_attested_approved_count": totals[
+                "solo_attested_approved"
+            ],
+            "unattributed_approved_count": totals[
+                "unattributed_approved"
+            ],
             "unlabeled_count": candidate_count - totals["labeled"],
             "unreviewed_count": candidate_count - totals["reviewed"],
             "annotation_complete": totals["labeled"] == candidate_count,
             "review_complete": totals["approved"] == candidate_count,
+            "human_attested_review_complete": (
+                totals["approved"] == candidate_count
+                and (
+                    totals["independent_approved"]
+                    + totals["solo_attested_approved"]
+                )
+                == candidate_count
+            ),
+            "independent_review_complete": (
+                totals["independent_approved"] == candidate_count
+            ),
+            "review_audit_current": review_audit_current,
         },
         "items": items,
     }
+
+
+def _review_assurance_by_candidate(
+    database: Database,
+    pack_id: str,
+    *,
+    current_content_sha256: str,
+) -> tuple[dict[str, tuple[str, str | None]], bool]:
+    with database.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT actor, event_type, details_json
+            FROM audit_log
+            WHERE entity_type = 'conflict_candidate_pack'
+              AND entity_id = ?
+              AND event_type IN (
+                'conflict_candidate_review_updated',
+                'conflict_candidate_review_batch_applied'
+              )
+            ORDER BY id DESC
+            """,
+            (pack_id,),
+        ).fetchall()
+    if not rows:
+        return {}, True
+    try:
+        latest_details = json.loads(rows[0]["details_json"])
+    except (TypeError, json.JSONDecodeError):
+        return {}, False
+    if (
+        latest_details.get("content_sha256_after")
+        != current_content_sha256
+    ):
+        return {}, False
+    assurance: dict[str, tuple[str, str | None]] = {}
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        candidate_ids = (
+            details.get("candidate_ids")
+            if row["event_type"]
+            == "conflict_candidate_review_batch_applied"
+            else [details.get("candidate_id")]
+        )
+        if not isinstance(candidate_ids, list):
+            continue
+        annotator = details.get("annotator")
+        mode = details.get("review_mode")
+        if mode not in {
+            INDEPENDENT_REVIEW_MODE,
+            SOLO_ATTESTED_REVIEW_MODE,
+        }:
+            mode = (
+                INDEPENDENT_REVIEW_MODE
+                if isinstance(annotator, str)
+                and row["actor"] != annotator
+                else "unattributed"
+            )
+        if (
+            mode == INDEPENDENT_REVIEW_MODE
+            and row["actor"] == annotator
+        ) or (
+            mode == SOLO_ATTESTED_REVIEW_MODE
+            and row["actor"] != annotator
+        ):
+            mode = "unattributed"
+        decision_by_candidate = details.get("decision_by_candidate")
+        if not isinstance(decision_by_candidate, dict):
+            decision_by_candidate = {}
+        uniform_batch_decision = None
+        if row["event_type"] == "conflict_candidate_review_batch_applied":
+            candidate_count = details.get("candidate_count")
+            if (
+                isinstance(candidate_count, int)
+                and details.get("approved_count") == candidate_count
+            ):
+                uniform_batch_decision = "approved"
+            elif (
+                isinstance(candidate_count, int)
+                and details.get("rejected_count") == candidate_count
+            ):
+                uniform_batch_decision = "rejected"
+        for candidate_id in candidate_ids:
+            if (
+                isinstance(candidate_id, str)
+                and candidate_id not in assurance
+            ):
+                decision = (
+                    decision_by_candidate.get(candidate_id)
+                    if row["event_type"]
+                    == "conflict_candidate_review_batch_applied"
+                    else details.get("decision")
+                )
+                if decision not in {"approved", "rejected"}:
+                    decision = uniform_batch_decision
+                assurance[candidate_id] = (mode, decision)
+    return assurance, True
 
 
 def list_conflict_labeling_plans(

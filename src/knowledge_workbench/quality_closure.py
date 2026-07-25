@@ -17,6 +17,11 @@ from .labeling import (
     list_labeling_sessions,
 )
 from .linting import lint_workspace
+from .review_assurance import (
+    INDEPENDENT_REVIEW_MODE,
+    SOLO_ATTESTED_REVIEW_MODE,
+    review_actor_policy_valid,
+)
 from .schema_validation import validate_graph_evaluation_dataset
 from .utils import sha256_text, utc_now
 from .wiki import write_text_atomic
@@ -150,15 +155,42 @@ def build_quality_closure_status(
             phase="human_data",
         ),
         _gate(
-            "conflict_independent_review",
-            conflict["review_complete"],
-            required={"review_complete": True},
+            "conflict_review",
+            conflict["human_attested_review_complete"],
+            required={
+                "human_attested_review_complete": True,
+                "accepted_review_modes": [
+                    "independent",
+                    "solo_attested",
+                ],
+            },
             actual={
                 "approved_count": conflict["approved_count"],
+                "human_attested_approved_count": conflict[
+                    "human_attested_approved_count"
+                ],
+                "independent_approved_count": conflict[
+                    "independent_approved_count"
+                ],
+                "solo_attested_approved_count": conflict[
+                    "solo_attested_approved_count"
+                ],
+                "unattributed_approved_count": conflict[
+                    "unattributed_approved_count"
+                ],
+                "independent_review_complete": conflict[
+                    "independent_review_complete"
+                ],
+                "review_audit_current": conflict[
+                    "review_audit_current"
+                ],
                 "candidate_count": conflict["candidate_count"],
                 "unreviewed_count": conflict["unreviewed_count"],
             },
-            next_action="提交整包后由不同 actor 逐批复核",
+            next_action=(
+                "提交整包后逐批人工复核；单人模式必须显式记录"
+                " solo_attested，不能冒充独立复核"
+            ),
             phase="human_data",
         ),
         _gate(
@@ -281,9 +313,15 @@ def build_quality_closure_status(
         ),
         _gate(
             "graph_gold_evaluation",
-            graph["passing_graph_gold_dataset_count"] > 0,
+            graph[
+                "human_attested_passing_graph_gold_dataset_count"
+            ] > 0,
             required={
-                "minimum_passing_graph_gold_dataset_count": 1,
+                "minimum_human_attested_passing_dataset_count": 1,
+                "accepted_review_modes": [
+                    "independent",
+                    "solo_attested",
+                ],
                 "finalization_audit_required": True,
             },
             actual={
@@ -296,11 +334,26 @@ def build_quality_closure_status(
                 "passing_graph_gold_dataset_count": graph[
                     "passing_graph_gold_dataset_count"
                 ],
+                "human_attested_passing_graph_gold_dataset_count": graph[
+                    "human_attested_passing_graph_gold_dataset_count"
+                ],
+                "independent_passing_graph_gold_dataset_count": graph[
+                    "independent_passing_graph_gold_dataset_count"
+                ],
+                "solo_attested_passing_graph_gold_dataset_count": graph[
+                    "solo_attested_passing_graph_gold_dataset_count"
+                ],
+                "unattributed_passing_graph_gold_dataset_count": graph[
+                    "unattributed_passing_graph_gold_dataset_count"
+                ],
                 "unaudited_graph_gold_dataset_count": graph[
                     "unaudited_graph_gold_dataset_count"
                 ],
             },
-            next_action="通过受控工作包异人复核、固化并运行 graph-evaluate",
+            next_action=(
+                "通过受控工作包人工复核、固化并运行 graph-evaluate；"
+                "报告必须区分独立与单人保证级别"
+            ),
             phase="human_data",
         ),
     ]
@@ -493,6 +546,27 @@ def _conflict_status(
             "annotation_complete", False
         ),
         "review_complete": summary.get("review_complete", False),
+        "human_attested_review_complete": summary.get(
+            "human_attested_review_complete", False
+        ),
+        "independent_review_complete": summary.get(
+            "independent_review_complete", False
+        ),
+        "human_attested_approved_count": summary.get(
+            "human_attested_approved_count", 0
+        ),
+        "independent_approved_count": summary.get(
+            "independent_approved_count", 0
+        ),
+        "solo_attested_approved_count": summary.get(
+            "solo_attested_approved_count", 0
+        ),
+        "unattributed_approved_count": summary.get(
+            "unattributed_approved_count", 0
+        ),
+        "review_audit_current": summary.get(
+            "review_audit_current", True
+        ),
     }
 
 
@@ -588,6 +662,11 @@ def _graph_gold_dataset_status(
     stale = 0
     passing = 0
     unaudited = 0
+    passing_by_assurance = {
+        INDEPENDENT_REVIEW_MODE: 0,
+        SOLO_ATTESTED_REVIEW_MODE: 0,
+        "unattributed": 0,
+    }
     with database.connect() as connection:
         audit_rows = connection.execute(
             """
@@ -596,7 +675,7 @@ def _graph_gold_dataset_status(
               AND entity_type = 'graph_gold_candidate'
             """
         ).fetchall()
-    finalized_outputs: dict[str, set[str]] = {}
+    finalized_outputs: dict[str, dict[str, set[str]]] = {}
     for row in audit_rows:
         try:
             details = json.loads(row["details_json"])
@@ -605,7 +684,10 @@ def _graph_gold_dataset_status(
         output = details.get("output")
         content_sha256 = details.get("content_sha256")
         if isinstance(output, str) and isinstance(content_sha256, str):
-            finalized_outputs.setdefault(output, set()).add(content_sha256)
+            mode = details.get("review_mode")
+            finalized_outputs.setdefault(output, {}).setdefault(
+                content_sha256, set()
+            ).add(mode if isinstance(mode, str) else "")
     for path in sorted(paths.evaluations.glob("*.json")):
         try:
             content = path.read_text(encoding="utf-8")
@@ -621,11 +703,16 @@ def _graph_gold_dataset_status(
         relative_path = path.resolve().relative_to(
             paths.root.resolve()
         ).as_posix()
-        if sha256_text(content) not in finalized_outputs.get(
-            relative_path, set()
-        ):
+        content_sha256 = sha256_text(content)
+        audit_modes = finalized_outputs.get(
+            relative_path, {}
+        ).get(content_sha256)
+        if not audit_modes:
             unaudited += 1
             continue
+        assurance = _graph_dataset_review_assurance(
+            payload, audit_modes
+        )
         valid += 1
         try:
             report = evaluate_graph_dataset(database, path)
@@ -639,12 +726,71 @@ def _graph_gold_dataset_status(
             and aggregate["truncated_path_case_count"] == 0
         ):
             passing += 1
+            passing_by_assurance[assurance] += 1
     return {
         "valid_graph_gold_dataset_count": valid,
         "stale_graph_gold_dataset_count": stale,
         "passing_graph_gold_dataset_count": passing,
+        "human_attested_passing_graph_gold_dataset_count": (
+            passing_by_assurance[INDEPENDENT_REVIEW_MODE]
+            + passing_by_assurance[SOLO_ATTESTED_REVIEW_MODE]
+        ),
+        "independent_passing_graph_gold_dataset_count": (
+            passing_by_assurance[INDEPENDENT_REVIEW_MODE]
+        ),
+        "solo_attested_passing_graph_gold_dataset_count": (
+            passing_by_assurance[SOLO_ATTESTED_REVIEW_MODE]
+        ),
+        "unattributed_passing_graph_gold_dataset_count": (
+            passing_by_assurance["unattributed"]
+        ),
         "unaudited_graph_gold_dataset_count": unaudited,
     }
+
+
+def _graph_dataset_review_assurance(
+    payload: dict[str, Any],
+    audit_modes: set[str],
+) -> str:
+    provenance = payload["provenance"]
+    payload_mode = provenance.get("review_mode")
+    explicit_modes = {
+        mode
+        for mode in audit_modes
+        if mode in {
+            INDEPENDENT_REVIEW_MODE,
+            SOLO_ATTESTED_REVIEW_MODE,
+        }
+    }
+    if len(explicit_modes) > 1:
+        return "unattributed"
+    if explicit_modes:
+        mode = next(iter(explicit_modes))
+        if payload_mode != mode:
+            return "unattributed"
+        expected_independent = mode == INDEPENDENT_REVIEW_MODE
+        if provenance.get("independent_review") is not expected_independent:
+            return "unattributed"
+    elif payload_mode in {
+        INDEPENDENT_REVIEW_MODE,
+        SOLO_ATTESTED_REVIEW_MODE,
+    }:
+        return "unattributed"
+    else:
+        mode = (
+            INDEPENDENT_REVIEW_MODE
+            if provenance["annotator"] != provenance["reviewer"]
+            else "unattributed"
+        )
+    if mode == "unattributed":
+        return mode
+    if not review_actor_policy_valid(
+        submitter=provenance["annotator"],
+        reviewer=provenance["reviewer"],
+        review_mode=mode,
+    ):
+        return "unattributed"
+    return mode
 
 
 def _work_pack_status(database: Database) -> dict[str, int]:

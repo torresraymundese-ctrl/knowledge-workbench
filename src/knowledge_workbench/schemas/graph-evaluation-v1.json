@@ -22,7 +22,12 @@
         "annotator": {"type": "string", "minLength": 1, "maxLength": 80},
         "reviewer": {"type": "string", "minLength": 1, "maxLength": 80},
         "reviewed_at": {"type": "string", "format": "date-time"},
-        "decision": {"const": "approved"}
+        "decision": {"const": "approved"},
+        "review_mode": {
+          "type": "string",
+          "enum": ["independent", "solo_attested"]
+        },
+        "independent_review": {"type": "boolean"}
       }
     },
     "relation_cases": {

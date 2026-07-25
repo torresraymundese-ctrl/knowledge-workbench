@@ -18,6 +18,17 @@ from .conflict_candidates import (
 from .conflict_labeling_plan import resolve_conflict_labeling_batch
 from .database import Database
 from .errors import InvalidTransitionError, KnowledgeWorkbenchError
+from .review_assurance import (
+    INDEPENDENT_REVIEW_MODE,
+    SOLO_ATTESTATION_PHRASE,
+    SOLO_ATTESTED_REVIEW_MODE,
+    required_review_mode,
+    review_actor_policy_valid,
+    review_audit_context,
+    review_mode_from_metadata,
+    validate_review_actor_policy,
+    validate_review_attestation,
+)
 from .utils import sha256_file, sha256_text, utc_now
 from .wiki import write_text_atomic
 
@@ -193,8 +204,10 @@ def export_conflict_batch_review_pack(
     output: Path,
     *,
     actor: str,
+    review_mode: str = INDEPENDENT_REVIEW_MODE,
 ) -> Path:
     actor = _required_actor(actor)
+    review_mode = required_review_mode(review_mode)
     output = _validated_output(paths, output, "冲突批次复核工作包")
     batch, source_path, source_pack = _resolved_source(
         database, paths, plan_id, batch_id
@@ -207,8 +220,14 @@ def export_conflict_batch_review_pack(
         raise InvalidTransitionError(
             "只有已提交标签的候选包可以导出冲突批次复核工作包"
         )
-    if submission["actor"] == actor:
-        raise InvalidTransitionError("标注人与复核人必须不同")
+    try:
+        validate_review_actor_policy(
+            submitter=submission["actor"],
+            reviewer=actor,
+            review_mode=review_mode,
+        )
+    except KnowledgeWorkbenchError as exc:
+        raise InvalidTransitionError(str(exc)) from exc
     source_content_sha256 = sha256_file(source_path)
     candidates = _ordered_candidates(source_pack, batch["candidate_ids"])
     generated_at = utc_now()
@@ -221,17 +240,33 @@ def export_conflict_batch_review_pack(
         f"source_content_sha256: {source_content_sha256}",
         f"annotator: {submission['actor']}",
         f"reviewer: {actor}",
+        f"review_mode: {review_mode}",
         f"generated_at: {generated_at}",
         "---",
         "",
-        f"# 跨文档冲突复核：{batch_id}",
+        f"# 跨文档冲突人工复核：{batch_id}",
         "",
         f"- 计划：`{plan_id}`",
         f"- 来源候选包：`{source_pack['pack_id']}`",
         f"- 标注人：`{submission['actor']}`",
         f"- 复核人：`{actor}`",
+        (
+            "- 复核模式：`independent`（标注人与复核人不同）。"
+            if review_mode == INDEPENDENT_REVIEW_MODE
+            else (
+                "- 复核模式：`solo_attested`（同一责任人二次确认，"
+                "不构成独立复核）。"
+            )
+        ),
         f"- 本批候选：`{len(candidates)}`",
-        "- 复核人必须独立回源；规则预测与标注结论都不能代替来源核对。",
+        (
+            "- 复核人必须独立回源；规则预测与标注结论都不能代替来源核对。"
+            if review_mode == INDEPENDENT_REVIEW_MODE
+            else (
+                "- 同一责任人必须重新回源；规则预测和首次标注"
+                "都不能代替二次核对。"
+            )
+        ),
         "- 每个候选必须且只能勾选“批准人工标签”或“驳回人工标签”。",
         "- 驳回必须填写复核意见；工作包按来源候选包 SHA-256 锁定。",
         "",
@@ -245,6 +280,12 @@ def export_conflict_batch_review_pack(
             "batch-review-apply "
             f"{_powershell_literal(str(output))} "
             f"--actor {_powershell_literal(actor)}"
+            + (
+                " --solo-attestation "
+                + _powershell_literal(SOLO_ATTESTATION_PHRASE)
+                if review_mode == SOLO_ATTESTED_REVIEW_MODE
+                else ""
+            )
         ),
         "```",
         "",
@@ -299,7 +340,10 @@ def export_conflict_batch_review_pack(
         source_content_sha256=source_content_sha256,
         candidate_count=len(candidates),
         actor=actor,
-        extra_details={"annotator": submission["actor"]},
+        extra_details={
+            "annotator": submission["actor"],
+            **review_audit_context(review_mode, None),
+        },
     )
     return output
 
@@ -310,18 +354,26 @@ def apply_conflict_batch_review_pack(
     pack_path: Path,
     *,
     actor: str,
+    solo_attestation: str | None = None,
 ) -> dict[str, Any]:
     actor = _required_actor(actor)
     pack_path, content = _read_work_pack(
         paths, pack_path, "冲突批次复核工作包"
     )
     metadata, decisions = _parse_review_pack(content)
+    review_mode = metadata["review_mode"]
+    attestation_sha256 = validate_review_attestation(
+        review_mode, solo_attestation
+    )
     if metadata["reviewer"] != actor:
         raise KnowledgeWorkbenchError(
             "工作包声明的复核人与当前 actor 不一致"
         )
-    if metadata["annotator"] == actor:
-        raise KnowledgeWorkbenchError("标注人与复核人必须不同")
+    validate_review_actor_policy(
+        submitter=metadata["annotator"],
+        reviewer=actor,
+        review_mode=review_mode,
+    )
     batch = resolve_conflict_labeling_batch(
         database,
         paths,
@@ -363,6 +415,8 @@ def apply_conflict_batch_review_pack(
         ).as_posix(),
         work_pack_sha256=sha256_text(content),
         actor=actor,
+        review_mode=review_mode,
+        solo_attestation_sha256=attestation_sha256,
     )
 
 
@@ -426,6 +480,11 @@ def inspect_conflict_batch_work_pack(
             )
         _require_metadata(metadata, required_metadata)
         actor = _required_actor(metadata[role_key])
+        review_mode = (
+            review_mode_from_metadata(metadata)
+            if pack_type == _REVIEW_PACK_TYPE
+            else None
+        )
         records = _parse_candidate_sections(
             lines,
             start,
@@ -535,9 +594,20 @@ def inspect_conflict_batch_work_pack(
     phase = None
     phase_valid = False
     submission_actor_valid = pack_type != _REVIEW_PACK_TYPE
+    review_actor_policy_valid_value = (
+        pack_type != _REVIEW_PACK_TYPE
+        or review_actor_policy_valid(
+            submitter=metadata["annotator"],
+            reviewer=metadata["reviewer"],
+            review_mode=review_mode,
+        )
+    )
     actor_separation_valid = (
         pack_type != _REVIEW_PACK_TYPE
-        or metadata["annotator"] != metadata["reviewer"]
+        or (
+            review_mode == INDEPENDENT_REVIEW_MODE
+            and review_actor_policy_valid_value
+        )
     )
     if source_pack is not None and "source_content" not in validation_errors:
         submission, drifted = _candidate_submission_state(
@@ -573,15 +643,15 @@ def inspect_conflict_batch_work_pack(
         issue_codes.append("conflict_type_invalid")
     if missing_note_ids:
         issue_codes.append("required_note_missing")
-    if not actor_separation_valid:
-        issue_codes.append("actor_separation_conflict")
+    if not review_actor_policy_valid_value:
+        issue_codes.append("review_actor_policy_conflict")
     if not submission_actor_valid:
         issue_codes.append("annotator_audit_mismatch")
 
     apply_ready = (
         integrity_valid
         and phase_valid
-        and actor_separation_valid
+        and review_actor_policy_valid_value
         and submission_actor_valid
         and not unresolved_ids
     )
@@ -612,6 +682,16 @@ def inspect_conflict_batch_work_pack(
         "source_phase": phase,
         "source_phase_valid": phase_valid,
         "actor_separation_valid": actor_separation_valid,
+        "review_mode": review_mode,
+        "independent_review": (
+            review_mode == INDEPENDENT_REVIEW_MODE
+            if review_mode is not None
+            else None
+        ),
+        "solo_attestation_required": (
+            review_mode == SOLO_ATTESTED_REVIEW_MODE
+        ),
+        "review_actor_policy_valid": review_actor_policy_valid_value,
         "submission_actor_valid": submission_actor_valid,
         "next_unresolved_candidate_id": (
             unresolved_ids[0] if unresolved_ids else None
@@ -742,6 +822,7 @@ def _parse_review_pack(
             "reviewer",
         ),
     )
+    metadata["review_mode"] = review_mode_from_metadata(metadata)
     records = _parse_candidate_sections(
         lines,
         start,
