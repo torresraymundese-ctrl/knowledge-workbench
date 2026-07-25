@@ -264,6 +264,31 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             )
             self.assertIn("case_missing", blank_status["issue_codes"])
             self.assertFalse(blank_status["apply_ready"])
+            decoy = paths.evaluations / "not-a-work-pack.md"
+            decoy.write_text(
+                "正文示例：type: graph-gold-annotation-work-pack\n",
+                encoding="utf-8",
+            )
+            blank_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            self.assertEqual(
+                blank_quality["metrics"]["work_packs"][
+                    "graph_gold_annotation_incomplete_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                blank_quality["metrics"]["work_packs"][
+                    "graph_gold_annotation_work_pack_count"
+                ],
+                1,
+            )
+            graph_gate = {
+                item["gate_id"]: item
+                for item in blank_quality["gates"]
+            }["graph_gold_evaluation"]
+            self.assertIn("填写现有图谱黄金标注包", graph_gate["next_action"])
             with database.connect() as connection:
                 audit_count_after_status = connection.execute(
                     "SELECT COUNT(*) FROM audit_log"
@@ -283,6 +308,15 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             self.assertEqual(ready_annotation["path_case_count"], 1)
             self.assertEqual(ready_annotation["issue_codes"], [])
             self.assertTrue(ready_annotation["apply_ready"])
+            ready_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            self.assertEqual(
+                ready_quality["metrics"]["work_packs"][
+                    "graph_gold_annotation_ready_count"
+                ],
+                1,
+            )
             candidate_path = paths.evaluations / "gold-candidate.json"
             saved = apply_graph_gold_annotation_work_pack(
                 database,
@@ -354,6 +388,16 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             )
             self.assertFalse(blank_review["decisions_complete"])
             self.assertFalse(blank_review["apply_ready"])
+            blank_review_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            work_packs = blank_review_quality["metrics"]["work_packs"]
+            self.assertEqual(
+                work_packs["graph_gold_annotation_applied_count"], 1
+            )
+            self.assertEqual(
+                work_packs["graph_gold_review_incomplete_count"], 1
+            )
             review_path.write_text(
                 self._fill_review(
                     review_content,
@@ -377,6 +421,23 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             self.assertTrue(ready_review["decisions_complete"])
             self.assertEqual(ready_review["issue_codes"], [])
             self.assertTrue(ready_review["apply_ready"])
+            ready_review_quality = build_quality_closure_status(
+                database, paths, target_gold_documents=10
+            )
+            self.assertEqual(
+                ready_review_quality["metrics"]["work_packs"][
+                    "graph_gold_review_ready_count"
+                ],
+                1,
+            )
+            graph_gate = {
+                item["gate_id"]: item
+                for item in ready_review_quality["gates"]
+            }["graph_gold_evaluation"]
+            self.assertIn(
+                "应用已完成的图谱黄金复核工作包",
+                graph_gate["next_action"],
+            )
             dataset_path = paths.evaluations / "graph-gold-v1.json"
             result = apply_graph_gold_review_work_pack(
                 database,
@@ -402,6 +463,12 @@ class GraphGoldWorkPackTests(unittest.TestCase):
             )
             quality = build_quality_closure_status(
                 database, paths, target_gold_documents=10
+            )
+            self.assertEqual(
+                quality["metrics"]["work_packs"][
+                    "graph_gold_review_applied_count"
+                ],
+                1,
             )
             self.assertEqual(
                 quality["metrics"]["graph"][

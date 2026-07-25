@@ -11,6 +11,11 @@ from .database import Database
 from .entity_relationships import project_business_relationship_graph
 from .errors import KnowledgeWorkbenchError
 from .graph_evaluation import evaluate_graph_dataset
+from .graph_gold_workpacks import (
+    ANNOTATION_PACK_TYPE,
+    REVIEW_PACK_TYPE,
+    inspect_graph_gold_work_pack,
+)
 from .graph_pilot import list_graph_pilot_packs
 from .labeling import (
     labeling_session_readiness,
@@ -44,7 +49,7 @@ def build_quality_closure_status(
     gold = _gold_status(database)
     conflict = _conflict_status(database, paths)
     graph = _graph_status(database, paths)
-    work_packs = _work_pack_status(database)
+    work_packs = _work_pack_status(database, paths)
 
     gates = [
         _gate(
@@ -349,11 +354,26 @@ def build_quality_closure_status(
                 "unaudited_graph_gold_dataset_count": graph[
                     "unaudited_graph_gold_dataset_count"
                 ],
+                "annotation_work_pack_ready_count": work_packs[
+                    "graph_gold_annotation_ready_count"
+                ],
+                "annotation_work_pack_incomplete_count": work_packs[
+                    "graph_gold_annotation_incomplete_count"
+                ],
+                "annotation_work_pack_invalid_count": work_packs[
+                    "graph_gold_annotation_invalid_count"
+                ],
+                "review_work_pack_ready_count": work_packs[
+                    "graph_gold_review_ready_count"
+                ],
+                "review_work_pack_incomplete_count": work_packs[
+                    "graph_gold_review_incomplete_count"
+                ],
+                "review_work_pack_invalid_count": work_packs[
+                    "graph_gold_review_invalid_count"
+                ],
             },
-            next_action=(
-                "通过受控工作包人工复核、固化并运行 graph-evaluate；"
-                "报告必须区分独立与单人保证级别"
-            ),
+            next_action=_graph_gold_next_action(work_packs),
             phase="human_data",
         ),
     ]
@@ -793,7 +813,9 @@ def _graph_dataset_review_assurance(
     return mode
 
 
-def _work_pack_status(database: Database) -> dict[str, int]:
+def _work_pack_status(
+    database: Database, paths: WorkspacePaths
+) -> dict[str, int]:
     with database.connect() as connection:
         rows = connection.execute(
             """
@@ -817,6 +839,9 @@ def _work_pack_status(database: Database) -> dict[str, int]:
             """
         ).fetchall()
     counts = {row["event_type"]: row["count"] for row in rows}
+    graph_gold_work_packs = _graph_gold_work_pack_status(
+        database, paths
+    )
     return {
         "conflict_annotation_export_count": counts.get(
             "conflict_batch_annotation_pack_exported", 0
@@ -854,7 +879,112 @@ def _work_pack_status(database: Database) -> dict[str, int]:
         "graph_gold_dataset_finalized_count": counts.get(
             "graph_gold_dataset_finalized", 0
         ),
+        **graph_gold_work_packs,
     }
+
+
+def _graph_gold_work_pack_status(
+    database: Database,
+    paths: WorkspacePaths,
+) -> dict[str, int]:
+    metrics = {
+        "graph_gold_annotation_work_pack_count": 0,
+        "graph_gold_annotation_ready_count": 0,
+        "graph_gold_annotation_incomplete_count": 0,
+        "graph_gold_annotation_invalid_count": 0,
+        "graph_gold_annotation_applied_count": 0,
+        "graph_gold_review_work_pack_count": 0,
+        "graph_gold_review_ready_count": 0,
+        "graph_gold_review_incomplete_count": 0,
+        "graph_gold_review_invalid_count": 0,
+        "graph_gold_review_applied_count": 0,
+    }
+    if not paths.evaluations.exists():
+        return metrics
+    for path in sorted(paths.evaluations.glob("*.md")):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        work_pack_type = _declared_graph_gold_work_pack_type(
+            content
+        )
+        if work_pack_type is None:
+            continue
+        prefix = f"graph_gold_{work_pack_type}"
+        metrics[f"{prefix}_work_pack_count"] += 1
+        try:
+            status = inspect_graph_gold_work_pack(
+                database, paths, path
+            )
+        except KnowledgeWorkbenchError:
+            metrics[f"{prefix}_invalid_count"] += 1
+            continue
+        if status["already_applied"]:
+            metrics[f"{prefix}_applied_count"] += 1
+        elif not status["integrity_valid"]:
+            metrics[f"{prefix}_invalid_count"] += 1
+        elif status["apply_ready"]:
+            metrics[f"{prefix}_ready_count"] += 1
+        else:
+            metrics[f"{prefix}_incomplete_count"] += 1
+    return metrics
+
+
+def _declared_graph_gold_work_pack_type(
+    content: str,
+) -> str | None:
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        end = next(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+    except StopIteration:
+        return None
+    declared_type = None
+    for line in lines[1:end]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() == "type":
+            declared_type = value.strip()
+    return {
+        ANNOTATION_PACK_TYPE: "annotation",
+        REVIEW_PACK_TYPE: "review",
+    }.get(declared_type)
+
+
+def _graph_gold_next_action(work_packs: dict[str, int]) -> str:
+    if work_packs["graph_gold_review_ready_count"] > 0:
+        return (
+            "应用已完成的图谱黄金复核工作包，固化并运行 "
+            "graph-evaluate"
+        )
+    if work_packs["graph_gold_review_incomplete_count"] > 0:
+        return (
+            "逐案完成图谱黄金复核工作包后再次运行只读预检"
+        )
+    if work_packs["graph_gold_annotation_ready_count"] > 0:
+        return (
+            "应用已通过预检的图谱黄金标注工作包并导出复核包"
+        )
+    if work_packs["graph_gold_annotation_incomplete_count"] > 0:
+        return (
+            "填写现有图谱黄金标注包的名称和至少一个真实用例，"
+            "再运行只读预检"
+        )
+    if (
+        work_packs["graph_gold_annotation_invalid_count"] > 0
+        or work_packs["graph_gold_review_invalid_count"] > 0
+    ):
+        return (
+            "废弃来源漂移或完整性失效的图谱黄金工作包并重新导出"
+        )
+    return "导出图谱黄金标注工作包并人工填写真实用例"
 
 
 def _gate(
