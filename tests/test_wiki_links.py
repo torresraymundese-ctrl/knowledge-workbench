@@ -16,6 +16,21 @@ from knowledge_workbench.wiki_links import add_wiki_link, remove_wiki_link
 
 
 class WikiLinkTests(unittest.TestCase):
+    @staticmethod
+    def _admit_all_documents(database: Database) -> None:
+        with database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE document_governance
+                SET purpose = 'production',
+                    scope_status = 'in_scope',
+                    authority_status = 'reference',
+                    reviewed_by = 'scope-reviewer',
+                    reviewed_at = updated_at,
+                    decision_reason = '测试中明确准入'
+                """
+            )
+
     def test_target_update_marks_verified_downstream_page_for_revalidation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -29,6 +44,7 @@ class WikiLinkTests(unittest.TestCase):
                 downstream_source, paths, Classification.INTERNAL
             )
             database = Database(paths.database)
+            self._admit_all_documents(database)
             with database.connect() as connection:
                 target_evidence = connection.execute(
                     "SELECT id FROM evidence WHERE document_version_id = ?",
@@ -86,6 +102,7 @@ class WikiLinkTests(unittest.TestCase):
             first = ingest_file(source_a, paths, Classification.INTERNAL)
             second = ingest_file(source_b, paths, Classification.INTERNAL)
             database = Database(paths.database)
+            self._admit_all_documents(database)
             with database.connect() as connection:
                 evidence_id = connection.execute(
                     "SELECT id FROM evidence WHERE document_version_id = ?",
@@ -132,6 +149,7 @@ class WikiLinkTests(unittest.TestCase):
             first = ingest_file(source_a, paths, Classification.INTERNAL)
             second = ingest_file(source_b, paths, Classification.INTERNAL)
             database = Database(paths.database)
+            self._admit_all_documents(database)
             with database.connect() as connection:
                 evidence_id = connection.execute(
                     "SELECT id FROM evidence WHERE document_version_id = ?",

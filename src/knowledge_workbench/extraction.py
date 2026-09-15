@@ -46,29 +46,33 @@ class FaithfulEvidenceExtractor:
         return tuple(output)
 
     def _split_long(self, value: str) -> list[str]:
-        sentences = [
-            part.strip()
-            for part in re.split(r"(?<=[。！？.!?；;])\s*", value)
-            if part.strip()
-        ]
         chunks: list[str] = []
-        current = ""
-        for sentence in sentences:
-            if len(sentence) > self.max_chars:
-                if current:
-                    chunks.append(current)
-                    current = ""
-                chunks.extend(
-                    sentence[index : index + self.max_chars]
-                    for index in range(0, len(sentence), self.max_chars)
-                )
-            elif current and len(current) + len(sentence) > self.max_chars:
-                chunks.append(current)
-                current = sentence
-            else:
-                current += sentence
-        if current:
-            chunks.append(current)
+        start = 0
+        minimum_boundary = max(self.max_chars // 2, 1)
+        while len(value) - start > self.max_chars:
+            window = value[start : start + self.max_chars]
+            boundary = max(
+                (
+                    window.rfind(character) + 1
+                    for character in "。！？.!?；;\n"
+                ),
+                default=0,
+            )
+            if boundary < minimum_boundary:
+                whitespace = max(window.rfind(" "), window.rfind("\t"))
+                boundary = whitespace + 1 if whitespace >= minimum_boundary else 0
+            if boundary < minimum_boundary:
+                boundary = self.max_chars
+            end = start + boundary
+            excerpt = value[start:end].strip()
+            if excerpt:
+                chunks.append(excerpt)
+            start = end
+            while start < len(value) and value[start].isspace():
+                start += 1
+        remainder = value[start:].strip()
+        if remainder:
+            chunks.append(remainder)
         return chunks
 
 

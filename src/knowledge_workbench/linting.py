@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
     checked_entity_merge_requests = 0
     checked_entity_relation_types = 0
     checked_entity_relationships = 0
+    checked_topic_revisions = 0
     labeling_sessions = []
     with database.connect() as connection:
         foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -399,6 +401,45 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
                 revisions[0],
                 issues,
             )
+        topic_revisions = connection.execute(
+            """
+            WITH topic_revision_ids(page_id, revision_id) AS (
+                SELECT wp.id,
+                       (
+                           SELECT candidate.id
+                           FROM wiki_revisions candidate
+                           WHERE candidate.page_id = wp.id
+                             AND candidate.status IN (
+                                 'draft', 'reviewing', 'verified'
+                             )
+                           ORDER BY candidate.revision_number DESC,
+                                    candidate.created_at DESC,
+                                    candidate.id DESC
+                           LIMIT 1
+                       )
+                FROM wiki_pages wp
+                WHERE wp.source_document_id IS NULL
+                UNION
+                SELECT wp.id, wp.current_verified_revision_id
+                FROM wiki_pages wp
+                WHERE wp.source_document_id IS NULL
+                  AND wp.current_verified_revision_id IS NOT NULL
+            )
+            SELECT wr.id, wr.markdown_path, wr.content_sha256, wr.generator,
+                   ids.page_id
+            FROM topic_revision_ids ids
+            JOIN wiki_revisions wr ON wr.id = ids.revision_id
+            ORDER BY ids.page_id, wr.revision_number, wr.id
+            """
+        ).fetchall()
+        checked_topic_revisions = len(topic_revisions)
+        for revision in topic_revisions:
+            _check_topic_revision(
+                connection,
+                paths,
+                revision,
+                issues,
+            )
 
     for session in labeling_sessions:
         try:
@@ -433,6 +474,7 @@ def lint_workspace(database: Database, paths: WorkspacePaths) -> dict:
             "entity_merge_request_count": checked_entity_merge_requests,
             "entity_relation_type_count": checked_entity_relation_types,
             "entity_relationship_count": checked_entity_relationships,
+            "topic_wiki_revision_count": checked_topic_revisions,
         },
         "issues": [asdict(issue) for issue in issues],
     }
@@ -525,6 +567,215 @@ def _check_run_artifacts(
         )
 
 
+def _check_topic_revision(
+    connection,
+    paths: WorkspacePaths,
+    revision,
+    issues: list[LintIssue],
+) -> None:
+    revision_id = revision["id"]
+    if revision["generator"] != "topic-extractive-v1":
+        issues.append(
+            LintIssue(
+                "topic_wiki_generator_invalid",
+                revision_id,
+                "主题知识页必须由逐字摘录生成器创建",
+            )
+        )
+    markdown_path = (paths.root / revision["markdown_path"]).resolve()
+    try:
+        markdown_path.relative_to(paths.root.resolve())
+    except ValueError:
+        issues.append(
+            LintIssue(
+                "topic_wiki_path_escape",
+                revision_id,
+                "主题知识页路径越出工作区",
+            )
+        )
+        return
+    try:
+        content = markdown_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        issues.append(
+            LintIssue(
+                "topic_wiki_markdown_missing",
+                revision_id,
+                "主题知识页 Markdown 不存在或不可读取",
+            )
+        )
+        return
+    if not re.search(
+        r'^generator:\s*"topic-extractive-v1"\s*$',
+        content,
+        flags=re.MULTILINE,
+    ):
+        issues.append(
+            LintIssue(
+                "topic_wiki_generator_invalid",
+                revision_id,
+                "主题知识页 Markdown 缺少可信的逐字摘录生成器声明",
+            )
+        )
+    if sha256_text(content) != revision["content_sha256"]:
+        issues.append(
+            LintIssue(
+                "topic_wiki_markdown_sha256_mismatch",
+                revision_id,
+                "主题知识页 Markdown 哈希与数据库不一致",
+            )
+        )
+
+    expected_evidence_count = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM revision_evidence
+        WHERE revision_id = ?
+        """,
+        (revision_id,),
+    ).fetchone()[0]
+    rows = connection.execute(
+        """
+        SELECT e.id, e.excerpt, e.status AS evidence_status,
+               etv.status AS validation_status,
+               dv.document_id, pr.status AS run_status,
+               pr.is_current AS run_is_current,
+               (d.current_version_id = dv.id) AS version_is_current,
+               (pr.document_version_id = e.document_version_id)
+                   AS run_version_matches,
+               d.classification, dg.purpose, dg.scope_status,
+               dg.authority_status
+        FROM revision_evidence re
+        JOIN evidence e ON e.id = re.evidence_id
+        JOIN document_versions dv ON dv.id = e.document_version_id
+        JOIN documents d ON d.id = dv.document_id
+        LEFT JOIN evidence_technical_validation etv ON etv.evidence_id = e.id
+        LEFT JOIN processing_runs pr ON pr.id = e.processing_run_id
+        LEFT JOIN document_governance dg ON dg.document_id = d.id
+        WHERE re.revision_id = ?
+        ORDER BY e.id
+        """,
+        (revision_id,),
+    ).fetchall()
+    if (
+        len(rows) != expected_evidence_count
+        or len({row["document_id"] for row in rows}) < 2
+    ):
+        issues.append(
+            LintIssue(
+                "topic_wiki_source_count",
+                revision_id,
+                "主题知识页必须引用至少两份不同资料",
+            )
+        )
+    invalid_rows = [
+        row
+        for row in rows
+        if row["evidence_status"] != "verified"
+        or row["validation_status"] != "passed"
+        or row["run_status"] != "completed"
+        or not row["run_is_current"]
+        or not row["version_is_current"]
+        or not row["run_version_matches"]
+        or row["classification"] == "restricted"
+        or row["purpose"] != "production"
+        or row["scope_status"] != "in_scope"
+        or row["authority_status"] not in {"reference", "authoritative"}
+    ]
+    if invalid_rows:
+        issues.append(
+            LintIssue(
+                "topic_wiki_source_invalid",
+                revision_id,
+                f"主题知识页有 {len(invalid_rows)} 条来源依据不再有效",
+            )
+        )
+
+    database_ids = {row["id"] for row in rows}
+    excerpts = {row["id"]: row["excerpt"].strip() for row in rows}
+    lines = content.splitlines()
+    heading_indexes = [
+        index for index, line in enumerate(lines) if line.startswith("## ")
+    ]
+    marker_ids: set[str] = set()
+    source_marker_ids: set[str] = set()
+    marker_invalid = not heading_indexes
+    section_excerpt_missing = False
+    marker_pattern = re.compile(
+        r"<!-- topic-section-evidence: (?P<ids>\[.*\]) -->"
+    )
+    for position, heading_index in enumerate(heading_indexes):
+        if heading_index + 1 >= len(lines):
+            marker_invalid = True
+            continue
+        marker_match = marker_pattern.fullmatch(lines[heading_index + 1].strip())
+        if not marker_match:
+            marker_invalid = True
+            continue
+        try:
+            parsed = json.loads(marker_match.group("ids"))
+        except json.JSONDecodeError:
+            marker_invalid = True
+            continue
+        if (
+            not isinstance(parsed, list)
+            or any(not isinstance(item, str) or not item.strip() for item in parsed)
+            or len(parsed) != len(set(parsed))
+            or not set(parsed).issubset(database_ids)
+        ):
+            marker_invalid = True
+            continue
+        marker_ids.update(parsed)
+        if not lines[heading_index].startswith("## 原文依据："):
+            continue
+        if not parsed:
+            marker_invalid = True
+            continue
+        source_marker_ids.update(parsed)
+        next_heading = (
+            heading_indexes[position + 1]
+            if position + 1 < len(heading_indexes)
+            else len(lines)
+        )
+        section_text = "\n".join(
+            line[2:] if line.startswith("> ") else line
+            for line in lines[heading_index + 2 : next_heading]
+        )
+        if any(excerpts[evidence_id] not in section_text for evidence_id in parsed):
+            section_excerpt_missing = True
+
+    if (
+        marker_invalid
+        or marker_ids != database_ids
+        or source_marker_ids != database_ids
+    ):
+        issues.append(
+            LintIssue(
+                "topic_wiki_evidence_marker_mismatch",
+                revision_id,
+                "主题知识页每个二级章节必须紧邻声明依据，且逐项展示本修订全部来源",
+            )
+        )
+    missing_quotes = [
+        row["id"]
+        for row in rows
+        if row["excerpt"] not in content
+        and row["excerpt"]
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "\n> ")
+        not in content
+    ]
+    if missing_quotes or section_excerpt_missing:
+        issues.append(
+            LintIssue(
+                "topic_wiki_excerpt_missing",
+                revision_id,
+                "主题知识页缺少逐字原文，或原文未放在其声明的来源章节中",
+            )
+        )
+
+
 def _read_json(
     path: Path,
     entity_id: str,
@@ -558,13 +809,37 @@ def _check_analysis_database_consistency(
     issues: list[LintIssue],
 ) -> None:
     source = analysis.get("source", {})
-    expected_source = {
-        "document_version_id": document["current_version_id"],
-        "sha256": document["sha256"],
-        "classification": document["classification"],
+    classification_rank = {
+        "public": 0,
+        "internal": 1,
+        "confidential": 2,
+        "restricted": 3,
     }
-    if source != expected_source:
-        issues.append(LintIssue("analysis_source_mismatch", run_id, "分析来源与数据库当前版本不一致"))
+    source_classification = source.get("classification")
+    current_classification = document["classification"]
+    source_identity_matches = (
+        source.get("document_version_id") == document["current_version_id"]
+        and source.get("sha256") == document["sha256"]
+        and set(source) == {
+            "document_version_id",
+            "sha256",
+            "classification",
+        }
+    )
+    classification_is_preserved_or_tightened = (
+        source_classification in classification_rank
+        and current_classification in classification_rank
+        and classification_rank[current_classification]
+        >= classification_rank[source_classification]
+    )
+    if not source_identity_matches or not classification_is_preserved_or_tightened:
+        issues.append(
+            LintIssue(
+                "analysis_source_mismatch",
+                run_id,
+                "分析来源身份或当前密级收紧关系与数据库不一致",
+            )
+        )
     items = analysis.get("evidence", [])
     if len(items) != len(evidence):
         issues.append(
@@ -601,7 +876,10 @@ def _check_mirror(
     issues: list[LintIssue],
 ) -> None:
     try:
-        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+        # JSON Lines records are separated by LF. ``str.splitlines()`` also
+        # treats Unicode line/paragraph separators embedded in valid JSON
+        # strings as record boundaries, which corrupts otherwise valid mirrors.
+        lines = [line for line in path.read_text(encoding="utf-8").split("\n") if line]
         mirror = [json.loads(line) for line in lines]
     except FileNotFoundError:
         issues.append(LintIssue("evidence_mirror_missing", run_id, "证据 JSONL 镜像不存在"))

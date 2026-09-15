@@ -57,15 +57,19 @@ class DeepSeekChatModel:
     api_key: str
     name: str = "deepseek-chat"
     base_url: str = "https://api.deepseek.com"
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 45.0
     location: ProviderLocation = ProviderLocation.CLOUD
 
     @classmethod
+    def is_configured(cls) -> bool:
+        return bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+
+    @classmethod
     def from_environment(cls, **kwargs) -> "DeepSeekChatModel":
-        api_key = os.getenv("DEEPSEEK_API_KEY")
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             raise KnowledgeWorkbenchError(
-                "未配置 DEEPSEEK_API_KEY；主链路仍可使用 faithful 模式"
+                "未配置 DEEPSEEK_API_KEY；知识问答仍可使用本地摘录模式"
             )
         return cls(api_key=api_key, **kwargs)
 

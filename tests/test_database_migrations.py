@@ -9,10 +9,48 @@ from knowledge_workbench.database import (
     MIGRATION_3,
     SCHEMA,
     Database,
+    _apply_schema_migration,
 )
 
 
 class DatabaseMigrationTests(unittest.TestCase):
+    def test_failed_migration_rolls_back_schema_and_version_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "knowledge.sqlite3"
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE schema_migrations(
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.commit()
+
+                with self.assertRaises(sqlite3.OperationalError):
+                    _apply_schema_migration(
+                        connection,
+                        version=99,
+                        script=(
+                            "CREATE TABLE atomic_probe(id INTEGER);"
+                            "INSERT INTO missing_table VALUES (1);"
+                        ),
+                        applied_at="failure-test",
+                    )
+
+                table_exists = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'atomic_probe'
+                    """
+                ).fetchone()[0]
+                marker_exists = connection.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 99"
+                ).fetchone()[0]
+                self.assertEqual(table_exists, 0)
+                self.assertEqual(marker_exists, 0)
+
     def test_v4_backfills_processing_run_for_existing_evidence_and_revision(self):
         with tempfile.TemporaryDirectory() as temporary:
             database_path = Path(temporary) / "knowledge.sqlite3"
@@ -90,7 +128,11 @@ class DatabaseMigrationTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertEqual(
-                    versions, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+                    versions,
+                    {
+                        1, 2, 3, 4, 5, 6, 7, 8, 9,
+                        10, 11, 12, 13, 14, 15, 16, 17, 18,
+                    },
                 )
                 run = connection.execute(
                     "SELECT * FROM processing_runs WHERE document_version_id = 'ver_1'"
@@ -170,6 +212,60 @@ class DatabaseMigrationTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertIn("is_merge_anchor", alias_columns)
+                governance = connection.execute(
+                    """
+                    SELECT purpose, scope_status, authority_status, knowledge_domain
+                    FROM document_governance WHERE document_id = 'doc_1'
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    tuple(governance),
+                    ("development_fixture", "unreviewed", "unknown", "business"),
+                )
+                technical_validation = connection.execute(
+                    """
+                    SELECT status, validator
+                    FROM evidence_technical_validation
+                    WHERE evidence_id = 'ev_1'
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    tuple(technical_validation),
+                    ("pending", "migration-v15-existing-state"),
+                )
+                corpus_tables = {
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'table' AND name IN (
+                            'corpus_scans', 'corpus_files',
+                            'corpus_file_relations'
+                        )
+                        """
+                    ).fetchall()
+                }
+                self.assertEqual(
+                    corpus_tables,
+                    {
+                        "corpus_scans",
+                        "corpus_files",
+                        "corpus_file_relations",
+                    },
+                )
+                corpus_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(corpus_files)"
+                    ).fetchall()
+                }
+                self.assertIn("content_preview_json", corpus_columns)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 18"
+                    ).fetchone()[0],
+                    1,
+                )
 
             database.initialize("t5-repeat")
             with database.connect() as connection:
@@ -212,6 +308,42 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM schema_migrations WHERE version = 12"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 13"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 14"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 15"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 16"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 17"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = 18"
                     ).fetchone()[0],
                     1,
                 )

@@ -12,6 +12,7 @@ from .conflict_candidates import (
     _candidate_pack_by_id,
     _candidate_pack_phase,
     _candidate_submission_state,
+    _candidate_batch_annotation_state,
     apply_cross_document_candidate_label_batch,
     apply_cross_document_candidate_review_batch,
 )
@@ -215,12 +216,31 @@ def export_conflict_batch_review_pack(
         database, paths, plan_id, batch_id
     )
     submission, drifted = _candidate_submission_state(database, source_pack)
-    phase = _candidate_pack_phase(
-        submission, drifted, _candidate_counts(source_pack)
+    if submission is None:
+        submission = _candidate_batch_annotation_state(
+            database,
+            source_pack,
+            plan_id=plan_id,
+            batch_id=batch_id,
+            candidate_ids=batch["candidate_ids"],
+        )
+        drifted = False
+    phase = (
+        _candidate_pack_phase(
+            submission, drifted, _candidate_counts(source_pack)
+        )
+        if submission is not None
+        and submission.get("submission_kind")
+        != "audited_batch_work_pack"
+        else "batch_reviewing"
     )
-    if phase not in {"reviewing", "reviewed"} or submission is None:
+    if (
+        phase not in {"reviewing", "reviewed", "batch_reviewing"}
+        or submission is None
+    ):
         raise InvalidTransitionError(
-            "只有已提交标签的候选包可以导出冲突批次复核工作包"
+            "只有已整包提交或已应用受控标注工作包的批次"
+            "可以导出冲突复核工作包"
         )
     try:
         validate_review_actor_policy(
@@ -396,6 +416,14 @@ def apply_conflict_batch_review_pack(
         paths, metadata["source_pack_id"]
     )
     submission, _ = _candidate_submission_state(database, source_pack)
+    if submission is None:
+        submission = _candidate_batch_annotation_state(
+            database,
+            source_pack,
+            plan_id=metadata["plan_id"],
+            batch_id=metadata["batch_id"],
+            candidate_ids=batch["candidate_ids"],
+        )
     if (
         submission is None
         or submission["actor"] != metadata["annotator"]
@@ -623,13 +651,44 @@ def inspect_conflict_batch_work_pack(
         submission, drifted = _candidate_submission_state(
             database, source_pack
         )
-        phase = _candidate_pack_phase(
-            submission, drifted, _candidate_counts(source_pack)
+        if (
+            pack_type == _REVIEW_PACK_TYPE
+            and submission is None
+            and batch is not None
+        ):
+            submission = _candidate_batch_annotation_state(
+                database,
+                source_pack,
+                plan_id=metadata["plan_id"],
+                batch_id=metadata["batch_id"],
+                candidate_ids=batch["candidate_ids"],
+            )
+            drifted = False
+        phase = (
+            _candidate_pack_phase(
+                submission, drifted, _candidate_counts(source_pack)
+            )
+            if submission is not None
+            and submission.get("submission_kind")
+            != "audited_batch_work_pack"
+            else (
+                "batch_reviewing"
+                if submission is not None
+                else _candidate_pack_phase(
+                    submission,
+                    drifted,
+                    _candidate_counts(source_pack),
+                )
+            )
         )
         if pack_type == _ANNOTATION_PACK_TYPE:
             phase_valid = phase == "labeling"
         else:
-            phase_valid = phase in {"reviewing", "reviewed"}
+            phase_valid = phase in {
+                "reviewing",
+                "reviewed",
+                "batch_reviewing",
+            }
             submission_actor_valid = (
                 submission is not None
                 and submission["actor"] == metadata["annotator"]

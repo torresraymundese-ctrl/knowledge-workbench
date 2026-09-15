@@ -29,6 +29,34 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]{1,80}$"
     },
+    "focus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "predicted_type",
+        "requested_limit",
+        "candidate_count",
+        "selection_method"
+      ],
+      "properties": {
+        "predicted_type": {
+          "enum": ["value_change", "polarity_change"]
+        },
+        "requested_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "candidate_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "selection_method": {
+          "const": "unlabeled_similarity_desc_then_seeded_sha256"
+        }
+      }
+    },
     "strata": {
       "type": "object",
       "additionalProperties": false,

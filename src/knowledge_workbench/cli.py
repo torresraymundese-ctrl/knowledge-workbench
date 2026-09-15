@@ -12,12 +12,14 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from typing import Sequence
 
 import numpy as np
 
+from .backups import create_backup, list_backups, restore_backup, verify_backup
 from .benchmarking import benchmark_fts_search
 from .config import WorkspacePaths, resolve_workspace
 from .errors import KnowledgeWorkbenchError
@@ -132,16 +134,41 @@ from .conflict_batch_workpacks import (
 )
 from .conflict_evaluation import evaluate_conflict_dataset
 from .citation_evaluation import evaluate_citation_dataset
+from .corpus_map import (
+    AUTHORITY_STATUSES,
+    SCOPE_STATUSES,
+    corpus_file_card,
+    decide_corpus_file,
+    import_corpus_file,
+    latest_corpus_map,
+    scan_corpus_source,
+)
 from .model_pipeline import analyze_with_model, generate_wiki_with_model
+from .nas_admission import (
+    NAS_STATUSES,
+    decide_nas_discovery,
+    import_nas_discovery,
+    list_nas_discoveries,
+    scan_nas_source,
+)
 from .parsers import parse_document
 from .parsers.legacy_word import find_word_executable
 from .pipeline import faithful_analysis, faithful_wiki_generation
 from .providers import AuditedModelGateway, DeepSeekChatModel
 from .parsers import supported_extensions
 from .quality_closure import (
+    DEFAULT_CONFLICT_SAMPLE_SIZE,
     DEFAULT_GOLD_DOCUMENT_TARGET,
+    DEFAULT_MINIMUM_KNOWN_CONFLICTS,
     build_quality_closure_status,
     save_quality_closure_status,
+)
+from .question_answering import answer_question
+from .qa_gold_workpacks import (
+    evaluate_qa_gold_dataset,
+    export_qa_gold_work_pack,
+    finalize_qa_gold_dataset,
+    inspect_qa_gold_work_pack,
 )
 from .review import (
     publish_revision,
@@ -149,6 +176,7 @@ from .review import (
     request_revision_review,
     transition_evidence,
 )
+from .topic_wiki import build_topic_wiki_baseline, knowledge_setup
 from .search import search_evidence
 from .tasks import (
     claim_next_task,
@@ -169,6 +197,18 @@ from .vector_store import (
     build_evidence_index,
     semantic_search,
 )
+
+
+def _parse_modified_since_ns(value: str) -> int:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "modified-since 必须是 ISO 8601 日期或时间"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return int(parsed.astimezone(UTC).timestamp() * 1_000_000_000)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +247,114 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-legacy-word-conversion",
         action="store_true",
         help="显式允许使用本机 Microsoft Word 将旧版 .doc 临时转换为 DOCX",
+    )
+
+    nas = subparsers.add_parser("nas", help="只读扫描并人工管理 NAS 资料准入")
+    nas_sub = nas.add_subparsers(dest="nas_command", required=True)
+    nas_scan = nas_sub.add_parser("scan", help="扫描并仅登记合格文件的元数据")
+    nas_scan.add_argument("root", type=Path)
+    nas_scan.add_argument("--actor", required=True)
+    nas_scan.add_argument("--project")
+    nas_scan.add_argument("--extension", action="append", dest="extensions")
+    nas_scan.add_argument("--include-glob", action="append", default=[])
+    nas_scan.add_argument("--exclude-glob", action="append", default=[])
+    nas_scan.add_argument(
+        "--modified-since",
+        type=_parse_modified_since_ns,
+        help="仅扫描不早于此时间的文件，接受 ISO 8601 日期或时间",
+    )
+    nas_scan.add_argument("--include-archives", action="store_true")
+    nas_list = nas_sub.add_parser("list", help="列出 NAS 发现项及准入状态")
+    nas_list.add_argument("--status", choices=NAS_STATUSES)
+    nas_list.add_argument("--limit", type=int, default=100)
+    nas_decide = nas_sub.add_parser("decide", help="批准吸收或明确忽略一个发现项")
+    nas_decide.add_argument("discovery_id")
+    nas_decide.add_argument("decision", choices=("admit", "ignore"))
+    nas_decide.add_argument(
+        "--classification",
+        choices=[value.value for value in Classification],
+    )
+    nas_decide.add_argument("--actor", required=True)
+    nas_decide.add_argument("--reason", required=True)
+    nas_import = nas_sub.add_parser("import", help="显式导入已批准的 NAS 发现项")
+    nas_import.add_argument("discovery_id")
+    nas_import.add_argument("--actor", required=True)
+    nas_import.add_argument(
+        "--allow-legacy-word-conversion",
+        action="store_true",
+    )
+
+    corpus = subparsers.add_parser(
+        "corpus", help="在正式导入前生成只读资料地图和文档说明卡"
+    )
+    corpus_sub = corpus.add_subparsers(dest="corpus_command", required=True)
+    corpus_scan = corpus_sub.add_parser(
+        "scan", help="本地只读预读指定目录，不复制文件、不创建知识"
+    )
+    corpus_scan.add_argument("root", type=Path)
+    corpus_scan.add_argument("--actor", required=True)
+    corpus_scan.add_argument("--project")
+    corpus_scan.add_argument(
+        "--allow-legacy-word-conversion",
+        action="store_true",
+        help="明确允许使用本机 Word 预读旧版 .doc",
+    )
+    corpus_list = corpus_sub.add_parser(
+        "list", help="列出最新资料地图中的可读说明卡"
+    )
+    corpus_list.add_argument("--limit", type=int, default=100)
+    corpus_list.add_argument("--offset", type=int, default=0)
+    corpus_list.add_argument("--folder")
+    corpus_list.add_argument("--scope", choices=SCOPE_STATUSES)
+    corpus_list.add_argument("--query")
+    corpus_show = corpus_sub.add_parser("show", help="查看一张文档说明卡及候选关系")
+    corpus_show.add_argument("file_id")
+    corpus_decide = corpus_sub.add_parser(
+        "decide", help="确认资料是否属于知识范围以及它的权威性"
+    )
+    corpus_decide.add_argument("file_id")
+    corpus_decide.add_argument(
+        "--scope", required=True, choices=("in_scope", "out_of_scope")
+    )
+    corpus_decide.add_argument(
+        "--authority", required=True, choices=AUTHORITY_STATUSES
+    )
+    corpus_decide.add_argument("--actor", required=True)
+    corpus_decide.add_argument("--reason", required=True)
+    corpus_import = corpus_sub.add_parser(
+        "import", help="把已确认范围和权威性的资料显式导入知识库"
+    )
+    corpus_import.add_argument("file_id")
+    corpus_import.add_argument(
+        "--classification",
+        choices=[value.value for value in Classification],
+        default=Classification.INTERNAL.value,
+    )
+    corpus_import.add_argument("--actor", required=True)
+
+    backup = subparsers.add_parser(
+        "backup", help="创建、校验、列出或安全恢复版本化工作区快照"
+    )
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_sub.add_parser("create", help="创建并校验完整工作区快照")
+    backup_create.add_argument("--target", type=Path)
+    backup_create.add_argument("--actor", required=True)
+    backup_list = backup_sub.add_parser("list", help="列出已有快照")
+    backup_list.add_argument("--target", type=Path)
+    backup_verify = backup_sub.add_parser("verify", help="校验快照文件和 SQLite 完整性")
+    backup_verify.add_argument("--target", type=Path)
+    backup_verify.add_argument("--snapshot")
+    backup_restore = backup_sub.add_parser(
+        "restore",
+        help="默认只演练；显式应用时恢复到一个尚不存在的新工作区",
+    )
+    backup_restore.add_argument("destination", type=Path)
+    backup_restore.add_argument("--target", type=Path)
+    backup_restore.add_argument("--snapshot")
+    backup_restore.add_argument("--apply", action="store_true")
+    backup_restore.add_argument(
+        "--confirm",
+        help="应用恢复时必须完整填写要恢复的 snapshot ID",
     )
 
     evidence = subparsers.add_parser("evidence", help="列出或审核原子证据")
@@ -535,6 +683,20 @@ def build_parser() -> argparse.ArgumentParser:
     page = subparsers.add_parser("page", help="列出和审核 Wiki 页面修订")
     page_sub = page.add_subparsers(dest="page_command", required=True)
     page_sub.add_parser("list", help="列出 Wiki 页面和最新修订")
+    page_topic_build = page_sub.add_parser(
+        "topic-build",
+        help="从已准入资料生成少量逐字摘录式业务主题知识页",
+    )
+    page_topic_build.add_argument("--actor", required=True)
+    page_topic_build.add_argument(
+        "--refresh",
+        action="store_true",
+        help="资料说明或来源变化后创建新草稿修订；正在审核的草稿不会被替代",
+    )
+    page_sub.add_parser(
+        "topic-status",
+        help="查看基准资料确认建议和业务主题整理状态",
+    )
     page_review = page_sub.add_parser("request-review", help="提交 Wiki 修订审核")
     page_review.add_argument("revision_id")
     page_review.add_argument("--actor", required=True)
@@ -560,6 +722,55 @@ def build_parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search", help="使用 SQLite FTS5 搜索原子证据")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=10)
+
+    ask = subparsers.add_parser(
+        "ask", help="从当前已验证、非受限证据生成带引用的本地回答"
+    )
+    ask.add_argument("question")
+    ask.add_argument("--actor", required=True)
+    ask.add_argument("--limit", type=int, default=5)
+    ask.add_argument(
+        "--deepseek",
+        action="store_true",
+        help="本次问题请求 DeepSeek 综合回答；失败时自动回退本地摘录",
+    )
+    ask.add_argument(
+        "--allow-internal-cloud-once",
+        action="store_true",
+        help="仅授权本次问题将已筛选的 internal 依据片段发送到云端",
+    )
+
+    qa = subparsers.add_parser("qa", help="管理真实问答黄金集")
+    qa_sub = qa.add_subparsers(dest="qa_command", required=True)
+    qa_export = qa_sub.add_parser(
+        "gold-export", help="从有限问题集导出人工核对工作包"
+    )
+    qa_export.add_argument("questions", type=Path)
+    qa_export.add_argument("output", type=Path)
+    qa_export.add_argument("--actor", required=True)
+    qa_export.add_argument("--limit", type=int, default=8)
+    qa_status = qa_sub.add_parser(
+        "gold-status", help="检查问答黄金工作包完整性与填写进度"
+    )
+    qa_status.add_argument("work_pack", type=Path)
+    qa_apply = qa_sub.add_parser(
+        "gold-apply", help="应用已核对工作包并固化问答黄金集"
+    )
+    qa_apply.add_argument("work_pack", type=Path)
+    qa_apply.add_argument("output", type=Path)
+    qa_apply.add_argument("--actor", required=True)
+    qa_apply.add_argument(
+        "--review-mode",
+        choices=["independent", "solo-attested"],
+        default="independent",
+    )
+    qa_apply.add_argument("--solo-attestation")
+    qa_evaluate = qa_sub.add_parser(
+        "evaluate", help="运行问答答案类型、引用和密级泄漏评测"
+    )
+    qa_evaluate.add_argument("dataset", type=Path)
+    qa_evaluate.add_argument("--output", type=Path)
+    qa_evaluate.add_argument("--allow-failures", action="store_true")
 
     semantic = subparsers.add_parser("semantic-search", help="使用 BGE-M3 向量搜索原子证据")
     semantic.add_argument("query")
@@ -605,9 +816,33 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="汇总黄金资料、冲突、图谱和 Lint 真实进度"
     )
     quality_status.add_argument(
+        "--recommended-gold-documents",
         "--target-gold-documents",
+        dest="recommended_gold_documents",
         type=int,
         default=DEFAULT_GOLD_DOCUMENT_TARGET,
+        help=(
+            "黄金资料覆盖建议值，不参与质量闭环硬门槛"
+            f"（默认 {DEFAULT_GOLD_DOCUMENT_TARGET}）"
+        ),
+    )
+    quality_status.add_argument(
+        "--conflict-sample-size",
+        type=int,
+        default=DEFAULT_CONFLICT_SAMPLE_SIZE,
+        help=(
+            "冲突评测分层样本配额，不要求标注候选全集"
+            f"（默认 {DEFAULT_CONFLICT_SAMPLE_SIZE}）"
+        ),
+    )
+    quality_status.add_argument(
+        "--minimum-known-conflicts",
+        type=int,
+        default=DEFAULT_MINIMUM_KNOWN_CONFLICTS,
+        help=(
+            "分层样本中或补充用例中至少纳入的人工确认真冲突数"
+            f"（默认 {DEFAULT_MINIMUM_KNOWN_CONFLICTS}）"
+        ),
     )
     quality_status.add_argument("--output", type=Path)
     quality_status.add_argument(
@@ -712,6 +947,16 @@ def build_parser() -> argparse.ArgumentParser:
     conflict_batch_plan.add_argument("--batch-size", type=int, default=60)
     conflict_batch_plan.add_argument(
         "--seed", default="conflict-plan-v1"
+    )
+    conflict_batch_plan.add_argument(
+        "--focus-predicted-type",
+        choices=("value_change", "polarity_change"),
+        help="把指定类型中尚未标注且相似度最高的候选集中到第一批",
+    )
+    conflict_batch_plan.add_argument(
+        "--focus-limit",
+        type=int,
+        help="聚焦第一批的最大候选数；默认等于 batch-size",
     )
     conflict_batch_status = conflict_sub.add_parser(
         "batch-status",
@@ -940,6 +1185,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     paths = resolve_workspace(args.workspace)
     try:
@@ -947,6 +1196,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _doctor()
         if args.command == "formats":
             print("\n".join(supported_extensions()))
+            return 0
+        if args.command == "backup" and args.backup_command != "create":
+            _handle_backup(paths, args)
             return 0
 
         database = initialize_workspace(paths)
@@ -957,6 +1209,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _status(database, paths)
         elif args.command == "lint":
             _handle_lint(database, paths, args)
+        elif args.command == "nas":
+            _handle_nas(database, paths, args)
+        elif args.command == "corpus":
+            _handle_corpus(database, paths, args)
+        elif args.command == "backup":
+            _handle_backup(paths, args)
         elif args.command == "ingest":
             result = ingest_file(
                 args.path,
@@ -999,6 +1257,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _handle_page(args, database, paths)
         elif args.command == "search":
             _handle_search(database, args.query, args.limit)
+        elif args.command == "ask":
+            _handle_ask(database, args)
+        elif args.command == "qa":
+            _handle_qa(database, paths, args)
         elif args.command == "semantic-search":
             _handle_semantic_search(database, paths, args)
         elif args.command == "index":
@@ -1112,9 +1374,157 @@ def _status(database, paths: WorkspacePaths) -> None:
             "active_entity_relationships": connection.execute(
                 "SELECT COUNT(*) FROM entity_relationships WHERE status = 'active'"
             ).fetchone()[0],
+            "nas_discovered": connection.execute(
+                "SELECT COUNT(*) FROM nas_discoveries WHERE status = 'discovered'"
+            ).fetchone()[0],
+            "nas_admitted": connection.execute(
+                """
+                SELECT COUNT(*) FROM nas_discoveries
+                WHERE status IN ('admitted', 'imported')
+                """
+            ).fetchone()[0],
         }
     print(f"工作区：{paths.root}")
     _print_mapping(counts)
+
+
+def _handle_nas(database, paths: WorkspacePaths, args) -> None:
+    if args.nas_command == "scan":
+        result = scan_nas_source(
+            database,
+            args.root,
+            actor=args.actor,
+            project=args.project,
+            extensions=args.extensions,
+            include_globs=args.include_glob,
+            exclude_globs=args.exclude_glob,
+            modified_since_ns=args.modified_since,
+            include_archives=args.include_archives,
+        )
+        _print_mapping(result)
+        return
+    if args.nas_command == "list":
+        rows = list_nas_discoveries(
+            database,
+            status=args.status,
+            limit=args.limit,
+        )
+        if not rows:
+            print("暂无 NAS 发现项。")
+            return
+        for row in rows:
+            _print_mapping(row)
+        return
+    if args.nas_command == "decide":
+        row = decide_nas_discovery(
+            database,
+            args.discovery_id,
+            decision=args.decision,
+            actor=args.actor,
+            reason=args.reason,
+            classification=(
+                Classification(args.classification)
+                if args.classification
+                else None
+            ),
+        )
+        _print_mapping(row)
+        return
+    result = import_nas_discovery(
+        database,
+        paths,
+        args.discovery_id,
+        actor=args.actor,
+        allow_legacy_word_conversion=args.allow_legacy_word_conversion,
+    )
+    _print_mapping(
+        {
+            "discovery_id": args.discovery_id,
+            "document_id": result.document_id,
+            "version_id": result.version_id,
+            "sha256": result.sha256,
+            "duplicate": result.duplicate,
+            "evidence_count": result.evidence_count,
+        }
+    )
+
+
+def _handle_corpus(database: Database, paths: WorkspacePaths, args) -> None:
+    if args.corpus_command == "scan":
+        result = scan_corpus_source(
+            database,
+            args.root,
+            actor=args.actor,
+            project_name=args.project,
+            allow_legacy_word_conversion=args.allow_legacy_word_conversion,
+        )
+    elif args.corpus_command == "list":
+        result = latest_corpus_map(
+            database,
+            limit=args.limit,
+            offset=args.offset,
+            folder=args.folder,
+            scope_status=args.scope,
+            query=args.query,
+        )
+    elif args.corpus_command == "show":
+        result = corpus_file_card(database, args.file_id)
+    elif args.corpus_command == "decide":
+        result = decide_corpus_file(
+            database,
+            args.file_id,
+            scope_status=args.scope,
+            authority_status=args.authority,
+            actor=args.actor,
+            reason=args.reason,
+        )
+    else:
+        result = import_corpus_file(
+            database,
+            paths,
+            args.file_id,
+            classification=Classification(args.classification),
+            actor=args.actor,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _handle_backup(paths: WorkspacePaths, args) -> None:
+    target = (
+        args.target.expanduser().resolve()
+        if args.target
+        else (paths.root.parent / "本地知识库备份").resolve()
+    )
+    if args.backup_command == "create":
+        result = create_backup(paths, target, actor=args.actor)
+        _print_mapping({"target": str(target), **result})
+        return
+    if args.backup_command == "list":
+        rows = list_backups(target)
+        if not rows:
+            print(f"暂无备份快照：{target}")
+            return
+        for row in rows:
+            _print_mapping(row)
+        return
+    if args.backup_command == "verify":
+        result = verify_backup(target, snapshot_id=args.snapshot)
+        _print_mapping(asdict(result))
+        return
+    result = restore_backup(
+        target,
+        args.destination,
+        snapshot_id=args.snapshot,
+        apply=args.apply,
+        confirmation=args.confirm,
+        active_workspace=paths.root,
+    )
+    _print_mapping(result)
+    if not args.apply:
+        print(
+            "恢复演练已通过；未写入任何文件。"
+            "如需应用，请增加 --apply，并用 --confirm 完整填写 snapshot ID。"
+        )
 
 
 def _handle_lint(database, paths: WorkspacePaths, args) -> None:
@@ -1603,8 +2013,32 @@ def _handle_relation(args, database) -> None:
 
 
 def _handle_page(args, database, paths: WorkspacePaths) -> None:
+    if args.page_command == "topic-build":
+        result = build_topic_wiki_baseline(
+            database,
+            paths,
+            actor=args.actor,
+            refresh=args.refresh,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.page_command == "topic-status":
+        print(
+            json.dumps(
+                knowledge_setup(database),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
     if args.page_command == "request-review":
-        request_revision_review(database, args.revision_id, actor=args.actor)
+        request_revision_review(
+            database,
+            args.revision_id,
+            actor=args.actor,
+            paths=paths,
+        )
         print(f"修订 {args.revision_id} 已提交审核")
         return
     if args.page_command == "publish":
@@ -1726,6 +2160,146 @@ def _handle_search(database, query: str, limit: int) -> None:
         print(f"{row['id']}  [{row['status']}]  score={row['score']:.4f}")
         print(f"  {row['original_name']} ({row['classification']})")
         print(f"  {excerpt[:240]}")
+
+
+def _handle_ask(database, args) -> None:
+    paths = WorkspacePaths(database.path.parent)
+    model_gateway = None
+    unavailable_reason = None
+    if args.deepseek:
+        try:
+            model_gateway = AuditedModelGateway(
+                database,
+                DeepSeekChatModel.from_environment(),
+            )
+        except KnowledgeWorkbenchError:
+            unavailable_reason = "not_configured"
+    result = answer_question(
+        database,
+        args.question,
+        actor=args.actor,
+        limit=args.limit,
+        paths=paths,
+        model_gateway=model_gateway,
+        cloud_model_requested=args.deepseek,
+        allow_internal_cloud_once=args.allow_internal_cloud_once,
+        cloud_model_unavailable_reason=unavailable_reason,
+    )
+    print(result["answer"])
+    for index, citation in enumerate(result["citations"], start=1):
+        print(
+            f"[{index}] {citation['document_name']} "
+            f"({citation['classification']}) #{citation['ordinal']}"
+        )
+        print(f"  evidence_id={citation['evidence_id']}")
+        print(f"  locator={json.dumps(citation['locator'], ensure_ascii=False)}")
+        print(f"  {citation['excerpt']}")
+    for conflict in result["conflicts"]:
+        print(
+            f"[冲突] {conflict['conflict_id']} "
+            f"{conflict['conflict_type']} [{conflict['status']}]"
+        )
+    _print_mapping(
+        {
+            "answer_type": result["answer_type"],
+            "query_id": result["query_id"],
+            **result["retrieval"],
+        }
+    )
+
+
+def _handle_qa(database: Database, paths: WorkspacePaths, args) -> None:
+    if args.qa_command == "gold-export":
+        result = export_qa_gold_work_pack(
+            database,
+            paths,
+            args.questions,
+            args.output,
+            actor=args.actor,
+            limit=args.limit,
+        )
+        _print_mapping(
+            {
+                "pack_id": result["pack_id"],
+                "output": result["output"],
+                "case_count": result["case_count"],
+                "protected_sha256": result["protected_sha256"],
+            }
+        )
+        return
+    if args.qa_command == "gold-status":
+        status = inspect_qa_gold_work_pack(
+            database, paths, args.work_pack
+        )
+        _print_mapping(
+            {
+                key: value
+                for key, value in status.items()
+                if not key.startswith("_")
+            }
+        )
+        return
+    if args.qa_command == "gold-apply":
+        result = finalize_qa_gold_dataset(
+            database,
+            paths,
+            args.work_pack,
+            args.output,
+            actor=args.actor,
+            review_mode=args.review_mode,
+            solo_attestation=args.solo_attestation,
+        )
+        report_path = result["output"].with_suffix(".evaluation.json")
+        write_text_atomic(
+            report_path,
+            json.dumps(
+                result["evaluation"],
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+        _print_mapping(
+            {
+                "dataset_id": result["dataset_id"],
+                "output": result["output"],
+                "evaluation_output": report_path,
+                **result["evaluation"]["aggregate"],
+            }
+        )
+        return
+    if args.qa_command == "evaluate":
+        report = evaluate_qa_gold_dataset(
+            database, paths, args.dataset
+        )
+        output = args.output
+        if output is None:
+            timestamp = (
+                report["evaluated_at"].replace(":", "").replace("+", "-")
+            )
+            output = (
+                paths.evaluations / f"qa-evaluation-{timestamp}.json"
+            )
+        output = output.expanduser().resolve()
+        write_text_atomic(
+            output,
+            json.dumps(
+                report, ensure_ascii=False, indent=2, sort_keys=True
+            )
+            + "\n",
+        )
+        print(f"问答评测报告：{output}")
+        _print_mapping(report["aggregate"])
+        if (
+            report["aggregate"]["pass_rate"] < 1.0
+            or report["aggregate"]["restricted_leak_count"] > 0
+        ) and not args.allow_failures:
+            raise KnowledgeWorkbenchError(
+                "问答黄金评测未全部通过；报告已保存"
+            )
+        return
+    raise KnowledgeWorkbenchError("未知问答黄金集命令")
 
 
 def _handle_semantic_search(database, paths: WorkspacePaths, args) -> None:
@@ -1874,13 +2448,17 @@ def _handle_quality(
             paths,
             args.output,
             actor=args.actor,
-            target_gold_documents=args.target_gold_documents,
+            target_gold_documents=args.recommended_gold_documents,
+            conflict_sample_size=args.conflict_sample_size,
+            minimum_known_conflicts=args.minimum_known_conflicts,
         )
     else:
         report = build_quality_closure_status(
             database,
             paths,
-            target_gold_documents=args.target_gold_documents,
+            target_gold_documents=args.recommended_gold_documents,
+            conflict_sample_size=args.conflict_sample_size,
+            minimum_known_conflicts=args.minimum_known_conflicts,
         )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -2043,6 +2621,8 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
             actor=args.actor,
             batch_size=args.batch_size,
             seed=args.seed,
+            focus_predicted_type=args.focus_predicted_type,
+            focus_limit=args.focus_limit,
         )
         print(f"跨文档冲突标注计划：{output.expanduser().resolve()}")
         _print_mapping(
@@ -2054,6 +2634,7 @@ def _handle_conflict(database, paths: WorkspacePaths, args) -> None:
                 ],
                 "batch_count": len(plan["batches"]),
                 "batch_size": plan["batch_size"],
+                "focus": plan.get("focus"),
             }
         )
         return

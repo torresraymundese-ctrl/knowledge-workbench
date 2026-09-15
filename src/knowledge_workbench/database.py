@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 18
 
 
 SCHEMA = """
@@ -590,6 +590,347 @@ CREATE INDEX idx_entity_relationship_evidence_evidence
     ON entity_relationship_evidence(evidence_id, relationship_id);
 """
 
+MIGRATION_13 = """
+CREATE TABLE nas_discoveries (
+    id TEXT PRIMARY KEY,
+    source_root TEXT NOT NULL CHECK (length(trim(source_root)) > 0),
+    relative_path TEXT NOT NULL CHECK (length(trim(relative_path)) > 0),
+    file_name TEXT NOT NULL CHECK (length(trim(file_name)) > 0),
+    extension TEXT NOT NULL CHECK (length(trim(extension)) > 0),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    modified_at_ns INTEGER NOT NULL CHECK (modified_at_ns >= 0),
+    project TEXT,
+    status TEXT NOT NULL DEFAULT 'discovered' CHECK (
+        status IN ('discovered', 'admitted', 'ignored', 'imported')
+    ),
+    classification TEXT CHECK (
+        classification IS NULL OR
+        classification IN ('public', 'internal', 'confidential', 'restricted')
+    ),
+    discovered_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by TEXT,
+    decision_reason TEXT,
+    imported_at TEXT,
+    imported_by TEXT,
+    document_version_id TEXT REFERENCES document_versions(id),
+    UNIQUE(source_root, relative_path, sha256),
+    CHECK (
+        (status = 'discovered'
+         AND classification IS NULL
+         AND decided_at IS NULL AND decided_by IS NULL
+         AND decision_reason IS NULL
+         AND imported_at IS NULL AND imported_by IS NULL
+         AND document_version_id IS NULL)
+        OR
+        (status = 'admitted'
+         AND classification IS NOT NULL
+         AND decided_at IS NOT NULL AND decided_by IS NOT NULL
+         AND decision_reason IS NOT NULL
+         AND imported_at IS NULL AND imported_by IS NULL
+         AND document_version_id IS NULL)
+        OR
+        (status = 'ignored'
+         AND classification IS NULL
+         AND decided_at IS NOT NULL AND decided_by IS NOT NULL
+         AND decision_reason IS NOT NULL
+         AND imported_at IS NULL AND imported_by IS NULL
+         AND document_version_id IS NULL)
+        OR
+        (status = 'imported'
+         AND classification IS NOT NULL
+         AND decided_at IS NOT NULL AND decided_by IS NOT NULL
+         AND decision_reason IS NOT NULL
+         AND imported_at IS NOT NULL AND imported_by IS NOT NULL
+         AND document_version_id IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_nas_discoveries_status
+    ON nas_discoveries(status, discovered_at, id);
+CREATE INDEX idx_nas_discoveries_path
+    ON nas_discoveries(source_root, relative_path, discovered_at);
+CREATE INDEX idx_nas_discoveries_sha256
+    ON nas_discoveries(sha256, status);
+"""
+
+MIGRATION_14 = """
+ALTER TABLE nas_discoveries
+    ADD COLUMN risk_flags_json TEXT NOT NULL DEFAULT '[]'
+    CHECK (
+        json_valid(risk_flags_json)
+        AND json_type(risk_flags_json) = 'array'
+    );
+
+UPDATE nas_discoveries
+SET risk_flags_json = '["credential_material"]'
+WHERE instr(file_name, '账号密码') > 0
+   OR instr(file_name, '帐号密码') > 0
+   OR instr(file_name, '账户密码') > 0
+   OR instr(file_name, '用户密码') > 0
+   OR instr(file_name, '账号口令') > 0
+   OR instr(file_name, '账户口令') > 0
+   OR lower(file_name) GLOB '*account*password*'
+   OR lower(file_name) GLOB '*user*password*'
+   OR lower(file_name) GLOB '*password*list*'
+   OR lower(file_name) GLOB '*credential*list*'
+   OR lower(file_name) GLOB 'passwords.*'
+   OR lower(file_name) GLOB 'credentials.*'
+   OR lower(file_name) GLOB 'secrets.*';
+"""
+
+MIGRATION_15 = """
+CREATE TABLE document_governance (
+    document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL CHECK (
+        purpose IN ('development_fixture', 'candidate', 'production')
+    ),
+    scope_status TEXT NOT NULL CHECK (
+        scope_status IN ('unreviewed', 'in_scope', 'out_of_scope')
+    ),
+    authority_status TEXT NOT NULL CHECK (
+        authority_status IN (
+            'unknown', 'reference', 'authoritative', 'superseded'
+        )
+    ),
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    decision_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO document_governance(
+    document_id, purpose, scope_status, authority_status,
+    reviewed_by, reviewed_at, decision_reason, created_at, updated_at
+)
+SELECT id, 'development_fixture', 'unreviewed', 'unknown',
+       NULL, NULL, NULL, created_at, updated_at
+FROM documents;
+
+CREATE TABLE evidence_technical_validation (
+    evidence_id TEXT PRIMARY KEY REFERENCES evidence(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'passed', 'failed')),
+    validator TEXT NOT NULL,
+    checks_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(checks_json) AND json_type(checks_json) = 'object'),
+    validated_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO evidence_technical_validation(
+    evidence_id, status, validator, checks_json,
+    validated_at, created_at, updated_at
+)
+SELECT id,
+       CASE WHEN status IN ('verified', 'conflicted', 'deprecated', 'archived')
+            THEN 'passed' ELSE 'pending' END,
+       'migration-v15-existing-state',
+       '{"source_state":"preserved"}',
+       CASE WHEN status IN ('verified', 'conflicted', 'deprecated', 'archived')
+            THEN updated_at ELSE NULL END,
+       created_at,
+       updated_at
+FROM evidence;
+
+CREATE TABLE corpus_scans (
+    id TEXT PRIMARY KEY,
+    source_root TEXT NOT NULL CHECK (length(trim(source_root)) > 0),
+    root_label TEXT NOT NULL CHECK (length(trim(root_label)) > 0),
+    project_name TEXT,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+    file_count INTEGER NOT NULL CHECK (file_count >= 0),
+    folder_count INTEGER NOT NULL CHECK (folder_count >= 0),
+    total_size_bytes INTEGER NOT NULL CHECK (total_size_bytes >= 0),
+    readable_card_count INTEGER NOT NULL CHECK (readable_card_count >= 0),
+    metadata_only_count INTEGER NOT NULL CHECK (metadata_only_count >= 0),
+    blocked_count INTEGER NOT NULL CHECK (blocked_count >= 0),
+    unreadable_count INTEGER NOT NULL CHECK (unreadable_count >= 0),
+    duplicate_group_count INTEGER NOT NULL CHECK (duplicate_group_count >= 0),
+    version_group_count INTEGER NOT NULL CHECK (version_group_count >= 0),
+    actor TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_corpus_scans_current
+    ON corpus_scans(is_current, completed_at DESC, id);
+
+CREATE TABLE corpus_files (
+    id TEXT PRIMARY KEY,
+    scan_id TEXT NOT NULL REFERENCES corpus_scans(id) ON DELETE CASCADE,
+    relative_path TEXT NOT NULL CHECK (length(trim(relative_path)) > 0),
+    folder_path TEXT NOT NULL,
+    file_name TEXT NOT NULL CHECK (length(trim(file_name)) > 0),
+    extension TEXT NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    modified_at_ns INTEGER NOT NULL CHECK (modified_at_ns >= 0),
+    map_status TEXT NOT NULL CHECK (
+        map_status IN ('readable', 'metadata_only', 'blocked', 'unreadable')
+    ),
+    document_type TEXT NOT NULL CHECK (length(trim(document_type)) > 0),
+    display_title TEXT NOT NULL CHECK (length(trim(display_title)) > 0),
+    plain_summary TEXT NOT NULL CHECK (length(trim(plain_summary)) > 0),
+    outline_json TEXT NOT NULL DEFAULT '[]'
+        CHECK (json_valid(outline_json) AND json_type(outline_json) = 'array'),
+    key_signals_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(key_signals_json) AND json_type(key_signals_json) = 'object'),
+    risk_flags_json TEXT NOT NULL DEFAULT '[]'
+        CHECK (json_valid(risk_flags_json) AND json_type(risk_flags_json) = 'array'),
+    parser_name TEXT,
+    parser_version TEXT,
+    duplicate_group TEXT,
+    version_group TEXT,
+    scope_status TEXT NOT NULL DEFAULT 'unreviewed' CHECK (
+        scope_status IN ('unreviewed', 'in_scope', 'out_of_scope')
+    ),
+    authority_status TEXT NOT NULL DEFAULT 'unknown' CHECK (
+        authority_status IN (
+            'unknown', 'reference', 'authoritative', 'superseded'
+        )
+    ),
+    decided_by TEXT,
+    decided_at TEXT,
+    decision_reason TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(scan_id, relative_path)
+);
+
+CREATE INDEX idx_corpus_files_scan_folder
+    ON corpus_files(scan_id, folder_path, relative_path);
+CREATE INDEX idx_corpus_files_scan_status
+    ON corpus_files(scan_id, scope_status, map_status, relative_path);
+CREATE INDEX idx_corpus_files_sha256
+    ON corpus_files(scan_id, sha256);
+
+CREATE TABLE corpus_file_relations (
+    id TEXT PRIMARY KEY,
+    scan_id TEXT NOT NULL REFERENCES corpus_scans(id) ON DELETE CASCADE,
+    source_file_id TEXT NOT NULL REFERENCES corpus_files(id) ON DELETE CASCADE,
+    target_file_id TEXT NOT NULL REFERENCES corpus_files(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL CHECK (
+        relation_type IN ('exact_duplicate', 'version_candidate')
+    ),
+    plain_reason TEXT NOT NULL CHECK (length(trim(plain_reason)) > 0),
+    created_at TEXT NOT NULL,
+    CHECK (source_file_id != target_file_id),
+    UNIQUE(scan_id, source_file_id, target_file_id, relation_type)
+);
+
+CREATE INDEX idx_corpus_file_relations_source
+    ON corpus_file_relations(scan_id, source_file_id, relation_type);
+CREATE INDEX idx_corpus_file_relations_target
+    ON corpus_file_relations(scan_id, target_file_id, relation_type);
+"""
+
+
+MIGRATION_16 = """
+ALTER TABLE document_governance
+    ADD COLUMN knowledge_domain TEXT NOT NULL DEFAULT 'business' CHECK (
+        knowledge_domain IN (
+            'business', 'policy', 'technical',
+            'template', 'example', 'process'
+        )
+    );
+
+UPDATE document_governance
+SET knowledge_domain = CASE
+    WHEN document_id IN (
+        SELECT id FROM documents
+        WHERE instr(replace(source_path, char(92), '/'), '/政策文件/') > 0
+           OR instr(original_name, '教育部') > 0
+           OR instr(original_name, '文旅部') > 0
+           OR instr(original_name, '文化和旅游部') > 0
+           OR instr(original_name, '教育局') > 0
+           OR instr(original_name, '服务要求') > 0
+           OR instr(original_name, '安全规范') > 0
+           OR instr(original_name, '示范合同') > 0
+    ) THEN 'policy'
+    WHEN document_id IN (
+        SELECT id FROM documents
+        WHERE instr(original_name, '演示') > 0
+           OR instr(original_name, '示范研学路线') > 0
+    ) THEN 'example'
+    WHEN document_id IN (
+        SELECT id FROM documents
+        WHERE instr(original_name, '模板') > 0
+           OR instr(original_name, '待确认') > 0
+           OR instr(original_name, '核对清单') > 0
+    ) THEN 'template'
+    WHEN document_id IN (
+        SELECT id FROM documents
+        WHERE lower(original_name) = 'product.md'
+           OR lower(original_name) LIKE 'prd%'
+    ) THEN 'business'
+    WHEN document_id IN (
+        SELECT id FROM documents
+        WHERE instr(replace(source_path, char(92), '/'), '/工作计划/') > 0
+           OR instr(replace(source_path, char(92), '/'), '/archive/') > 0
+           OR instr(replace(source_path, char(92), '/'), '/archives/') > 0
+           OR instr(replace(source_path, char(92), '/'), '/tests/') > 0
+           OR instr(replace(source_path, char(92), '/'), '/docs/qa/') > 0
+           OR lower(original_name) IN (
+               'agents.md', 'claude.md', 'design-qa.md',
+               'frontend-ui-v1.0.md', 'readme.md', 'readme-运行说明.md'
+           )
+           OR instr(original_name, '工作计划') > 0
+           OR instr(original_name, '交付清单') > 0
+           OR instr(original_name, '交付说明') > 0
+           OR instr(original_name, '验收报告') > 0
+           OR instr(original_name, '里程碑报告') > 0
+           OR instr(original_name, '完成度评审') > 0
+    ) THEN 'process'
+    WHEN document_id IN (
+        SELECT id FROM documents
+        WHERE instr(replace(source_path, char(92), '/'), '/开发数据/') > 0
+           OR instr(replace(source_path, char(92), '/'), '/ddl/') > 0
+           OR lower(original_name) LIKE '%.sql'
+           OR instr(original_name, '接口设计') > 0
+           OR instr(original_name, '技术架构') > 0
+           OR instr(original_name, '技术选型') > 0
+           OR instr(original_name, '数据字典') > 0
+           OR instr(original_name, '时序图') > 0
+           OR instr(original_name, '状态机') > 0
+    ) THEN 'technical'
+    ELSE 'business'
+END;
+CREATE INDEX idx_document_governance_domain
+    ON document_governance(knowledge_domain, purpose, scope_status);
+"""
+
+MIGRATION_17 = """
+UPDATE document_governance
+SET knowledge_domain = 'business'
+WHERE document_id IN (
+    SELECT id
+    FROM documents
+    WHERE lower(original_name) = 'product.md'
+       OR lower(original_name) LIKE 'prd%'
+);
+
+UPDATE document_governance
+SET knowledge_domain = 'process'
+WHERE document_id IN (
+    SELECT id
+    FROM documents
+    WHERE instr(original_name, '交付说明') > 0
+);
+"""
+
+MIGRATION_18 = """
+ALTER TABLE corpus_files
+    ADD COLUMN content_preview_json TEXT NOT NULL DEFAULT '[]'
+    CHECK (
+        json_valid(content_preview_json)
+        AND json_type(content_preview_json) = 'array'
+    );
+"""
+
 
 class ClosingConnection(sqlite3.Connection):
     """Makes ``with database.connect()`` close the file handle on Windows."""
@@ -599,6 +940,29 @@ class ClosingConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
+
+
+def _apply_schema_migration(
+    connection: sqlite3.Connection,
+    *,
+    version: int,
+    script: str,
+    applied_at: str,
+    allow_existing: bool = False,
+) -> None:
+    """Apply schema DDL and its version marker in one SQLite transaction."""
+    marker = (
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)"
+        if allow_existing
+        else "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)"
+    )
+    try:
+        connection.executescript(f"BEGIN IMMEDIATE;\n{script}")
+        connection.execute(marker, (version, applied_at))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
 
 
 class Database:
@@ -616,10 +980,12 @@ class Database:
     def initialize(self, applied_at: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
-            connection.executescript(SCHEMA)
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (1, applied_at),
+            _apply_schema_migration(
+                connection,
+                version=1,
+                script=SCHEMA,
+                applied_at=applied_at,
+                allow_existing=True,
             )
             applied = {
                 row[0]
@@ -627,82 +993,35 @@ class Database:
                     "SELECT version FROM schema_migrations"
                 ).fetchall()
             }
-            if 2 not in applied:
-                connection.executescript(MIGRATION_2)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (2, applied_at),
+            migrations = (
+                (2, MIGRATION_2),
+                (3, MIGRATION_3),
+                (4, MIGRATION_4),
+                (5, MIGRATION_5),
+                (6, MIGRATION_6),
+                (7, MIGRATION_7),
+                (8, MIGRATION_8),
+                (9, MIGRATION_9),
+                (10, MIGRATION_10),
+                (11, MIGRATION_11),
+                (12, MIGRATION_12),
+                (13, MIGRATION_13),
+                (14, MIGRATION_14),
+                (15, MIGRATION_15),
+                (16, MIGRATION_16),
+                (17, MIGRATION_17),
+                (18, MIGRATION_18),
+            )
+            for version, script in migrations:
+                if version in applied:
+                    continue
+                _apply_schema_migration(
+                    connection,
+                    version=version,
+                    script=script,
+                    applied_at=applied_at,
                 )
-                applied.add(2)
-            if 3 not in applied:
-                connection.executescript(MIGRATION_3)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (3, applied_at),
-                )
-                applied.add(3)
-            if 4 not in applied:
-                connection.executescript(MIGRATION_4)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (4, applied_at),
-                )
-                applied.add(4)
-            if 5 not in applied:
-                connection.executescript(MIGRATION_5)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (5, applied_at),
-                )
-                applied.add(5)
-            if 6 not in applied:
-                connection.executescript(MIGRATION_6)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (6, applied_at),
-                )
-                applied.add(6)
-            if 7 not in applied:
-                connection.executescript(MIGRATION_7)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (7, applied_at),
-                )
-                applied.add(7)
-            if 8 not in applied:
-                connection.executescript(MIGRATION_8)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (8, applied_at),
-                )
-                applied.add(8)
-            if 9 not in applied:
-                connection.executescript(MIGRATION_9)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (9, applied_at),
-                )
-                applied.add(9)
-            if 10 not in applied:
-                connection.executescript(MIGRATION_10)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (10, applied_at),
-                )
-                applied.add(10)
-            if 11 not in applied:
-                connection.executescript(MIGRATION_11)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (11, applied_at),
-                )
-                applied.add(11)
-            if 12 not in applied:
-                connection.executescript(MIGRATION_12)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (12, applied_at),
-                )
+                applied.add(version)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

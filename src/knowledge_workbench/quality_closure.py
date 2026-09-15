@@ -39,6 +39,8 @@ from .wiki import write_text_atomic
 
 DEFAULT_GOLD_DOCUMENT_TARGET = 20
 MINIMUM_GOLD_DOCUMENT_BASELINE = 10
+DEFAULT_CONFLICT_SAMPLE_SIZE = 100
+DEFAULT_MINIMUM_KNOWN_CONFLICTS = 5
 
 
 def build_quality_closure_status(
@@ -46,13 +48,31 @@ def build_quality_closure_status(
     paths: WorkspacePaths,
     *,
     target_gold_documents: int = DEFAULT_GOLD_DOCUMENT_TARGET,
+    conflict_sample_size: int = DEFAULT_CONFLICT_SAMPLE_SIZE,
+    minimum_known_conflicts: int = DEFAULT_MINIMUM_KNOWN_CONFLICTS,
 ) -> dict[str, Any]:
     target_gold_documents = _validated_gold_target(
         target_gold_documents
     )
+    conflict_sample_size = _validated_conflict_sample_size(
+        conflict_sample_size
+    )
+    minimum_known_conflicts = _validated_minimum_known_conflicts(
+        minimum_known_conflicts,
+        conflict_sample_size=conflict_sample_size,
+    )
     lint = lint_workspace(database, paths)
     gold = _gold_status(database)
+    governance = _document_governance_status(database)
+    gold["quality_role"] = "development_regression_only"
+    gold["counts_as_enterprise_business_baseline"] = False
     conflict = _conflict_status(database, paths)
+    conflict_sampling = _conflict_sampling_status(
+        conflict,
+        requested_sample_size=conflict_sample_size,
+        minimum_known_conflicts=minimum_known_conflicts,
+    )
+    conflict["sampling"] = conflict_sampling
     graph = _graph_status(database, paths)
     work_packs = _work_pack_status(database, paths)
 
@@ -69,7 +89,7 @@ def build_quality_closure_status(
             phase="system",
         ),
         _gate(
-            "gold_baseline",
+            "development_regression_baseline",
             (
                 gold["approved_current_document_count"]
                 >= MINIMUM_GOLD_DOCUMENT_BASELINE
@@ -88,48 +108,25 @@ def build_quality_closure_status(
                     "invalid_approved_session_count"
                 ],
             },
-            next_action="完成至少 10 份当前资料的双人黄金标注",
-            phase="human_data",
+            next_action="完成至少 10 份开发样例的回归标注；它不代表企业业务基线",
+            phase="system",
         ),
         _gate(
-            "gold_expansion",
+            "business_corpus_scope",
             (
-                gold["approved_current_document_count"]
-                >= target_gold_documents
-                and gold["invalid_approved_session_count"] == 0
+                governance["production_in_scope_document_count"] > 0
+                and governance["production_authoritative_document_count"] > 0
+                and governance["production_unreviewed_document_count"] == 0
             ),
             required={
-                "target_approved_current_documents":
-                target_gold_documents,
-                "invalid_approved_sessions": 0,
+                "minimum_production_in_scope_documents": 1,
+                "minimum_production_authoritative_documents": 1,
+                "production_unreviewed_documents": 0,
             },
-            actual={
-                "approved_current_document_count": gold[
-                    "approved_current_document_count"
-                ],
-                "current_document_count": gold[
-                    "current_document_count"
-                ],
-                "unapproved_current_document_count": gold[
-                    "unapproved_current_document_count"
-                ],
-                "unapproved_current_document_ids": gold[
-                    "unapproved_current_document_ids"
-                ],
-                "remaining_document_count": max(
-                    0,
-                    target_gold_documents
-                    - gold["approved_current_document_count"],
-                ),
-                "minimum_new_document_import_count": max(
-                    0,
-                    target_gold_documents
-                    - gold["current_document_count"],
-                ),
-            },
+            actual=governance,
             next_action=(
-                "先人工判断当前未覆盖资料是否适合作为真实黄金资料，"
-                "再导入缺少的新资料并完成异人复核"
+                "先生成全库资料地图，再由熟悉业务的人确认资料范围、"
+                "现行版本和权威性；不要逐条审批普通证据"
             ),
             phase="human_data",
         ),
@@ -149,17 +146,44 @@ def build_quality_closure_status(
                 "candidate_count": conflict["candidate_count"],
                 "batch_count": conflict["batch_count"],
             },
-            next_action="生成覆盖完整候选包的经审计分层计划",
+            next_action=(
+                "生成覆盖完整候选清单的经审计分层抽样框；"
+                "完整清单不要求全量人工标注"
+            ),
             phase="system",
         ),
         _gate(
             "conflict_annotation",
-            conflict["annotation_complete"],
-            required={"annotation_complete": True},
+            (
+                conflict_sampling["annotation_complete"]
+                and conflict_sampling["known_conflict_labeling_complete"]
+            ),
+            required={
+                "stratified_sample_annotation_complete": True,
+                "minimum_known_conflicts":
+                minimum_known_conflicts,
+            },
             actual={
-                "labeled_count": conflict["labeled_count"],
-                "candidate_count": conflict["candidate_count"],
-                "unlabeled_count": conflict["unlabeled_count"],
+                "candidate_universe_count": conflict["candidate_count"],
+                "requested_sample_size": conflict_sampling[
+                    "requested_sample_size"
+                ],
+                "effective_sample_size": conflict_sampling[
+                    "effective_sample_size"
+                ],
+                "sample_labeled_count": conflict_sampling[
+                    "sample_labeled_count"
+                ],
+                "remaining_sample_label_count": conflict_sampling[
+                    "remaining_sample_label_count"
+                ],
+                "known_conflict_labeled_count": conflict_sampling[
+                    "known_conflict_labeled_count"
+                ],
+                "remaining_known_conflict_label_count": conflict_sampling[
+                    "remaining_known_conflict_label_count"
+                ],
+                "strata": conflict_sampling["strata"],
                 "annotation_work_pack_ready_count": work_packs[
                     "conflict_annotation_ready_count"
                 ],
@@ -174,22 +198,42 @@ def build_quality_closure_status(
                 ],
             },
             next_action=_conflict_annotation_next_action(
-                work_packs
+                conflict_sampling, work_packs
             ),
             phase="human_data",
         ),
         _gate(
             "conflict_review",
-            conflict["human_attested_review_complete"],
+            (
+                conflict_sampling["human_attested_review_complete"]
+                and conflict_sampling["known_conflict_review_complete"]
+            ),
             required={
-                "human_attested_review_complete": True,
+                "stratified_sample_human_attested_review_complete": True,
+                "minimum_human_attested_known_conflicts":
+                minimum_known_conflicts,
                 "accepted_review_modes": [
                     "independent",
                     "solo_attested",
                 ],
             },
             actual={
-                "approved_count": conflict["approved_count"],
+                "candidate_universe_count": conflict["candidate_count"],
+                "effective_sample_size": conflict_sampling[
+                    "effective_sample_size"
+                ],
+                "sample_human_attested_review_count": conflict_sampling[
+                    "sample_human_attested_review_count"
+                ],
+                "remaining_sample_review_count": conflict_sampling[
+                    "remaining_sample_review_count"
+                ],
+                "human_attested_known_conflict_count": conflict_sampling[
+                    "human_attested_known_conflict_count"
+                ],
+                "remaining_known_conflict_review_count": conflict_sampling[
+                    "remaining_known_conflict_review_count"
+                ],
                 "human_attested_approved_count": conflict[
                     "human_attested_approved_count"
                 ],
@@ -208,8 +252,7 @@ def build_quality_closure_status(
                 "review_audit_current": conflict[
                     "review_audit_current"
                 ],
-                "candidate_count": conflict["candidate_count"],
-                "unreviewed_count": conflict["unreviewed_count"],
+                "strata": conflict_sampling["strata"],
                 "review_work_pack_ready_count": work_packs[
                     "conflict_review_ready_count"
                 ],
@@ -224,7 +267,7 @@ def build_quality_closure_status(
                 ],
             },
             next_action=_conflict_review_next_action(
-                conflict, work_packs
+                conflict_sampling, work_packs
             ),
             phase="human_data",
         ),
@@ -417,14 +460,19 @@ def build_quality_closure_status(
         for item in gates
         if item["status"] != "passed"
     ]
+    gold_advisory = _gold_coverage_advisory(
+        gold, recommended_document_count=target_gold_documents
+    )
     return {
-        "schema_version": "1.0",
+        "schema_version": "3.0",
         "kind": "quality-closure-status",
         "checked_at": utc_now(),
         "configuration": {
             "minimum_gold_document_baseline":
             MINIMUM_GOLD_DOCUMENT_BASELINE,
-            "target_gold_documents": target_gold_documents,
+            "recommended_gold_documents": target_gold_documents,
+            "conflict_sample_size": conflict_sample_size,
+            "minimum_known_conflicts": minimum_known_conflicts,
         },
         "summary": {
             "complete": passed_count == len(gates),
@@ -433,6 +481,10 @@ def build_quality_closure_status(
             "pending_gate_count": len(gates) - passed_count,
             "human_action_required": any(
                 item["phase"] == "human_data" for item in pending
+            ),
+            "advisory_count": 1,
+            "unmet_advisory_count": (
+                0 if gold_advisory["status"] == "met" else 1
             ),
         },
         "metrics": {
@@ -447,11 +499,14 @@ def build_quality_closure_status(
                 ),
             },
             "gold": gold,
+            "document_governance": governance,
+            "material_flow": _material_flow_status(database, gold),
             "conflict": conflict,
             "graph": graph,
             "work_packs": work_packs,
         },
         "gates": gates,
+        "advisories": [gold_advisory],
         "pending_actions": pending,
     }
 
@@ -463,6 +518,8 @@ def save_quality_closure_status(
     *,
     actor: str,
     target_gold_documents: int = DEFAULT_GOLD_DOCUMENT_TARGET,
+    conflict_sample_size: int = DEFAULT_CONFLICT_SAMPLE_SIZE,
+    minimum_known_conflicts: int = DEFAULT_MINIMUM_KNOWN_CONFLICTS,
 ) -> dict[str, Any]:
     actor = _required_actor(actor)
     output = _validated_output(paths, output)
@@ -470,6 +527,8 @@ def save_quality_closure_status(
         database,
         paths,
         target_gold_documents=target_gold_documents,
+        conflict_sample_size=conflict_sample_size,
+        minimum_known_conflicts=minimum_known_conflicts,
     )
     content = json.dumps(
         report, ensure_ascii=False, indent=2, sort_keys=True
@@ -499,13 +558,55 @@ def save_quality_closure_status(
                         item["gate_id"]
                         for item in report["pending_actions"]
                     ],
-                    "target_gold_documents": target_gold_documents,
+                    "recommended_gold_documents":
+                    target_gold_documents,
+                    "conflict_sample_size": conflict_sample_size,
+                    "minimum_known_conflicts":
+                    minimum_known_conflicts,
                 },
             )
     except Exception:
         output.unlink(missing_ok=True)
         raise
     return report
+
+
+def _document_governance_status(database: Database) -> dict[str, int]:
+    with database.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT purpose, scope_status, authority_status, COUNT(*) AS count
+            FROM document_governance
+            GROUP BY purpose, scope_status, authority_status
+            """
+        ).fetchall()
+    metrics = {
+        "development_fixture_document_count": 0,
+        "candidate_document_count": 0,
+        "production_document_count": 0,
+        "production_in_scope_document_count": 0,
+        "production_authoritative_document_count": 0,
+        "production_unreviewed_document_count": 0,
+    }
+    for row in rows:
+        purpose = row["purpose"]
+        count = row["count"]
+        if purpose == "development_fixture":
+            metrics["development_fixture_document_count"] += count
+        elif purpose == "candidate":
+            metrics["candidate_document_count"] += count
+        elif purpose == "production":
+            metrics["production_document_count"] += count
+            if row["scope_status"] == "in_scope":
+                metrics["production_in_scope_document_count"] += count
+            if (
+                row["scope_status"] == "in_scope"
+                and row["authority_status"] == "authoritative"
+            ):
+                metrics["production_authoritative_document_count"] += count
+            if row["scope_status"] == "unreviewed":
+                metrics["production_unreviewed_document_count"] += count
+    return metrics
 
 
 def _gold_status(database: Database) -> dict[str, Any]:
@@ -617,6 +718,236 @@ def _conflict_status(
         "review_audit_current": summary.get(
             "review_audit_current", True
         ),
+        "known_conflict_labeled_count": summary.get(
+            "known_conflict_labeled_count", 0
+        ),
+        "human_attested_known_conflict_count": summary.get(
+            "human_attested_known_conflict_count", 0
+        ),
+        "stratum_status": summary.get("stratum_status", {}),
+    }
+
+
+def _conflict_sampling_status(
+    conflict: dict[str, Any],
+    *,
+    requested_sample_size: int,
+    minimum_known_conflicts: int,
+) -> dict[str, Any]:
+    candidate_count = conflict["candidate_count"]
+    effective_sample_size = min(requested_sample_size, candidate_count)
+    stratum_status = conflict["stratum_status"]
+    universe_by_stratum = {
+        stratum: status["candidate_count"]
+        for stratum, status in stratum_status.items()
+        if status["candidate_count"] > 0
+    }
+    quotas = _allocate_stratified_quotas(
+        universe_by_stratum,
+        effective_sample_size,
+    )
+    strata = {}
+    sample_labeled_count = 0
+    sample_human_attested_review_count = 0
+    for stratum, quota in quotas.items():
+        status = stratum_status[stratum]
+        labeled = min(status["labeled_count"], quota)
+        reviewed = min(
+            status["human_attested_approved_count"], quota
+        )
+        sample_labeled_count += labeled
+        sample_human_attested_review_count += reviewed
+        strata[stratum] = {
+            "candidate_count": status["candidate_count"],
+            "sample_quota": quota,
+            "labeled_count": status["labeled_count"],
+            "sample_labeled_count": labeled,
+            "human_attested_approved_count": status[
+                "human_attested_approved_count"
+            ],
+            "sample_human_attested_review_count": reviewed,
+            "remaining_label_count": quota - labeled,
+            "remaining_review_count": quota - reviewed,
+        }
+    known_conflict_labeled_count = conflict[
+        "known_conflict_labeled_count"
+    ]
+    human_attested_known_conflict_count = conflict[
+        "human_attested_known_conflict_count"
+    ]
+    return {
+        "selection_method": (
+            "quota_stratified_by_predicted_type_and_similarity_band"
+        ),
+        "candidate_universe_count": candidate_count,
+        "requested_sample_size": requested_sample_size,
+        "effective_sample_size": effective_sample_size,
+        "minimum_known_conflicts": minimum_known_conflicts,
+        "sample_labeled_count": sample_labeled_count,
+        "remaining_sample_label_count": (
+            effective_sample_size - sample_labeled_count
+        ),
+        "sample_human_attested_review_count": (
+            sample_human_attested_review_count
+        ),
+        "remaining_sample_review_count": (
+            effective_sample_size
+            - sample_human_attested_review_count
+        ),
+        "known_conflict_labeled_count": (
+            known_conflict_labeled_count
+        ),
+        "remaining_known_conflict_label_count": max(
+            0,
+            minimum_known_conflicts - known_conflict_labeled_count,
+        ),
+        "human_attested_known_conflict_count": (
+            human_attested_known_conflict_count
+        ),
+        "remaining_known_conflict_review_count": max(
+            0,
+            minimum_known_conflicts
+            - human_attested_known_conflict_count,
+        ),
+        "annotation_complete": (
+            effective_sample_size > 0
+            and sample_labeled_count == effective_sample_size
+        ),
+        "known_conflict_labeling_complete": (
+            known_conflict_labeled_count >= minimum_known_conflicts
+        ),
+        "human_attested_review_complete": (
+            effective_sample_size > 0
+            and sample_human_attested_review_count
+            == effective_sample_size
+        ),
+        "known_conflict_review_complete": (
+            human_attested_known_conflict_count
+            >= minimum_known_conflicts
+        ),
+        "strata": strata,
+    }
+
+
+def _allocate_stratified_quotas(
+    universe_by_stratum: dict[str, int],
+    sample_size: int,
+) -> dict[str, int]:
+    quotas = {
+        stratum: 0 for stratum in sorted(universe_by_stratum)
+    }
+    for _ in range(sample_size):
+        eligible = [
+            stratum
+            for stratum, count in universe_by_stratum.items()
+            if quotas[stratum] < count
+        ]
+        if not eligible:
+            break
+        selected = min(
+            eligible,
+            key=lambda stratum: (
+                quotas[stratum] / universe_by_stratum[stratum],
+                -universe_by_stratum[stratum],
+                stratum,
+            ),
+        )
+        quotas[selected] += 1
+    return {
+        stratum: quota
+        for stratum, quota in quotas.items()
+        if quota > 0
+    }
+
+
+def _gold_coverage_advisory(
+    gold: dict[str, Any],
+    *,
+    recommended_document_count: int,
+) -> dict[str, Any]:
+    approved_count = gold["approved_current_document_count"]
+    return {
+        "advisory_id": "gold_coverage_recommendation",
+        "status": (
+            "met"
+            if approved_count >= recommended_document_count
+            else "suggested"
+        ),
+        "blocks_quality_closure": False,
+        "recommendation": {
+            "recommended_approved_current_documents":
+            recommended_document_count,
+        },
+        "actual": {
+            "approved_current_document_count": approved_count,
+            "imported_current_document_count": gold[
+                "current_document_count"
+            ],
+            "unapproved_current_document_count": gold[
+                "unapproved_current_document_count"
+            ],
+            "unapproved_current_document_ids": gold[
+                "unapproved_current_document_ids"
+            ],
+            "remaining_recommended_document_count": max(
+                0, recommended_document_count - approved_count
+            ),
+            "minimum_new_document_import_count": max(
+                0,
+                recommended_document_count
+                - gold["current_document_count"],
+            ),
+        },
+        "next_action": (
+            None
+            if approved_count >= recommended_document_count
+            else (
+                "仅在格式、业务类型或风险覆盖确有缺口时扩充黄金样本；"
+                "不要为达到建议数量吸收无关 NAS 资料"
+            )
+        ),
+    }
+
+
+def _material_flow_status(
+    database: Database,
+    gold: dict[str, Any],
+) -> dict[str, Any]:
+    with database.connect() as connection:
+        nas_counts = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'discovered' THEN 1 ELSE 0 END)
+                    AS discovered_count,
+                SUM(CASE WHEN status IN ('admitted', 'imported')
+                         THEN 1 ELSE 0 END)
+                    AS admitted_count
+            FROM nas_discoveries
+            """
+        ).fetchone()
+    return {
+        "nas_discovered": {
+            "available": True,
+            "count": nas_counts["discovered_count"] or 0,
+            "definition": "只读扫描发现、尚未做准入决定的文件",
+        },
+        "nas_admitted": {
+            "available": True,
+            "count": nas_counts["admitted_count"] or 0,
+            "definition": "已明确批准吸收、允许进入导入链路的文件",
+        },
+        "imported": {
+            "available": True,
+            "count": gold["current_document_count"],
+            "definition": "已进入 SHA-256 导入链路的当前资料",
+        },
+        "gold_sample": {
+            "available": True,
+            "count": gold["approved_current_document_count"],
+            "definition": (
+                "来源仍为当前版本的开发回归样本；不代表企业业务知识已批准"
+            ),
+        },
     }
 
 
@@ -1058,6 +1389,7 @@ def _declared_work_pack_type(
 
 
 def _conflict_annotation_next_action(
+    sampling: dict[str, Any],
     work_packs: dict[str, int],
 ) -> str:
     if work_packs["conflict_annotation_ready_count"] > 0:
@@ -1068,15 +1400,28 @@ def _conflict_annotation_next_action(
         )
     if work_packs["conflict_annotation_invalid_count"] > 0:
         return "重新导出来源漂移或完整性失效的冲突标注批次"
-    return "导出下一批冲突候选并逐条人工回源标注"
+    if sampling["remaining_known_conflict_label_count"] > 0:
+        return (
+            "继续按分层配额标注代表性候选，并主动加入至少 "
+            f"{sampling['remaining_known_conflict_label_count']} 条"
+            "人工确认的真冲突；不要求标完候选全集"
+        )
+    return (
+        "继续按分层配额标注代表性候选；"
+        f"还需 {sampling['remaining_sample_label_count']} 条，"
+        "不要求标完候选全集"
+    )
 
 
 def _conflict_review_next_action(
-    conflict: dict[str, Any],
+    sampling: dict[str, Any],
     work_packs: dict[str, int],
 ) -> str:
-    if not conflict["annotation_complete"]:
-        return "先完成全部冲突候选标注，再提交整包进入人工复核"
+    if not (
+        sampling["annotation_complete"]
+        and sampling["known_conflict_labeling_complete"]
+    ):
+        return "先完成分层样本和已知真冲突标注，不需要处理候选全集"
     if work_packs["conflict_review_ready_count"] > 0:
         return "应用已完成的冲突人工复核批次工作包"
     if work_packs["conflict_review_incomplete_count"] > 0:
@@ -1086,8 +1431,8 @@ def _conflict_review_next_action(
     if work_packs["conflict_review_invalid_count"] > 0:
         return "重新导出来源漂移或完整性失效的冲突复核批次"
     return (
-        "提交完整候选包并导出人工复核批次；单人模式必须"
-        "显式记录 solo_attested"
+        "复核达到分层配额的样本和已知真冲突；未抽样候选不形成欠账，"
+        "单人模式必须显式记录 solo_attested"
     )
 
 
@@ -1157,6 +1502,36 @@ def _validated_gold_target(value: int) -> int:
     ):
         raise KnowledgeWorkbenchError(
             "黄金资料目标必须是 10 到 1000 之间的整数"
+        )
+    return value
+
+
+def _validated_conflict_sample_size(value: int) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 10
+        or value > 1000
+    ):
+        raise KnowledgeWorkbenchError(
+            "冲突分层样本建议规模必须是 10 到 1000 之间的整数"
+        )
+    return value
+
+
+def _validated_minimum_known_conflicts(
+    value: int,
+    *,
+    conflict_sample_size: int,
+) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 1
+        or value > conflict_sample_size
+    ):
+        raise KnowledgeWorkbenchError(
+            "已知真冲突最少数量必须是 1 到冲突样本规模之间的整数"
         )
     return value
 

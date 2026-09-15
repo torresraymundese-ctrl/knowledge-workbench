@@ -3,13 +3,60 @@
 const statusLabels = {
   draft: "草稿",
   reviewing: "审核中",
-  verified: "已验证",
+  verified: "技术校验通过",
   rejected: "已驳回",
   conflicted: "有冲突",
   pending: "待处理",
   deprecated: "已弃用",
   archived: "已归档",
   merged: "已合并",
+};
+
+const wikiStatusLabels = {
+  draft: "待整理",
+  reviewing: "业务复核中",
+  verified: "正式发布",
+  rejected: "已驳回",
+  superseded: "已被替代",
+  archived: "已归档",
+};
+
+const classificationLabels = {
+  public: "公开资料",
+  internal: "内部资料",
+  confidential: "机密资料",
+  restricted: "受限资料",
+};
+
+const purposeLabels = {
+  development_fixture: "开发样例",
+  candidate: "候选资料",
+  production: "正式业务资料",
+};
+
+const scopeLabels = {
+  unreviewed: "尚未确认",
+  in_scope: "纳入范围",
+  out_of_scope: "不纳入",
+};
+
+const authorityLabels = {
+  unknown: "暂不确定",
+  reference: "参考资料",
+  authoritative: "现行权威资料",
+  superseded: "已被新版本替代",
+};
+
+const mapStatusLabels = {
+  readable: "已生成内容说明",
+  metadata_only: "仅登记文件信息",
+  blocked: "正文读取已阻止",
+  unreadable: "需要重新处理",
+};
+
+const conflictTypeLabels = {
+  value_change: "数值说法不一致",
+  polarity_change: "允许与禁止的说法相反",
 };
 
 const eventLabels = {
@@ -39,6 +86,10 @@ const eventLabels = {
   entity_relationship_created: "业务关系已登记",
   entity_relationship_retracted: "业务关系已撤销",
   graph_pilot_pack_created: "图谱试点证据包已生成",
+  corpus_map_created: "全库资料地图已生成",
+  corpus_file_scope_decided: "资料范围和权威性已确认",
+  corpus_file_imported: "资料已明确导入",
+  knowledge_question_answered: "知识问答已检索",
   worker_started: "后台工作器已启动",
   worker_stopped: "后台工作器已停止",
   labeling_session_created: "黄金标注已创建",
@@ -48,7 +99,27 @@ const eventLabels = {
 };
 
 let csrfToken = "";
-const reviewKinds = ["evidence", "conflicts", "wiki_revisions"];
+const qaState = {
+  history: [],
+  busy: false,
+  deepseekConfigured: false,
+  suggestionPage: 0,
+};
+const qaStarterSuggestions = [
+  [
+    "研学平台适合哪些用户群体？",
+    "平台有哪些安全与保险要求？",
+    "课程、基地和导师之间是什么关系？",
+    "合同和退款需要注意什么？",
+  ],
+  [
+    "如何提升研学平台的受众覆盖？",
+    "学校和机构分别拥有哪些权限？",
+    "研学活动开始前需要准备什么？",
+    "现有资料主要覆盖了哪些业务主题？",
+  ],
+];
+const reviewKinds = ["conflicts", "wiki_revisions"];
 const reviewState = {
   limit: 5,
   offsets: { evidence: 0, conflicts: 0, wiki_revisions: 0 },
@@ -58,6 +129,39 @@ const reviewState = {
     classification: "",
     statuses: { evidence: "", conflicts: "", wiki_revisions: "" },
   },
+};
+const corpusViews = new Set(
+  ["all", "readable", "duplicates", "versions", "attention"],
+);
+
+// latest-request-guard:start
+function createLatestRequestGuard() {
+  let latestToken = 0;
+  return {
+    begin() {
+      latestToken += 1;
+      return latestToken;
+    },
+    isLatest(token) {
+      return token === latestToken;
+    },
+    invalidate() {
+      latestToken += 1;
+    },
+  };
+}
+// latest-request-guard:end
+
+const corpusMapRequestGuard = createLatestRequestGuard();
+const corpusCardRequestGuard = createLatestRequestGuard();
+const corpusState = {
+  limit: 60,
+  offset: 0,
+  folder: "",
+  scope: "",
+  query: "",
+  view: "all",
+  data: null,
 };
 const candidateState = {
   limit: 10,
@@ -141,10 +245,10 @@ function metricCard(label, value, sub, icon) {
 function renderSummary(summary) {
   const metrics = document.querySelector("#metrics");
   metrics.replaceChildren(
-    metricCard("当前资料", summary.document_count, "内容寻址版本", "文"),
-    metricCard("原子证据", summary.current_evidence_count, "仅当前处理运行", "证"),
-    metricCard("Wiki 页面", summary.wiki_page_count, "SQLite 状态真相", "知"),
-    metricCard("批准评测集", summary.approved_labeling_session_count, "双人复核完成", "评"),
+    metricCard("当前平台资料", summary.document_count, "不展示开发背景资料", "资"),
+    metricCard("待确认平台资料", summary.candidate_document_count, "等待业务范围确认", "候"),
+    metricCard("正式平台资料", summary.production_document_count, "已纳入业务知识范围", "正"),
+    metricCard("技术校验通过", summary.technically_validated_evidence_count, "不等于业务批准", "技"),
   );
 
   const statuses = document.querySelector("#evidence-status");
@@ -166,7 +270,7 @@ function renderSummary(summary) {
     [summary.active_conflict_count, "待处理冲突"],
     [summary.active_task_count, "活动任务"],
     [summary.needs_revalidation_count, "待重验证页面"],
-    [summary.evidence_by_status.reviewing || 0, "审核中证据"],
+    [summary.wiki_pages_by_status.reviewing || 0, "业务复核中的 Wiki"],
   ].forEach(([value, label]) => {
     const item = element("div", "attention-item");
     item.append(element("strong", "", formatNumber(value)), element("span", "", label));
@@ -180,21 +284,553 @@ function renderDocuments(documents) {
   body.replaceChildren();
   documents.items.forEach((item) => {
     const row = document.createElement("tr");
-    const nameCell = document.createElement("td");
-    nameCell.append(element("div", "document-name", item.display_name), element("span", "document-id", shortId(item.document_id)));
-    const classCell = document.createElement("td");
-    classCell.append(element("span", `tag ${item.classification}`, item.classification));
+    const nameCell = element("td", "document-name-cell", "");
+    const documentIdentity = element("div", "document-identity", "");
+    const openControl = button(
+      item.display_name,
+      "document-open",
+      () => openDocument(item.document_id),
+    );
+    openControl.setAttribute(
+      "aria-label",
+      `用本地应用打开只读副本：${item.display_name}`,
+    );
+    documentIdentity.append(
+      openControl,
+      element(
+        "span",
+        "document-description",
+        item.authority_status === "authoritative"
+          ? "当前主要依据"
+          : "已纳入知识范围的参考资料",
+      ),
+    );
+    nameCell.append(
+      element("span", "document-type-icon nav-icon icon-document", ""),
+      documentIdentity,
+    );
+    const purposeCell = document.createElement("td");
+    purposeCell.append(element("span", `state purpose-${item.purpose}`, purposeLabels[item.purpose] || item.purpose));
     const wikiClass = item.needs_revalidation ? "state warn" : item.wiki_status === "verified" ? "state ok" : "state";
+    const technicalText = `${formatNumber(item.technically_validated_evidence_count)}/${formatNumber(item.evidence_count)} 条通过`;
     row.append(
       nameCell,
-      classCell,
-      element("td", "state", item.parser),
-      element("td", "", formatNumber(item.evidence_count)),
-      element("td", item.reviewing_evidence_count ? "state warn" : "state", item.reviewing_evidence_count ? `${item.reviewing_evidence_count} 待审` : "—"),
-      element("td", wikiClass, item.needs_revalidation ? "待重验证" : statusLabels[item.wiki_status] || item.wiki_status || "无"),
+      purposeCell,
+      element("td", item.scope_status === "in_scope" ? "state ok" : "state", scopeLabels[item.scope_status] || item.scope_status),
+      element("td", "state", technicalText),
+      element("td", item.authority_status === "authoritative" ? "state ok" : "state", authorityLabels[item.authority_status] || item.authority_status),
+      element("td", wikiClass, item.needs_revalidation ? "待重新确认" : wikiStatusLabels[item.wiki_status] || item.wiki_status || "尚未形成"),
     );
     body.append(row);
   });
+}
+
+async function openDocument(documentId) {
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  try {
+    const payload = await postTransition(
+      `/api/v1/documents/${encodeURIComponent(documentId)}/open`,
+      { actor },
+    );
+    showBanner(`已用本地应用打开只读副本：${payload.result.display_name}`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "无法打开资料");
+  }
+}
+
+function formatBytes(value) {
+  const size = Number(value) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
+  if (size < 1024 ** 3) return `${(size / 1024 ** 2).toFixed(1)} MB`;
+  return `${(size / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function corpusSummaryCard(view, value, label, note, active) {
+  const card = button(label, "corpus-summary-card", () => {
+    selectCorpusView(view).catch((cause) => {
+      showBanner(cause instanceof Error ? cause.message : "资料筛选失败");
+    });
+  });
+  card.setAttribute("data-corpus-view", view);
+  card.setAttribute("aria-pressed", String(active));
+  card.replaceChildren(
+    element("strong", "", formatNumber(value)),
+    element("span", "", label),
+    element("small", "", note),
+  );
+  return card;
+}
+
+async function selectCorpusView(view) {
+  if (!corpusViews.has(view)) return;
+  corpusState.view = view;
+  corpusState.offset = 0;
+  await refreshCorpusMap();
+}
+
+function renderKnowledgeSetupLoading() {
+  document.querySelector("#authority-confirmation-count").textContent = "正在读取";
+  document.querySelector("#topic-candidate-count").textContent = "正在读取";
+  document.querySelector("#authority-confirmations").replaceChildren(
+    element("div", "knowledge-setup-empty", "正在整理需要优先确认的资料…"),
+  );
+  document.querySelector("#topic-candidates").replaceChildren(
+    element("div", "knowledge-setup-empty", "正在整理业务知识主题…"),
+  );
+}
+
+function renderKnowledgeSetupError() {
+  document.querySelector("#authority-confirmation-count").textContent = "读取失败";
+  document.querySelector("#topic-candidate-count").textContent = "读取失败";
+  document.querySelector("#authority-confirmations").replaceChildren(
+    element("div", "knowledge-setup-empty error", "暂时无法读取基准资料建议，请稍后刷新重试。"),
+  );
+  document.querySelector("#topic-candidates").replaceChildren(
+    element("div", "knowledge-setup-empty error", "暂时无法读取业务知识主题，请稍后刷新重试。"),
+  );
+}
+
+function readableSourceTitle(source) {
+  if (typeof source === "string") return source.trim();
+  if (!source || typeof source !== "object") return "";
+  return String(
+    source.display_title
+    || source.title
+    || source.document_name
+    || "",
+  ).trim();
+}
+
+function renderKnowledgeSetup(payload) {
+  const authorityItems = Array.isArray(payload?.authority_confirmations)
+    ? payload.authority_confirmations
+    : [];
+  const topicItems = Array.isArray(payload?.topic_candidates)
+    ? payload.topic_candidates
+    : [];
+  const authorityRoot = document.querySelector("#authority-confirmations");
+  const topicRoot = document.querySelector("#topic-candidates");
+  document.querySelector("#authority-confirmation-count").textContent =
+    `${formatNumber(authorityItems.length)} 项`;
+  document.querySelector("#topic-candidate-count").textContent =
+    `${formatNumber(topicItems.length)} 个主题`;
+  authorityRoot.replaceChildren();
+  topicRoot.replaceChildren();
+
+  if (!authorityItems.length) {
+    authorityRoot.append(
+      element(
+        "div",
+        "knowledge-setup-empty",
+        "当前没有需要优先确认的基准资料。后续发现总纲、权限矩阵或现行政策时，系统会在这里提示。",
+      ),
+    );
+  } else {
+    authorityItems.forEach((item) => {
+      const card = element("article", "knowledge-setup-item authority-confirmation-item");
+      const heading = element("div", "knowledge-setup-item-heading");
+      const authorityKey = Object.prototype.hasOwnProperty.call(
+        authorityLabels,
+        item.current_authority,
+      )
+        ? item.current_authority
+        : "unknown";
+      heading.append(
+        element("strong", "", item.display_title || "未命名资料"),
+        element(
+          "span",
+          `knowledge-status authority-${authorityKey}`,
+          authorityLabels[authorityKey],
+        ),
+      );
+      card.append(
+        heading,
+        element(
+          "p",
+          "knowledge-setup-reason",
+          item.plain_reason || "这份资料可能影响多个业务主题，建议由熟悉业务的人确认是否为当前适用版本。",
+        ),
+      );
+      const topics = Array.isArray(item.topics)
+        ? item.topics.filter((topic) => typeof topic === "string" && topic.trim())
+        : [];
+      if (topics.length) {
+        const topicRow = element("div", "knowledge-topic-chips");
+        topics.forEach((topic) => topicRow.append(element("span", "", topic.trim())));
+        card.append(topicRow);
+      }
+      const footer = element("footer", "knowledge-setup-item-footer");
+      footer.append(
+        element("small", "", "是否为现行权威资料，需要人工确认"),
+      );
+      if (item.file_id) {
+        footer.append(
+          button(
+            "查看说明并确认",
+            "primary",
+            () => openCorpusCard(item.file_id),
+          ),
+        );
+      }
+      card.append(footer);
+      authorityRoot.append(card);
+    });
+  }
+
+  if (!topicItems.length) {
+    topicRoot.append(
+      element(
+        "div",
+        "knowledge-setup-empty",
+        "当前还没有可形成的业务知识主题。请先完成资料地图和范围确认。",
+      ),
+    );
+  } else {
+    topicItems.forEach((item) => {
+      const card = element("article", "knowledge-setup-item topic-candidate-item");
+      const heading = element("div", "knowledge-setup-item-heading");
+      heading.append(
+        element("strong", "", item.title || "未命名业务主题"),
+        element(
+          "span",
+          "knowledge-status topic-status",
+          item.status_label || "正在整理资料",
+        ),
+      );
+      card.append(
+        heading,
+        element(
+          "p",
+          "knowledge-setup-reason",
+          item.plain_description || "系统将把相关资料整理成用户可以直接阅读和提问的主题知识页。",
+        ),
+      );
+
+      const examples = Array.isArray(item.question_examples)
+        ? item.question_examples.filter(
+          (question) => typeof question === "string" && question.trim(),
+        )
+        : [];
+      if (examples.length) {
+        const exampleBlock = element("div", "topic-question-examples");
+        exampleBlock.append(element("small", "", "形成后可以这样问"));
+        const list = document.createElement("ul");
+        examples.slice(0, 3).forEach((question) => {
+          list.append(element("li", "", question.trim()));
+        });
+        exampleBlock.append(list);
+        card.append(exampleBlock);
+      }
+
+      const sourceTitles = Array.isArray(item.primary_sources)
+        ? item.primary_sources.map(readableSourceTitle).filter(Boolean)
+        : [];
+      if (sourceTitles.length) {
+        card.append(
+          element(
+            "p",
+            "topic-primary-sources",
+            `主要来源：${sourceTitles.slice(0, 3).join("、")}${
+              sourceTitles.length > 3 ? `等 ${formatNumber(sourceTitles.length)} 份` : ""
+            }`,
+          ),
+        );
+      }
+
+      const footer = element("footer", "knowledge-setup-item-footer");
+      const counts = element("div", "topic-candidate-counts");
+      const authoritativeCount = Number(item.authoritative_source_count) || 0;
+      const referenceCount = Number(item.reference_source_count) || 0;
+      counts.append(
+        element("span", "", `涉及 ${formatNumber(item.document_count)} 份资料`),
+        element(
+          "span",
+          "confirmed",
+          `${formatNumber(authoritativeCount)} 份主要依据 · ${formatNumber(referenceCount)} 份参考资料`,
+        ),
+      );
+      footer.append(counts);
+      if (item.revision_id) {
+        const revisionLabel = wikiStatusLabels[item.revision_status]
+          || "主题知识页已生成";
+        const revisionActions = element("div", "topic-revision-actions");
+        revisionActions.append(
+          element("span", "knowledge-status wiki-status", revisionLabel),
+          button(
+            "查看主题知识页",
+            "primary",
+            () => openRevision(item.revision_id),
+          ),
+        );
+        footer.append(revisionActions);
+      }
+      card.append(footer);
+      topicRoot.append(card);
+    });
+  }
+}
+
+async function loadKnowledgeSetup() {
+  const response = await fetch("/api/v1/knowledge-setup", {
+    headers: { Accept: "application/json" },
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "知识整理建议读取失败");
+  }
+  renderKnowledgeSetup(payload);
+}
+
+function renderCorpusMap(data) {
+  corpusState.data = data;
+  if (corpusViews.has(data.view)) corpusState.view = data.view;
+  const scanTime = document.querySelector("#corpus-scan-time");
+  const summary = document.querySelector("#corpus-summary");
+  const files = document.querySelector("#corpus-files");
+  const pagination = document.querySelector("#corpus-pagination");
+  const folderSelect = document.querySelector("#corpus-folder");
+  const previousFolder = corpusState.folder;
+  folderSelect.replaceChildren(new Option("全部目录", ""));
+
+  if (!data.scan) {
+    scanTime.textContent = "尚未扫描";
+    summary.replaceChildren(
+      element("div", "panel corpus-empty", "请先填写资料目录并生成资料地图。系统会先让您看懂文件，再决定哪些资料进入知识库。"),
+    );
+    files.replaceChildren();
+    pagination.replaceChildren();
+    pagination.hidden = true;
+    return;
+  }
+  pagination.hidden = false;
+
+  scanTime.textContent = `${data.scan.root_label} · ${formatTime(data.scan.completed_at)}`;
+  data.folders.forEach((folder) => {
+    const option = new Option(
+      `${folder.display_name}（${formatNumber(folder.file_count)} 份）`,
+      folder.folder,
+    );
+    option.selected = folder.folder === previousFolder;
+    folderSelect.append(option);
+  });
+  summary.replaceChildren(
+    corpusSummaryCard("all", data.scan.file_count, "发现文件", `${data.scan.folder_count} 个目录`, data.view === "all"),
+    corpusSummaryCard("readable", data.scan.readable_card_count, "已读懂正文", "已生成可读说明卡", data.view === "readable"),
+    corpusSummaryCard("duplicates", data.scan.duplicate_group_count, "重复文件组", "内容完全相同", data.view === "duplicates"),
+    corpusSummaryCard("versions", data.scan.version_group_count, "版本候选组", "需要确认现行版本", data.view === "versions"),
+    corpusSummaryCard("attention", data.scan.blocked_count + data.scan.unreadable_count, "需要关注", "风险文件或暂时无法读取", data.view === "attention"),
+  );
+
+  files.replaceChildren();
+  if (!data.items.length) {
+    files.append(element("div", "panel corpus-empty", "当前筛选条件下没有资料。"));
+  } else {
+    data.items.forEach((item) => {
+      const card = element("article", "panel corpus-card");
+      const header = document.createElement("header");
+      const identity = element("div");
+      identity.append(
+        element("h3", "", item.display_title),
+        element("small", "", `${item.folder} · ${item.document_type} · ${formatBytes(item.size_bytes)}`),
+      );
+      header.append(identity, element("span", `map-state ${item.map_status}`, mapStatusLabels[item.map_status] || item.map_status));
+      const statusRow = element("div", "corpus-card-status");
+      statusRow.append(
+        element("span", `scope-${item.scope_status}`, scopeLabels[item.scope_status] || item.scope_status),
+        element("span", `authority-${item.authority_status}`, authorityLabels[item.authority_status] || item.authority_status),
+      );
+      if (item.duplicate_group) statusRow.append(element("span", "relation-chip", "存在重复文件"));
+      if (item.version_group) statusRow.append(element("span", "relation-chip", "存在版本候选"));
+      const outline = element("ul", "corpus-card-outline");
+      item.outline.slice(0, 4).forEach((entry) => outline.append(element("li", "", entry)));
+      const footer = document.createElement("footer");
+      footer.append(
+        element("span", "", item.relation_count ? `发现 ${item.relation_count} 个文件关系` : "尚未发现直接文件关系"),
+        button("查看说明并确认范围", "primary", () => openCorpusCard(item.file_id)),
+      );
+      card.append(header, statusRow, element("p", "corpus-card-summary", item.plain_summary));
+      if (item.outline.length) card.append(outline);
+      card.append(footer);
+      files.append(card);
+    });
+  }
+
+  const pageNumber = Math.floor(data.offset / data.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(data.total / data.limit));
+  const previous = button("上一页", "", async () => {
+    corpusState.offset = Math.max(0, data.offset - data.limit);
+    await refreshCorpusMap();
+  });
+  previous.disabled = !data.has_previous;
+  const next = button("下一页", "", async () => {
+    corpusState.offset = data.offset + data.limit;
+    await refreshCorpusMap();
+  });
+  next.disabled = !data.has_next;
+  pagination.replaceChildren(
+    previous,
+    element("span", "", `第 ${pageNumber}/${pageCount} 页 · 共 ${formatNumber(data.total)} 份`),
+    next,
+  );
+}
+
+async function refreshCorpusMap() {
+  const requestToken = corpusMapRequestGuard.begin();
+  const parameters = new URLSearchParams({
+    limit: String(corpusState.limit),
+    offset: String(corpusState.offset),
+  });
+  parameters.set("view", corpusState.view);
+  if (corpusState.folder) parameters.set("folder", corpusState.folder);
+  if (corpusState.scope) parameters.set("scope", corpusState.scope);
+  if (corpusState.query) parameters.set("q", corpusState.query);
+  try {
+    const response = await fetch(`/api/v1/corpus-map?${parameters}`, {
+      headers: { Accept: "application/json" },
+    });
+    const data = await response.json();
+    if (!corpusMapRequestGuard.isLatest(requestToken)) return false;
+    if (!response.ok) throw new Error(data.error || "资料地图读取失败");
+    renderCorpusMap(data);
+    return true;
+  } catch (cause) {
+    if (!corpusMapRequestGuard.isLatest(requestToken)) return false;
+    const committedView = corpusState.data?.view;
+    corpusState.view = corpusViews.has(committedView) ? committedView : "all";
+    throw cause;
+  }
+}
+
+async function openCorpusCard(fileId) {
+  const requestToken = corpusCardRequestGuard.begin();
+  try {
+    const response = await fetch(`/api/v1/corpus-files/${encodeURIComponent(fileId)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const detail = await response.json();
+    if (!corpusCardRequestGuard.isLatest(requestToken)) return;
+    if (!response.ok) throw new Error(detail.error || "文档说明卡读取失败");
+    document.querySelector("#corpus-dialog-title").textContent = detail.display_title;
+    const meta = document.querySelector("#corpus-dialog-meta");
+    meta.replaceChildren(
+      element("span", "", detail.document_type),
+      element("span", "", detail.folder),
+      element("span", `map-state ${detail.map_status}`, mapStatusLabels[detail.map_status] || detail.map_status),
+      element("span", "", formatBytes(detail.size_bytes)),
+    );
+    document.querySelector("#corpus-dialog-summary").textContent = detail.plain_summary;
+
+    const preview = document.querySelector("#corpus-dialog-preview");
+    preview.replaceChildren(element("h3", "", "代表性正文节选"));
+    if (detail.content_preview?.length) {
+      detail.content_preview.forEach((item) => {
+        const block = element("article", "corpus-preview-item");
+        block.append(
+          element("strong", "", item.label || "正文片段"),
+          element("p", "", item.text),
+        );
+        preview.append(block);
+      });
+    } else {
+      preview.append(
+        element(
+          "p",
+          "muted",
+          "这是较早生成的扫描，没有保存代表性正文节选；请重新生成资料地图后查看。",
+        ),
+      );
+    }
+
+    const outline = document.querySelector("#corpus-dialog-outline");
+    outline.replaceChildren(element("h3", "", "文档结构"));
+    if (detail.outline.length) {
+      const list = document.createElement("ul");
+      detail.outline.forEach((item) => list.append(element("li", "", item)));
+      outline.append(list);
+    } else {
+      outline.append(element("p", "muted", "这份资料没有可识别的标题目录。"));
+    }
+
+    const signals = document.querySelector("#corpus-dialog-signals");
+    signals.replaceChildren(
+      element("h3", "", "系统读到的关键信号"),
+      element("p", "", `读取 ${formatNumber(detail.key_signals.content_units)} 个内容单元，约 ${formatNumber(detail.key_signals.character_count)} 个字符。`),
+    );
+    if (detail.key_signals.dates?.length) {
+      signals.append(element("p", "", `出现的日期：${detail.key_signals.dates.join("、")}`));
+    }
+    if (detail.key_signals.version_markers?.length) {
+      signals.append(element("p", "", `版本字样：${detail.key_signals.version_markers.join("、")}`));
+    }
+
+    const relations = document.querySelector("#corpus-dialog-relations");
+    relations.replaceChildren(element("h3", "", "与其他文件的关系"));
+    if (!detail.relations.length) {
+      relations.append(
+        element(
+          "p",
+          "muted",
+          "目前只检查了内容完全相同的重复文件和按文件名判断的版本候选，暂未发现对应关系。",
+        ),
+      );
+    } else {
+      detail.relations.forEach((relation) => {
+        const relationCard = element("article", "corpus-relation-card");
+        const relationButton = button(
+          "查看对方说明",
+          "quiet-button",
+          () => openCorpusCard(relation.other_file_id),
+        );
+        relationButton.setAttribute(
+          "aria-label",
+          `查看${relation.other_title}的说明`,
+        );
+        relationCard.append(
+          element("strong", "", relation.other_title),
+          element("p", "", relation.plain_reason),
+          relationButton,
+        );
+        relations.append(relationCard);
+      });
+    }
+    document.querySelector("#corpus-decision-file-id").value = detail.file_id;
+    document.querySelector("#corpus-decision-scope").value =
+      detail.scope_status === "out_of_scope" ? "out_of_scope" : "in_scope";
+    document.querySelector("#corpus-decision-authority").value = detail.authority_status;
+    document.querySelector("#corpus-decision-reason").value = detail.decision_reason || "";
+    const includeOption = document.querySelector('#corpus-decision-scope option[value="in_scope"]');
+    includeOption.disabled = detail.risk_flags.includes("credential_material");
+    if (includeOption.disabled) {
+      document.querySelector("#corpus-decision-scope").value = "out_of_scope";
+    }
+    const importPanel = document.querySelector("#corpus-import-form");
+    document.querySelector("#corpus-import-file-id").value = detail.file_id;
+    const importNote = document.querySelector("#corpus-import-note");
+    const authorityReady = ["reference", "authoritative"].includes(detail.authority_status);
+    const canImport =
+      detail.scope_status === "in_scope"
+      && authorityReady
+      && !detail.imported
+      && !detail.risk_flags.includes("credential_material");
+    if (detail.imported) {
+      importPanel.hidden = false;
+      document.querySelector("#corpus-import-classification-field").hidden = true;
+      document.querySelector("#corpus-import-submit").hidden = true;
+      importNote.textContent = "这份资料已经进入知识编译链路。后续文件内容变化时会要求重新扫描和确认，不会静默覆盖。";
+    } else {
+      document.querySelector("#corpus-import-classification-field").hidden = false;
+      document.querySelector("#corpus-import-submit").hidden = false;
+      importPanel.hidden = !canImport;
+      importNote.textContent = "这是单独的明确操作：系统会复制只读原件并生成可追溯知识，不会修改源文件。";
+    }
+    const dialog = document.querySelector("#corpus-dialog");
+    if (!dialog.open) dialog.showModal();
+  } catch (cause) {
+    if (!corpusCardRequestGuard.isLatest(requestToken)) return;
+    showBanner(cause instanceof Error ? cause.message : "文档说明卡读取失败");
+  }
 }
 
 function queueColumn(title, page, describe) {
@@ -243,7 +879,9 @@ function button(label, className, action) {
 function actorValue() {
   const actor = document.querySelector("#actor").value.trim();
   if (!actor) {
-    showBanner("请先填写操作者，例如 reviewer-01");
+    const management = document.querySelector(".management-menu");
+    if (management) management.open = true;
+    showBanner("请先在“管理与维护”中填写操作者，例如 ZZ");
     document.querySelector("#actor").focus();
     throw new Error("actor-required");
   }
@@ -269,6 +907,381 @@ async function postTransition(path, payload) {
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || `操作失败（HTTP ${response.status}）`);
   return result;
+}
+
+function qaWelcomeMessage() {
+  const message = element("div", "qa-empty-conversation");
+  message.append(
+    element("span", "empty-chat-icon nav-icon icon-chat", ""),
+    element("strong", "", "不需要记住文件名"),
+    element(
+      "p",
+      "",
+      "直接描述业务问题即可。答案出现后，所用知识主题和原始资料会显示在右侧。",
+    ),
+  );
+  return message;
+}
+
+function plainLocator(locator = {}) {
+  const parts = [];
+  if (locator.page) parts.push(`第 ${locator.page} 页`);
+  if (locator.section) parts.push(`章节“${locator.section}”`);
+  if (locator.heading_path) {
+    const headings = Array.isArray(locator.heading_path) ? locator.heading_path.join(" → ") : locator.heading_path;
+    if (headings) parts.push(`章节“${headings}”`);
+  }
+  if (locator.sheet) parts.push(`工作表“${locator.sheet}”`);
+  if (locator.cell_range) parts.push(`单元格 ${locator.cell_range}`);
+  if (locator.slide) parts.push(`第 ${locator.slide} 张幻灯片`);
+  if (locator.line_start) {
+    const end = locator.line_end && locator.line_end !== locator.line_start ? `–${locator.line_end}` : "";
+    parts.push(`第 ${locator.line_start}${end} 行`);
+  }
+  if (locator.paragraph) parts.push(`第 ${locator.paragraph} 段`);
+  if (locator.table) parts.push(`第 ${locator.table} 个表格`);
+  if (locator.row) parts.push(`第 ${locator.row} 行`);
+  return [...new Set(parts)].join(" · ") || "文件内位置已记录";
+}
+
+function qaCitationCard(citation, index) {
+  const card = element("article", "qa-citation");
+  const header = document.createElement("header");
+  header.append(
+    element("strong", "", `依据 ${index + 1} · ${citation.document_name}`),
+    element("span", `tag ${citation.classification}`, citation.classification),
+  );
+  const excerpt = citation.excerpt_truncated ? `${citation.excerpt}…` : citation.excerpt;
+  const footer = document.createElement("footer");
+  footer.append(
+    element("span", "qa-source-location", `${plainLocator(citation.locator)} · ${citation.knowledge_scope || "正式业务资料"}`),
+    button("查看原文与位置", "", () => openEvidence(citation.evidence_id)),
+  );
+  card.append(header, element("blockquote", "", excerpt), footer);
+  return card;
+}
+
+function qaWikiCard(match) {
+  const card = element("article", "qa-wiki-card");
+  const header = document.createElement("header");
+  header.append(
+    element("strong", "", match.page_title),
+    element("span", "state ok", match.authority_status === "authoritative" ? "当前权威资料" : "正式知识页"),
+  );
+  const excerpt = match.excerpt_truncated ? `${match.excerpt}…` : match.excerpt;
+  card.append(
+    header,
+    element("small", "", `相关章节：${match.section_title} · 来源：${match.document_name}`),
+    element("p", "", excerpt),
+  );
+  return card;
+}
+
+function qaKnowledgePath(steps, interactionRoute = "knowledge") {
+  const section = element("section", "qa-knowledge-path");
+  const headings = {
+    greeting: "我是这样理解的",
+    external_realtime: "当前能力边界",
+    workspace_status: "我读取了这些实时状态",
+    advisory: "我是这样分析的",
+    clarification: "我需要先确认一点",
+    model_out_of_scope: "我判断了问题范围",
+  };
+  section.append(
+    element(
+      "strong",
+      "",
+      headings[interactionRoute] || "我是这样查到的",
+    ),
+  );
+  const list = document.createElement("ol");
+  steps.forEach((step) => {
+    const item = element("li", `qa-path-step ${step.status || ""}`);
+    item.append(
+      element("span", "qa-path-marker", step.status === "found" ? "✓" : "·"),
+      element("div", "", ""),
+    );
+    item.lastChild.append(
+      element("strong", "", step.title),
+      element("p", "", step.detail),
+    );
+    list.append(item);
+  });
+  section.append(list);
+  return section;
+}
+
+function qaEntityRelations(context) {
+  if (!context?.relationships?.length) return null;
+  const section = element("section", "qa-entity-relations");
+  section.append(element("strong", "", "与问题相关的业务关系"));
+  context.relationships.slice(0, 6).forEach((relationship) => {
+    section.append(
+      element(
+        "div",
+        "qa-relation-row",
+        `${relationship.source_name}  —${relationship.label}→  ${relationship.target_name}`,
+      ),
+    );
+  });
+  return section;
+}
+
+function qaSuggestions(items) {
+  if (!items?.length) return null;
+  const section = element("section", "qa-suggestions");
+  section.append(element("strong", "", "你还可以继续问"));
+  const choices = element("div", "qa-suggestion-list");
+  items.forEach((suggestion) => {
+    choices.append(button(suggestion, "qa-suggestion", () => {
+      const input = document.querySelector("#qa-question");
+      input.value = suggestion;
+      document.querySelector("#qa-character-count").textContent = String(suggestion.length);
+      input.focus();
+    }));
+  });
+  section.append(choices);
+  return section;
+}
+
+function fillQaQuestion(question) {
+  const input = document.querySelector("#qa-question");
+  input.value = question;
+  document.querySelector("#qa-character-count").textContent = String(question.length);
+  input.focus();
+}
+
+function renderQaFollowUps(items = null) {
+  const suggestions = Array.isArray(items) && items.length
+    ? items
+    : qaStarterSuggestions[qaState.suggestionPage % qaStarterSuggestions.length];
+  const root = document.querySelector("#qa-follow-ups");
+  root.replaceChildren();
+  suggestions.slice(0, 4).forEach((suggestion) => {
+    root.append(button(suggestion, "qa-follow-up", () => fillQaQuestion(suggestion)));
+  });
+}
+
+function qaSourceEmpty(message = "提交问题后，可以从这里打开知识主题或核对原始资料。") {
+  const empty = element("div", "qa-source-empty");
+  empty.append(
+    element("span", "nav-icon icon-document", ""),
+    element("strong", "", "来源会显示在这里"),
+    element("p", "", message),
+  );
+  return empty;
+}
+
+function qaSourceCard(item, kind, index) {
+  const card = element("article", `qa-source-card source-tone-${(index % 4) + 1}`);
+  const heading = document.createElement("header");
+  heading.append(
+    element("span", "qa-source-type-icon nav-icon icon-document", ""),
+    element("strong", "", kind === "topic" ? item.page_title : item.document_name),
+  );
+  const label = kind === "topic"
+    ? (item.authority_status === "authoritative" ? "当前权威知识主题" : "正式知识主题")
+    : (classificationLabels[item.classification] || "原始资料");
+  card.append(
+    heading,
+    element("span", "qa-source-kind", label),
+    element(
+      "p",
+      "",
+      kind === "topic"
+        ? `${item.section_title || "相关章节"} · ${item.excerpt || "本次回答使用了该主题。"}`
+        : `${plainLocator(item.locator)} · ${item.excerpt || "原文位置已记录"}`,
+    ),
+  );
+  if (kind === "evidence" && item.evidence_id) {
+    card.append(button("查看原文", "qa-source-open", () => openEvidence(item.evidence_id)));
+  } else if (kind === "topic" && item.revision_id) {
+    card.append(button("查看主题", "qa-source-open", () => openRevision(item.revision_id)));
+  }
+  return card;
+}
+
+function renderQaSources(result) {
+  const root = document.querySelector("#qa-source-list");
+  root.replaceChildren();
+  const topics = Array.isArray(result?.wiki_matches) ? result.wiki_matches : [];
+  const citations = Array.isArray(result?.citations) ? result.citations : [];
+  [...topics.map((item) => ["topic", item]), ...citations.map((item) => ["evidence", item])]
+    .slice(0, 8)
+    .forEach(([kind, item], index) => root.append(qaSourceCard(item, kind, index)));
+  if (!root.children.length) {
+    root.append(
+      qaSourceEmpty(
+        result?.retrieval?.interaction_route === "workspace_status"
+          ? "这个回答直接读取本机工作区状态，没有引用业务资料。"
+          : "这次回答没有使用可展开的资料来源。",
+      ),
+    );
+  }
+}
+
+function qaConflictCard(conflict) {
+  const card = element("article", "qa-conflict");
+  card.append(
+    element("strong", "", `需要人工判断 · ${conflictTypeLabels[conflict.conflict_type] || "不同资料说法不一致"}`),
+    element("p", "", `${conflict.document_name} · ${conflict.reason}`),
+    element("div", "qa-conflict-side", `证据 A ${shortId(conflict.older.evidence_id)}\n${conflict.older.excerpt}`),
+    element("div", "qa-conflict-side", `证据 B ${shortId(conflict.newer.evidence_id)}\n${conflict.newer.excerpt}`),
+  );
+  return card;
+}
+
+function qaAmbiguityCard(ambiguity) {
+  const card = element("article", "qa-conflict");
+  card.append(
+    element("strong", "", "检测到多个数值"),
+    element("p", "", "这些差异尚未登记为人工确认冲突，请不要直接选取其中一个。"),
+  );
+  ambiguity.values.forEach((item) => {
+    card.append(
+      element(
+        "div",
+        "qa-conflict-side",
+        `${item.value} · 支撑证据 ${item.evidence_ids.map(shortId).join("、")}`,
+      ),
+    );
+  });
+  return card;
+}
+
+function appendQaMessage(role, text, result = null) {
+  const root = document.querySelector("#qa-messages");
+  root.querySelector(".qa-empty-conversation")?.remove();
+  const message = element("div", `qa-message ${role}`);
+  message.append(element("div", "qa-avatar", role === "user" ? "你" : "知"));
+  const bubble = element("div", "qa-bubble");
+  bubble.append(
+    element("strong", "", role === "user" ? "你的问题" : "知识助手"),
+    element("p", "", text),
+  );
+  if (result) {
+    const relations = qaEntityRelations(result.entity_context);
+    if (relations) bubble.append(relations);
+    if (result.conflicts?.length) {
+      const conflicts = element("div", "qa-conflicts");
+      result.conflicts.forEach((item) => conflicts.append(qaConflictCard(item)));
+      bubble.append(conflicts);
+    }
+    if (result.ambiguities?.length) {
+      const ambiguities = element("div", "qa-conflicts");
+      result.ambiguities.forEach((item) => ambiguities.append(qaAmbiguityCard(item)));
+      bubble.append(ambiguities);
+    }
+    renderQaSources(result);
+    renderQaFollowUps(result.follow_up_suggestions);
+  }
+  message.append(bubble);
+  root.append(message);
+  root.scrollTop = root.scrollHeight;
+}
+
+function qaRetrievalStatus(metadata) {
+  const route = metadata.interaction_route;
+  if (route === "greeting") return "会话导航";
+  if (route === "external_realtime") return "能力边界 · 未查询实时外部数据";
+  if (route === "workspace_status") {
+    const inventory = metadata.workspace_inventory || {};
+    return `工作区实时统计 · ${formatNumber(inventory.formal_document_count)} 份正式资料 · ${formatNumber(inventory.qualified_evidence_count)} 条可回溯依据 · ${formatNumber(inventory.published_topic_count)} 个正式主题`;
+  }
+  if (route === "advisory") {
+    return `全局知识分析 · ${formatNumber(metadata.wiki_match_count)} 个引用主题 · ${formatNumber(metadata.eligible_document_count)} 份正式资料`;
+  }
+  if (route === "clarification") {
+    return "智能体理解 · 需要补充一个关键信息";
+  }
+  if (route === "model_out_of_scope") {
+    return "智能体理解 · 当前知识与能力范围外";
+  }
+  return `本机查找 · ${formatNumber(metadata.eligible_document_count)} 份正式资料 · ${formatNumber(metadata.wiki_match_count)} 个相关知识章节`;
+}
+
+function qaModelStatus(metadata) {
+  const route = metadata.interaction_route;
+  if (route === "greeting") return "问候无需调用 DeepSeek";
+  if (route === "external_realtime") return "没有实时数据源，未让模型猜测";
+  if (route === "workspace_status") return "直接读取 SQLite，未让模型猜测";
+  if (metadata.cloud_model_used) return "DeepSeek 已综合并通过校验";
+  if (!metadata.cloud_model_requested) return "本地摘录回答";
+  const reasons = {
+    not_configured: "DeepSeek 未绑定，已回退本地回答",
+    answer_not_eligible: "证据不足或存在歧义，未发送到 DeepSeek",
+    policy_denied: "密级策略阻止云调用，已回退本地回答",
+    provider_error: "DeepSeek 超时或调用失败，已回退本地回答",
+    invalid_model_output: "DeepSeek 回答未通过校验，已回退本地回答",
+    not_needed_for_greeting: "问候无需调用 DeepSeek",
+    external_realtime_unavailable: "没有实时数据源，未让模型猜测",
+    workspace_status_local: "直接读取 SQLite，未让模型猜测",
+  };
+  return reasons[metadata.cloud_model_fallback_reason]
+    || "DeepSeek 未用于最终回答，已回退本地回答";
+}
+
+function configureDeepSeek(provider = {}) {
+  const configured = provider.configured === true;
+  qaState.deepseekConfigured = configured;
+  const checkbox = document.querySelector("#qa-use-deepseek");
+  const status = document.querySelector("#qa-deepseek-status");
+  checkbox.checked = configured;
+  checkbox.disabled = !configured;
+  status.textContent = configured
+    ? "已绑定；默认用于每次提问，可在发送前取消。本次提交会记录云调用审计。"
+    : "尚未绑定 DEEPSEEK_API_KEY；当前只能使用本地摘录回答";
+}
+
+async function askKnowledgeQuestion(question, allowDeepSeekOnce = false) {
+  if (qaState.busy) return;
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const history = qaState.history.slice(-6);
+  qaState.busy = true;
+  const submit = document.querySelector("#qa-submit");
+  submit.disabled = true;
+  submit.classList.add("loading");
+  submit.setAttribute(
+    "aria-label",
+    allowDeepSeekOnce ? "正在查找资料并综合回答" : "正在查找知识主题和原始资料",
+  );
+  appendQaMessage("user", question);
+  try {
+    const payload = await postTransition("/api/v1/qa/ask", {
+      actor,
+      question,
+      history,
+      limit: 5,
+      allow_deepseek_once: allowDeepSeekOnce,
+    });
+    const result = payload.result;
+    appendQaMessage("assistant", result.answer, result);
+    qaState.history.push(
+      { role: "user", content: question },
+      { role: "assistant", content: result.answer },
+    );
+    qaState.history = qaState.history.slice(-6);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : "知识问答失败";
+    appendQaMessage("assistant", `本次问题未完成：${message}`);
+    showBanner(message);
+  } finally {
+    qaState.busy = false;
+    submit.disabled = false;
+    submit.classList.remove("loading");
+    submit.setAttribute("aria-label", "发送问题");
+  }
+}
+
+function resetQaConversation() {
+  qaState.history = [];
+  document.querySelector("#qa-messages").replaceChildren(qaWelcomeMessage());
+  document.querySelector("#qa-question").value = "";
+  document.querySelector("#qa-character-count").textContent = "0";
+  document.querySelector("#qa-use-deepseek").checked = qaState.deepseekConfigured;
+  document.querySelector("#qa-source-list").replaceChildren(qaSourceEmpty());
+  renderQaFollowUps();
 }
 
 async function transitionEvidence(evidenceId, target, label) {
@@ -300,7 +1313,7 @@ async function openEvidence(evidenceId) {
     actions.replaceChildren();
     const definitions = {
       draft: [["提交审核", "reviewing", "primary"]],
-      reviewing: [["审核通过", "verified", "primary"], ["退回草稿", "draft", ""], ["标记冲突", "conflicted", "danger"]],
+      reviewing: [["确认技术校验通过", "verified", "primary"], ["退回待校验", "draft", ""], ["标记冲突", "conflicted", "danger"]],
       conflicted: [["重新进入审核", "reviewing", "primary"]],
     };
     (definitions[detail.status] || []).forEach(([label, target, className]) => {
@@ -391,7 +1404,9 @@ async function openRevision(revisionId) {
     const detail = await response.json();
     if (!response.ok) throw new Error(detail.error || "无法读取 Wiki 修订详情");
     document.querySelector("#revision-dialog-title").textContent = detail.page_title;
-    document.querySelector("#revision-dialog-meta").textContent = `${detail.classification} · 修订 ${detail.revision_number} · ${statusLabels[detail.status] || detail.status} · ${detail.generator}`;
+    const classificationLabel = classificationLabels[detail.classification] || "资料密级待确认";
+    const revisionStatusLabel = wikiStatusLabels[detail.status] || "状态待确认";
+    document.querySelector("#revision-dialog-meta").textContent = `${classificationLabel} · 第 ${detail.revision_number} 版 · ${revisionStatusLabel} · ${detail.generator_label || "系统整理"}`;
     const evidenceSummary = Object.entries(detail.evidence_by_status)
       .map(([status, count]) => `${statusLabels[status] || status} ${count}`)
       .join("，");
@@ -407,8 +1422,8 @@ async function openRevision(revisionId) {
         : "该修订正在复核，但尚未满足正式发布条件。";
       notice.hidden = false;
     } else {
-      notice.hidden = true;
-      notice.textContent = "";
+      notice.textContent = "这里显示的是便于阅读的正文预览；证据标记和内部字段仍保留在原始 Wiki 文件中。";
+      notice.hidden = false;
     }
     const actions = document.querySelector("#revision-dialog-actions");
     actions.replaceChildren();
@@ -455,20 +1470,7 @@ async function openRevision(revisionId) {
 
 function renderReviews(queue) {
   const columns = document.querySelector("#review-columns");
-  const evidenceColumn = queueColumn("原子证据", queue.evidence, (item) => [item.document_name, `${statusLabels[item.status] || item.status} · #${item.ordinal}`]);
-  evidenceColumn.querySelectorAll(".queue-item").forEach((card, index) => {
-    const item = queue.evidence.items[index];
-    if (!item) return;
-    const actions = element("div", "queue-actions");
-    if (item.classification === "restricted") {
-      actions.append(element("small", "", "请回原文件并通过 CLI 审核"));
-    } else {
-      actions.append(button("查看并审核", "primary", () => openEvidence(item.evidence_id)));
-    }
-    card.append(actions);
-  });
-
-  const conflictColumn = queueColumn("潜在冲突", queue.conflicts, (item) => [item.document_name, `${item.conflict_type} · ${statusLabels[item.status] || item.status}`]);
+  const conflictColumn = queueColumn("需要判断的冲突", queue.conflicts, (item) => [item.document_name, `${item.conflict_type} · ${statusLabels[item.status] || item.status}`]);
   conflictColumn.querySelectorAll(".queue-item").forEach((card, index) => {
     const item = queue.conflicts.items[index];
     if (!item) return;
@@ -494,7 +1496,7 @@ function renderReviews(queue) {
     card.append(actions);
   });
 
-  const wikiColumn = queueColumn("Wiki 修订", queue.wiki_revisions, (item) => [item.page_title, `修订 ${item.revision_number} · ${statusLabels[item.status] || item.status}`]);
+  const wikiColumn = queueColumn("需要确认的 Wiki 结论", queue.wiki_revisions, (item) => [item.page_title, `第 ${item.revision_number} 版 · ${wikiStatusLabels[item.status] || item.status}`]);
   wikiColumn.querySelectorAll(".queue-item").forEach((card, index) => {
     const item = queue.wiki_revisions.items[index];
     if (!item) return;
@@ -506,7 +1508,7 @@ function renderReviews(queue) {
     }
     card.append(actions);
   });
-  columns.replaceChildren(evidenceColumn, conflictColumn, wikiColumn);
+  columns.replaceChildren(conflictColumn, wikiColumn);
 }
 
 function renderRejectedHistory(page) {
@@ -972,7 +1974,7 @@ function renderEntityRelationshipEvidence(page) {
   root.replaceChildren();
   document.querySelector("#entity-relationship-evidence-summary").textContent = page.total
     ? `${page.total} 条共同证据；当前显示 ${page.items.length} 条`
-    : "没有同时关联两个实体的当前 verified 非受限证据";
+    : "没有同时关联两个实体且技术校验通过的当前非受限证据";
   if (!page.items.length) {
     root.append(element("span", "muted", "暂无可选证据"));
     return;
@@ -1085,7 +2087,7 @@ function renderEntityRelationships(page) {
     const support = element(
       "div",
       "relationship-support",
-      `历史证据 ${relationship.supporting_evidence_count} 条 · 当前 verified ${relationship.current_verified_supporting_evidence_count} 条 · 登记人 ${relationship.created_by} · ${formatTime(relationship.created_at)}`,
+      `历史证据 ${relationship.supporting_evidence_count} 条 · 当前技术校验通过 ${relationship.current_verified_supporting_evidence_count} 条 · 登记人 ${relationship.created_by} · ${formatTime(relationship.created_at)}`,
     );
     card.append(heading, route, support);
     if (relationship.status === "active") {
@@ -1522,9 +2524,9 @@ function renderGraphPilotPage(page) {
       summary.source_snapshot_passed ? "ok" : "danger",
     ),
     graphPilotProgress(
-      "证据审核",
+      "证据技术校验",
       `${Math.round(summary.verified_evidence_coverage * 100)}%`,
-      `${summary.verified_evidence_count} 条 verified · ${summary.status_counts.draft || 0} 条 draft`,
+      `${summary.verified_evidence_count} 条技术校验通过 · ${summary.status_counts.draft || 0} 条待校验`,
       summary.evidence_review_complete ? "ok" : "warn",
     ),
     graphPilotProgress(
@@ -1615,7 +2617,7 @@ async function loadGraphPilotPacks() {
   selector.replaceChildren();
   listing.items.forEach((item) => {
     const summary = item.summary;
-    const option = element("option", "", `${item.source_labeling_session_name} · verified ${summary.verified_evidence_count}/${summary.candidate_count}`);
+    const option = element("option", "", `${item.source_labeling_session_name} · 技术校验通过 ${summary.verified_evidence_count}/${summary.candidate_count}`);
     option.value = item.pack_id;
     selector.append(option);
   });
@@ -1680,11 +2682,17 @@ async function loadDashboard() {
   sync.classList.remove("ready");
   sync.lastChild.textContent = "正在读取";
   error.hidden = true;
+  renderKnowledgeSetupLoading();
+  const knowledgeSetupLoad = loadKnowledgeSetup().catch(() => {
+    renderKnowledgeSetupError();
+  });
   try {
     const response = await fetch("/api/v1/bootstrap", { headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error(`读取失败（HTTP ${response.status}）`);
     const data = await response.json();
     csrfToken = data.web.csrf_token;
+    configureDeepSeek(data.web.providers?.deepseek);
+    renderCorpusMap(data.corpus_map);
     renderSummary(data.summary);
     renderDocuments(data.documents);
     const candidateLoad = loadCandidatePacks().catch((cause) => {
@@ -1721,7 +2729,15 @@ async function loadDashboard() {
       document.querySelector("#entity-relationship-pagination").replaceChildren();
       showBanner(message);
     });
-    await Promise.all([loadReviewQueues(), graphPilotLoad, candidateLoad, entityCandidateLoad, entityMergeLoad, entityRelationshipLoad]);
+    await Promise.all([
+      knowledgeSetupLoad,
+      loadReviewQueues(),
+      graphPilotLoad,
+      candidateLoad,
+      entityCandidateLoad,
+      entityMergeLoad,
+      entityRelationshipLoad,
+    ]);
     renderEvaluations(data.evaluations);
     renderActivity(data.activity);
     sync.classList.add("ready");
@@ -1736,12 +2752,123 @@ async function loadDashboard() {
 }
 
 document.querySelector("#refresh").addEventListener("click", loadDashboard);
+document.querySelector("#corpus-scan-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const root = document.querySelector("#corpus-root").value.trim();
+  const projectName = document.querySelector("#corpus-project").value.trim();
+  if (!root) {
+    showBanner("请填写需要读取的资料目录");
+    document.querySelector("#corpus-root").focus();
+    return;
+  }
+  const submit = document.querySelector("#corpus-scan-submit");
+  submit.disabled = true;
+  submit.textContent = "正在只读整理资料…";
+  try {
+    const response = await postTransition("/api/v1/corpus-map/scan", {
+      actor,
+      root,
+      project_name: projectName || null,
+      allow_legacy_word_conversion: document.querySelector("#corpus-legacy-word").checked,
+    });
+    corpusState.offset = 0;
+    corpusState.folder = "";
+    corpusState.scope = "";
+    corpusState.query = "";
+    await loadDashboard();
+    showBanner(`资料地图已生成：${formatNumber(response.file_count)} 份文件，未导入知识库。`, true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "资料地图生成失败");
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "只读生成资料地图";
+  }
+});
+document.querySelector("#corpus-filters").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  corpusState.folder = document.querySelector("#corpus-folder").value;
+  corpusState.scope = document.querySelector("#corpus-scope").value;
+  corpusState.query = document.querySelector("#corpus-query").value.trim();
+  corpusState.offset = 0;
+  try { await refreshCorpusMap(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "资料地图筛选失败");
+  }
+});
+document.querySelector("#clear-corpus-filters").addEventListener("click", async () => {
+  document.querySelector("#corpus-filters").reset();
+  corpusState.folder = "";
+  corpusState.scope = "";
+  corpusState.query = "";
+  corpusState.view = "all";
+  corpusState.offset = 0;
+  try { await refreshCorpusMap(); } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "资料地图读取失败");
+  }
+});
+document.querySelector("#corpus-decision-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const fileId = document.querySelector("#corpus-decision-file-id").value;
+  const reason = document.querySelector("#corpus-decision-reason").value.trim();
+  if (!reason) {
+    showBanner("请用一句话说明为什么纳入或不纳入");
+    document.querySelector("#corpus-decision-reason").focus();
+    return;
+  }
+  try {
+    await postTransition(`/api/v1/corpus-files/${encodeURIComponent(fileId)}/decide`, {
+      actor,
+      scope_status: document.querySelector("#corpus-decision-scope").value,
+      authority_status: document.querySelector("#corpus-decision-authority").value,
+      reason,
+    });
+    document.querySelector("#corpus-dialog").close();
+    await refreshCorpusMap();
+    await loadKnowledgeSetup().catch(() => {
+      renderKnowledgeSetupError();
+    });
+    showBanner("资料范围和权威性判断已保存，但文件尚未导入知识库。", true);
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "资料范围判断保存失败");
+  }
+});
+document.querySelector("#corpus-import-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let actor;
+  try { actor = actorValue(); } catch { return; }
+  const fileId = document.querySelector("#corpus-import-file-id").value;
+  const submit = document.querySelector("#corpus-import-submit");
+  submit.disabled = true;
+  submit.textContent = "正在导入并生成可追溯知识…";
+  try {
+    const response = await postTransition(`/api/v1/corpus-files/${encodeURIComponent(fileId)}/import`, {
+      actor,
+      classification: document.querySelector("#corpus-import-classification").value,
+    });
+    document.querySelector("#corpus-dialog").close();
+    await loadDashboard();
+    const nextStep = response.next_action === "ready"
+      ? "现有正式 Wiki 仍然有效，可以直接问答。"
+      : "无需逐条人工勾选依据；下一步只需复核 Wiki 结论。";
+    showBanner(
+      `资料已导入：${formatNumber(response.technically_validated_evidence_count)} 条依据已由系统完成技术校验。${nextStep}`,
+      true,
+    );
+  } catch (cause) {
+    showBanner(cause instanceof Error ? cause.message : "资料导入失败");
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "确认导入并生成知识";
+  }
+});
 document.querySelector("#review-filters").addEventListener("submit", async (event) => {
   event.preventDefault();
   reviewState.filters.query = document.querySelector("#review-query").value.trim();
   reviewState.filters.classification = document.querySelector("#review-classification").value;
   reviewState.filters.statuses = {
-    evidence: document.querySelector("#evidence-review-status").value,
     conflicts: document.querySelector("#conflict-review-status").value,
     wiki_revisions: document.querySelector("#wiki-review-status").value,
   };
@@ -1754,7 +2881,7 @@ document.querySelector("#clear-review-filters").addEventListener("click", async 
   reviewState.filters = {
     query: "",
     classification: "",
-    statuses: { evidence: "", conflicts: "", wiki_revisions: "" },
+    statuses: { conflicts: "", wiki_revisions: "" },
   };
   reviewKinds.forEach((kind) => { reviewState.offsets[kind] = 0; });
   reviewState.historyOffset = 0;
@@ -1881,7 +3008,7 @@ document.querySelector("#entity-relationship-create").addEventListener("submit",
     return;
   }
   if (!evidenceIds.length) {
-    showBanner("请至少选择一条共同 verified 证据");
+    showBanner("请至少选择一条共同的技术校验通过证据");
     return;
   }
   if (!note) {
@@ -1895,7 +3022,7 @@ document.querySelector("#entity-relationship-create").addEventListener("submit",
     confirmationInput.focus();
     return;
   }
-  if (!window.confirm(`确认登记该业务关系并引用 ${evidenceIds.length} 条已验证证据？`)) return;
+  if (!window.confirm(`确认登记该业务关系并引用 ${evidenceIds.length} 条技术校验通过证据？`)) return;
   try {
     await postTransition("/api/v1/entity-relationships/create", {
       actor,
@@ -1982,12 +3109,92 @@ document.querySelector("#clear-candidate-filters").addEventListener("click", asy
     showBanner(cause instanceof Error ? cause.message : "候选包读取失败");
   }
 });
+document.querySelector("#qa-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.querySelector("#qa-question");
+  const question = input.value.trim();
+  if (question.length < 2) {
+    showBanner("问题至少需要 2 个字符");
+    input.focus();
+    return;
+  }
+  const deepseek = document.querySelector("#qa-use-deepseek");
+  const allowDeepSeekOnce = qaState.deepseekConfigured && deepseek.checked;
+  deepseek.checked = qaState.deepseekConfigured;
+  input.value = "";
+  document.querySelector("#qa-character-count").textContent = "0";
+  await askKnowledgeQuestion(question, allowDeepSeekOnce);
+});
+document.querySelector("#qa-question").addEventListener("input", (event) => {
+  document.querySelector("#qa-character-count").textContent = String(event.target.value.length);
+});
+document.querySelector("#qa-question").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    document.querySelector("#qa-form").requestSubmit();
+  }
+});
+document.querySelector("#qa-clear").addEventListener("click", resetQaConversation);
+document.querySelector("#qa-refresh-suggestions").addEventListener("click", () => {
+  qaState.suggestionPage += 1;
+  renderQaFollowUps();
+});
+const corpusDialog = document.querySelector("#corpus-dialog");
+document.querySelector("#close-corpus-dialog").addEventListener("click", () => {
+  corpusCardRequestGuard.invalidate();
+  corpusDialog.close();
+});
+corpusDialog.addEventListener("cancel", () => {
+  corpusCardRequestGuard.invalidate();
+});
+corpusDialog.addEventListener("close", () => {
+  corpusCardRequestGuard.invalidate();
+});
 document.querySelector("#close-evidence-dialog").addEventListener("click", () => document.querySelector("#evidence-dialog").close());
 document.querySelector("#close-revision-dialog").addEventListener("click", () => document.querySelector("#revision-dialog").close());
-document.querySelectorAll(".nav-item").forEach((item) => {
-  item.addEventListener("click", () => {
-    document.querySelectorAll(".nav-item").forEach((entry) => entry.classList.remove("active"));
-    item.classList.add("active");
+
+function activateWorkspaceView(viewId, updateLocation = true) {
+  const fallback = "qa";
+  const target = document.getElementById(viewId) ? viewId : fallback;
+  document.querySelectorAll("main > section[id]").forEach((section) => {
+    section.classList.toggle("view-active", section.id === target);
+  });
+  document.querySelectorAll(".nav-item").forEach((item) => {
+    item.classList.toggle("active", item.getAttribute("href") === `#${target}`);
+  });
+  const management = document.querySelector(".management-menu");
+  const managementTarget = Boolean(
+    document.querySelector(`.management-navigation a[href="#${target}"]`),
+  );
+  if (management) management.open = managementTarget;
+  if (updateLocation && window.location.hash !== `#${target}`) {
+    window.history.pushState(null, "", `#${target}`);
+  }
+  window.scrollTo({ top: 0, behavior: "auto" });
+}
+
+document.querySelectorAll(".nav-item, [data-view-link]").forEach((item) => {
+  item.addEventListener("click", (event) => {
+    const viewId = item.getAttribute("href")?.replace(/^#/, "");
+    if (!viewId || !document.getElementById(viewId)) return;
+    event.preventDefault();
+    activateWorkspaceView(viewId);
   });
 });
+window.addEventListener("hashchange", () => {
+  activateWorkspaceView(window.location.hash.replace(/^#/, "") || "qa", false);
+});
+const actorInput = document.querySelector("#actor");
+try {
+  actorInput.value = window.localStorage.getItem("knowledge-workbench-actor") || "";
+  actorInput.addEventListener("input", () => {
+    const value = actorInput.value.trim();
+    if (value) window.localStorage.setItem("knowledge-workbench-actor", value);
+    else window.localStorage.removeItem("knowledge-workbench-actor");
+  });
+} catch (_error) {
+  // The workbench remains usable when the browser blocks local preferences.
+}
+renderQaFollowUps();
+activateWorkspaceView(window.location.hash.replace(/^#/, "") || "qa", false);
 loadDashboard();

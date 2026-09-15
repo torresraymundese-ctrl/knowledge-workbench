@@ -9,6 +9,7 @@ build/
 
 # Local knowledge workspace and secrets
 workspace/
+本地知识库备份/
+.restore-verification-*/
 .env
 *.local.toml
-

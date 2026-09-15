@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .audit import record_event
 from .config import WorkspacePaths
 from .conflict_candidates import (
     cross_document_candidate_page,
@@ -17,6 +20,13 @@ from .conflict_labeling_plan import (
     resolve_conflict_labeling_batch,
 )
 from .conflicts import transition_conflict
+from .corpus_map import (
+    corpus_file_card,
+    decide_corpus_file,
+    import_corpus_file,
+    latest_corpus_map,
+    scan_corpus_source,
+)
 from .database import Database
 from .entity_candidates import accept_entity_candidate, reject_entity_candidate
 from .entity_merges import (
@@ -33,17 +43,48 @@ from .entity_relationships import (
 from .entity_visibility import get_entity_visibility, list_entity_visibility
 from .errors import KnowledgeWorkbenchError
 from .graph_pilot import graph_pilot_pack_page, list_graph_pilot_packs
-from .models import ConflictStatus, EvidenceStatus
+from .models import Classification, ConflictStatus, EvidenceStatus
+from .question_answering import answer_question as answer_knowledge_question
+from .providers import AuditedModelGateway, DeepSeekChatModel
 from .review import (
     publish_revision,
     reject_revision,
     request_revision_review,
     transition_evidence,
 )
+from .topic_wiki import knowledge_setup
 from .utils import sha256_text
 
 
 MAX_WIKI_PREVIEW_CHARACTERS = 50_000
+_TOPIC_CLASSIFICATION_SQL = """
+CASE MAX(
+    CASE d.classification
+        WHEN 'restricted' THEN 4
+        WHEN 'confidential' THEN 3
+        WHEN 'internal' THEN 2
+        ELSE 1
+    END
+)
+    WHEN 4 THEN 'restricted'
+    WHEN 3 THEN 'confidential'
+    WHEN 2 THEN 'internal'
+    ELSE 'public'
+END
+"""
+
+
+def _open_with_default_application(path: Path) -> None:
+    if os.name != "nt":
+        raise KnowledgeWorkbenchError(
+            "当前系统不支持用本机应用打开资料"
+        )
+    try:
+        os.startfile(path)  # type: ignore[attr-defined]
+    except OSError as exc:
+        raise KnowledgeWorkbenchError(
+            "本机应用无法打开这份资料"
+        ) from exc
 
 
 class WorkbenchReadService:
@@ -59,12 +100,38 @@ class WorkbenchReadService:
 
     def bootstrap(self) -> dict[str, Any]:
         return {
+            "corpus_map": self.corpus_map(limit=60),
             "summary": self.summary(),
             "documents": self.documents(limit=12),
-            "review_queue": self.review_queue(limit=12),
             "evaluations": self.evaluations(limit=6),
             "activity": self.activity(limit=8),
         }
+
+    def corpus_map(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        folder: str | None = None,
+        scope_status: str | None = None,
+        query: str | None = None,
+        view: str = "all",
+    ) -> dict[str, Any]:
+        return latest_corpus_map(
+            self.database,
+            limit=limit,
+            offset=offset,
+            folder=folder,
+            scope_status=scope_status,
+            query=query,
+            view=view,
+        )
+
+    def corpus_file_card(self, file_id: str) -> dict[str, Any]:
+        return corpus_file_card(self.database, file_id)
+
+    def knowledge_setup(self) -> dict[str, Any]:
+        return knowledge_setup(self.database)
 
     def conflict_candidate_packs(self) -> dict[str, Any]:
         return list_cross_document_candidate_packs(self.database, self.paths)
@@ -541,7 +608,13 @@ class WorkbenchReadService:
     def summary(self) -> dict[str, Any]:
         with self.database.connect() as connection:
             document_count = connection.execute(
-                "SELECT COUNT(*) FROM documents WHERE current_version_id IS NOT NULL"
+                """
+                SELECT COUNT(*)
+                FROM documents d
+                JOIN document_governance dg ON dg.document_id = d.id
+                WHERE d.current_version_id IS NOT NULL
+                  AND dg.purpose != 'development_fixture'
+                """
             ).fetchone()[0]
             evidence_rows = connection.execute(
                 """
@@ -550,11 +623,21 @@ class WorkbenchReadService:
                 JOIN processing_runs pr
                   ON pr.id = e.processing_run_id AND pr.is_current = 1
                 JOIN documents d ON d.current_version_id = pr.document_version_id
+                JOIN document_governance dg ON dg.document_id = d.id
+                WHERE dg.purpose != 'development_fixture'
                 GROUP BY e.status
                 """
             ).fetchall()
             page_rows = connection.execute(
-                "SELECT status, COUNT(*) AS count FROM wiki_pages GROUP BY status"
+                """
+                SELECT wp.status, COUNT(*) AS count
+                FROM wiki_pages wp
+                LEFT JOIN document_governance dg
+                  ON dg.document_id = wp.source_document_id
+                WHERE wp.source_document_id IS NULL
+                   OR dg.purpose != 'development_fixture'
+                GROUP BY wp.status
+                """
             ).fetchall()
             active_conflicts = connection.execute(
                 "SELECT COUNT(*) FROM conflicts WHERE status IN ('pending', 'reviewing')"
@@ -563,13 +646,47 @@ class WorkbenchReadService:
                 "SELECT COUNT(*) FROM tasks WHERE status IN ('pending', 'running', 'retrying')"
             ).fetchone()[0]
             needs_revalidation = connection.execute(
-                "SELECT COUNT(*) FROM wiki_pages WHERE needs_revalidation = 1"
+                """
+                SELECT COUNT(*)
+                FROM wiki_pages wp
+                LEFT JOIN document_governance dg
+                  ON dg.document_id = wp.source_document_id
+                WHERE wp.needs_revalidation = 1
+                  AND (
+                    wp.source_document_id IS NULL
+                    OR dg.purpose != 'development_fixture'
+                  )
+                """
             ).fetchone()[0]
             approved_labeling_sessions = connection.execute(
                 "SELECT COUNT(*) FROM labeling_sessions WHERE status = 'approved'"
             ).fetchone()[0]
+            governance_rows = connection.execute(
+                """
+                SELECT purpose, scope_status, COUNT(*) AS count
+                FROM document_governance
+                GROUP BY purpose, scope_status
+                """
+            ).fetchall()
+            technically_passed = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM evidence_technical_validation etv
+                JOIN evidence e ON e.id = etv.evidence_id
+                JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id AND pr.is_current = 1
+                JOIN documents d ON d.current_version_id = pr.document_version_id
+                JOIN document_governance dg ON dg.document_id = d.id
+                WHERE etv.status = 'passed'
+                  AND dg.purpose != 'development_fixture'
+                """
+            ).fetchone()[0]
         evidence_by_status = {row["status"]: row["count"] for row in evidence_rows}
         pages_by_status = {row["status"]: row["count"] for row in page_rows}
+        governance = {
+            f"{row['purpose']}:{row['scope_status']}": row["count"]
+            for row in governance_rows
+        }
         return {
             "document_count": document_count,
             "current_evidence_count": sum(evidence_by_status.values()),
@@ -580,6 +697,26 @@ class WorkbenchReadService:
             "active_task_count": active_tasks,
             "needs_revalidation_count": needs_revalidation,
             "approved_labeling_session_count": approved_labeling_sessions,
+            "technically_validated_evidence_count": technically_passed,
+            "development_fixture_count": sum(
+                row["count"]
+                for row in governance_rows
+                if row["purpose"] == "development_fixture"
+            ),
+            "candidate_document_count": sum(
+                row["count"]
+                for row in governance_rows
+                if row["purpose"] == "candidate"
+            ),
+            "production_document_count": sum(
+                row["count"]
+                for row in governance_rows
+                if (
+                    row["purpose"] == "production"
+                    and row["scope_status"] == "in_scope"
+                )
+            ),
+            "business_scope_counts": governance,
             "access_mode": "local-controlled-write",
         }
 
@@ -587,14 +724,24 @@ class WorkbenchReadService:
         limit, offset = _pagination(limit, offset)
         with self.database.connect() as connection:
             total = connection.execute(
-                "SELECT COUNT(*) FROM documents WHERE current_version_id IS NOT NULL"
+                """
+                SELECT COUNT(*)
+                FROM documents d
+                JOIN document_governance dg ON dg.document_id = d.id
+                WHERE d.current_version_id IS NOT NULL
+                  AND dg.purpose != 'development_fixture'
+                """
             ).fetchone()[0]
             rows = connection.execute(
                 """
                 SELECT d.id, d.original_name, d.classification, d.updated_at,
                        dv.id AS version_id, dv.size_bytes, dv.media_type,
                        pr.id AS processing_run_id, pr.parser_name, pr.parser_version,
+                       dg.purpose, dg.scope_status, dg.authority_status,
+                       dg.knowledge_domain,
                        COUNT(e.id) AS evidence_count,
+                       SUM(CASE WHEN etv.status = 'passed' THEN 1 ELSE 0 END)
+                           AS technically_validated_evidence_count,
                        SUM(CASE WHEN e.status = 'reviewing' THEN 1 ELSE 0 END)
                            AS reviewing_evidence_count,
                        SUM(CASE WHEN e.status = 'verified' THEN 1 ELSE 0 END)
@@ -605,8 +752,12 @@ class WorkbenchReadService:
                 JOIN document_versions dv ON dv.id = d.current_version_id
                 JOIN processing_runs pr
                   ON pr.document_version_id = dv.id AND pr.is_current = 1
+                JOIN document_governance dg ON dg.document_id = d.id
                 LEFT JOIN evidence e ON e.processing_run_id = pr.id
+                LEFT JOIN evidence_technical_validation etv
+                  ON etv.evidence_id = e.id
                 LEFT JOIN wiki_pages wp ON wp.source_document_id = d.id
+                WHERE dg.purpose != 'development_fixture'
                 GROUP BY d.id, dv.id, pr.id, wp.id
                 ORDER BY d.updated_at DESC, d.id
                 LIMIT ? OFFSET ?
@@ -630,22 +781,40 @@ class WorkbenchReadService:
                 JOIN processing_runs pr
                   ON pr.id = e.processing_run_id AND pr.is_current = 1
                 JOIN documents d ON d.current_version_id = pr.document_version_id
+                JOIN document_governance dg ON dg.document_id = d.id
                 WHERE e.status IN ('draft', 'reviewing', 'conflicted')
+                  AND dg.purpose != 'development_fixture'
                 """
             ).fetchone()[0]
             conflict_total = connection.execute(
-                "SELECT COUNT(*) FROM conflicts WHERE status IN ('pending', 'reviewing')"
+                """
+                SELECT COUNT(*)
+                FROM conflicts c
+                JOIN documents d ON d.id = c.document_id
+                JOIN document_governance dg ON dg.document_id = d.id
+                WHERE c.status IN ('pending', 'reviewing')
+                  AND dg.purpose != 'development_fixture'
+                """
             ).fetchone()[0]
             revision_total = connection.execute(
                 """
                 SELECT COUNT(*)
                 FROM wiki_revisions wr
                 JOIN wiki_pages wp ON wp.id = wr.page_id
-                JOIN documents d ON d.id = wp.source_document_id
-                JOIN processing_runs pr
-                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
                 WHERE wr.status IN ('draft', 'reviewing')
-                  AND d.current_version_id = pr.document_version_id
+                  AND wp.source_document_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM revision_evidence hidden_re
+                      JOIN evidence hidden_e
+                        ON hidden_e.id = hidden_re.evidence_id
+                      JOIN document_versions hidden_dv
+                        ON hidden_dv.id = hidden_e.document_version_id
+                      JOIN document_governance hidden_dg
+                        ON hidden_dg.document_id = hidden_dv.document_id
+                      WHERE hidden_re.revision_id = wr.id
+                        AND hidden_dg.purpose = 'development_fixture'
+                  )
                 """
             ).fetchone()[0]
             evidence = connection.execute(
@@ -656,7 +825,9 @@ class WorkbenchReadService:
                 JOIN processing_runs pr
                   ON pr.id = e.processing_run_id AND pr.is_current = 1
                 JOIN documents d ON d.current_version_id = pr.document_version_id
+                JOIN document_governance dg ON dg.document_id = d.id
                 WHERE e.status IN ('draft', 'reviewing', 'conflicted')
+                  AND dg.purpose != 'development_fixture'
                 ORDER BY CASE e.status
                              WHEN 'conflicted' THEN 0
                              WHEN 'reviewing' THEN 1
@@ -673,23 +844,39 @@ class WorkbenchReadService:
                        d.original_name, d.classification
                 FROM conflicts c
                 JOIN documents d ON d.id = c.document_id
+                JOIN document_governance dg ON dg.document_id = d.id
                 WHERE c.status IN ('pending', 'reviewing')
+                  AND dg.purpose != 'development_fixture'
                 ORDER BY c.updated_at DESC, c.id
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
             revisions = connection.execute(
-                """
+                f"""
                 SELECT wr.id, wr.status, wr.revision_number, wr.updated_at,
-                       wp.title, d.classification
+                       wp.title, {_TOPIC_CLASSIFICATION_SQL} AS classification
                 FROM wiki_revisions wr
                 JOIN wiki_pages wp ON wp.id = wr.page_id
-                JOIN documents d ON d.id = wp.source_document_id
-                JOIN processing_runs pr
-                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
+                JOIN revision_evidence re ON re.revision_id = wr.id
+                JOIN evidence e ON e.id = re.evidence_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
                 WHERE wr.status IN ('draft', 'reviewing')
-                  AND d.current_version_id = pr.document_version_id
+                  AND wp.source_document_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM revision_evidence hidden_re
+                      JOIN evidence hidden_e
+                        ON hidden_e.id = hidden_re.evidence_id
+                      JOIN document_versions hidden_dv
+                        ON hidden_dv.id = hidden_e.document_version_id
+                      JOIN document_governance hidden_dg
+                        ON hidden_dg.document_id = hidden_dv.document_id
+                      WHERE hidden_re.revision_id = wr.id
+                        AND hidden_dg.purpose = 'development_fixture'
+                  )
+                GROUP BY wr.id, wp.title
                 ORDER BY wr.updated_at DESC, wr.id
                 LIMIT ?
                 """,
@@ -781,23 +968,109 @@ class WorkbenchReadService:
         where = ["wr.status = 'rejected'"]
         parameters: list[Any] = []
         if classification:
-            where.append("d.classification = ?")
+            where.append("sources.classification = ?")
             parameters.append(classification)
         if query:
             where.append(
                 """
                 (instr(lower(wr.id), lower(?)) > 0
-                 OR (d.classification <> 'restricted'
+                 OR (sources.classification <> 'restricted'
                      AND instr(lower(wp.title), lower(?)) > 0))
                 """
             )
             parameters.extend((query, query))
         predicate = " AND ".join(where)
+        cte = f"""
+            WITH revision_sources AS (
+                SELECT wr_source.id AS revision_id,
+                       CASE
+                           WHEN COUNT(d.id) = 0
+                                AND source_document.id IS NULL
+                           THEN 'restricted'
+                           WHEN MAX(
+                               CASE
+                                   WHEN d.classification = 'restricted'
+                                        OR source_document.classification = 'restricted'
+                                   THEN 4
+                                   WHEN d.classification = 'confidential'
+                                        OR source_document.classification = 'confidential'
+                                   THEN 3
+                                   WHEN d.classification = 'internal'
+                                        OR source_document.classification = 'internal'
+                                   THEN 2
+                                   ELSE 1
+                               END
+                           ) = 4 THEN 'restricted'
+                           WHEN MAX(
+                               CASE
+                                   WHEN d.classification = 'confidential'
+                                        OR source_document.classification = 'confidential'
+                                   THEN 3
+                                   WHEN d.classification = 'internal'
+                                        OR source_document.classification = 'internal'
+                                   THEN 2
+                                   ELSE 1
+                               END
+                           ) = 3 THEN 'confidential'
+                           WHEN MAX(
+                               CASE
+                                   WHEN d.classification = 'internal'
+                                        OR source_document.classification = 'internal'
+                                   THEN 2
+                                   ELSE 1
+                               END
+                           ) = 2 THEN 'internal'
+                           ELSE 'public'
+                       END AS classification,
+                       CASE
+                           WHEN COUNT(e.id) > 0
+                                AND MIN(
+                                    CASE
+                                        WHEN pr.is_current = 1
+                                             AND d.current_version_id = dv.id
+                                             AND pr.document_version_id =
+                                                 e.document_version_id
+                                             AND (
+                                                 wp_source.source_document_id IS NULL
+                                                 OR (
+                                                     d.id =
+                                                         wp_source.source_document_id
+                                                     AND e.processing_run_id =
+                                                         wr_source.processing_run_id
+                                                 )
+                                             )
+                                             AND (
+                                                 wp_source.source_document_id
+                                                     IS NOT NULL
+                                                 OR wr_source.processing_run_id
+                                                     IS NULL
+                                             )
+                                        THEN 1 ELSE 0
+                                    END
+                                ) = 1
+                           THEN 1 ELSE 0
+                       END AS source_is_current
+                FROM wiki_revisions wr_source
+                JOIN wiki_pages wp_source
+                  ON wp_source.id = wr_source.page_id
+                LEFT JOIN documents source_document
+                  ON source_document.id = wp_source.source_document_id
+                LEFT JOIN revision_evidence re
+                  ON re.revision_id = wr_source.id
+                LEFT JOIN evidence e ON e.id = re.evidence_id
+                LEFT JOIN document_versions dv
+                  ON dv.id = e.document_version_id
+                LEFT JOIN documents d ON d.id = dv.document_id
+                LEFT JOIN processing_runs pr
+                  ON pr.id = e.processing_run_id
+                WHERE wr_source.status = 'rejected'
+                GROUP BY wr_source.id
+            )
+        """
         source = f"""
             FROM wiki_revisions wr
             JOIN wiki_pages wp ON wp.id = wr.page_id
-            JOIN documents d ON d.id = wp.source_document_id
-            JOIN processing_runs pr ON pr.id = wr.processing_run_id
+            JOIN revision_sources sources ON sources.revision_id = wr.id
             LEFT JOIN audit_log rejection ON rejection.id = (
                 SELECT al.id
                 FROM audit_log al
@@ -811,15 +1084,14 @@ class WorkbenchReadService:
         """
         with self.database.connect() as connection:
             total = connection.execute(
-                f"SELECT COUNT(*) {source}", parameters
+                f"{cte} SELECT COUNT(*) {source}", parameters
             ).fetchone()[0]
             rows = connection.execute(
                 f"""
+                {cte}
                 SELECT wr.id, wr.revision_number, wr.updated_at,
-                       wp.title, d.classification,
-                       CASE WHEN pr.is_current = 1
-                                  AND d.current_version_id = pr.document_version_id
-                            THEN 1 ELSE 0 END AS source_is_current,
+                       wp.title, sources.classification,
+                       sources.source_is_current,
                        rejection.actor AS rejected_by,
                        rejection.created_at AS rejected_at,
                        rejection.details_json AS rejection_details_json
@@ -852,7 +1124,10 @@ class WorkbenchReadService:
         classification: str | None,
         query: str | None,
     ):
-        where = ["e.status IN ('draft', 'reviewing', 'conflicted')"]
+        where = [
+            "e.status IN ('draft', 'reviewing', 'conflicted')",
+            "dg.purpose != 'development_fixture'",
+        ]
         parameters: list[Any] = []
         if status:
             where.append("e.status = ?")
@@ -876,6 +1151,7 @@ class WorkbenchReadService:
             JOIN processing_runs pr
               ON pr.id = e.processing_run_id AND pr.is_current = 1
             JOIN documents d ON d.current_version_id = pr.document_version_id
+            JOIN document_governance dg ON dg.document_id = d.id
             WHERE {predicate}
         """
         with self.database.connect() as connection:
@@ -908,7 +1184,10 @@ class WorkbenchReadService:
         classification: str | None,
         query: str | None,
     ):
-        where = ["c.status IN ('pending', 'reviewing')"]
+        where = [
+            "c.status IN ('pending', 'reviewing')",
+            "dg.purpose != 'development_fixture'",
+        ]
         parameters: list[Any] = []
         if status:
             where.append("c.status = ?")
@@ -930,6 +1209,7 @@ class WorkbenchReadService:
         source = f"""
             FROM conflicts c
             JOIN documents d ON d.id = c.document_id
+            JOIN document_governance dg ON dg.document_id = d.id
             WHERE {predicate}
         """
         with self.database.connect() as connection:
@@ -957,45 +1237,65 @@ class WorkbenchReadService:
         classification: str | None,
         query: str | None,
     ):
-        where = [
-            "wr.status IN ('draft', 'reviewing')",
-            "d.current_version_id = pr.document_version_id",
-        ]
+        where = ["status IN ('draft', 'reviewing')"]
         parameters: list[Any] = []
         if status:
-            where.append("wr.status = ?")
+            where.append("status = ?")
             parameters.append(status)
         if classification:
-            where.append("d.classification = ?")
+            where.append("classification = ?")
             parameters.append(classification)
         if query:
             where.append(
                 """
-                (instr(lower(wr.id), lower(?)) > 0
-                 OR (d.classification <> 'restricted'
-                     AND instr(lower(wp.title), lower(?)) > 0))
+                (instr(lower(id), lower(?)) > 0
+                 OR (classification <> 'restricted'
+                     AND instr(lower(title), lower(?)) > 0))
                 """
             )
             parameters.extend((query, query))
         predicate = " AND ".join(where)
         source = f"""
-            FROM wiki_revisions wr
-            JOIN wiki_pages wp ON wp.id = wr.page_id
-            JOIN documents d ON d.id = wp.source_document_id
-            JOIN processing_runs pr
-              ON pr.id = wr.processing_run_id AND pr.is_current = 1
-            WHERE {predicate}
+            WITH topic_queue AS (
+                SELECT wr.id, wr.status, wr.revision_number, wr.updated_at,
+                       wp.title,
+                       {_TOPIC_CLASSIFICATION_SQL} AS classification
+                FROM wiki_revisions wr
+                JOIN wiki_pages wp ON wp.id = wr.page_id
+                JOIN revision_evidence re ON re.revision_id = wr.id
+                JOIN evidence e ON e.id = re.evidence_id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE wp.source_document_id IS NULL
+                  AND wr.status IN ('draft', 'reviewing')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM revision_evidence hidden_re
+                      JOIN evidence hidden_e
+                        ON hidden_e.id = hidden_re.evidence_id
+                      JOIN document_versions hidden_dv
+                        ON hidden_dv.id = hidden_e.document_version_id
+                      JOIN document_governance hidden_dg
+                        ON hidden_dg.document_id = hidden_dv.document_id
+                      WHERE hidden_re.revision_id = wr.id
+                        AND hidden_dg.purpose = 'development_fixture'
+                  )
+                GROUP BY wr.id, wp.title
+            )
         """
         with self.database.connect() as connection:
             total = connection.execute(
-                f"SELECT COUNT(*) {source}", parameters
+                f"{source} SELECT COUNT(*) FROM topic_queue WHERE {predicate}",
+                parameters,
             ).fetchone()[0]
             rows = connection.execute(
                 f"""
-                SELECT wr.id, wr.status, wr.revision_number, wr.updated_at,
-                       wp.title, d.classification
                 {source}
-                ORDER BY wr.updated_at DESC, wr.id
+                SELECT id, status, revision_number, updated_at,
+                       title, classification
+                FROM topic_queue
+                WHERE {predicate}
+                ORDER BY updated_at DESC, id
                 LIMIT ? OFFSET ?
                 """,
                 (*parameters, limit, offset),
@@ -1050,63 +1350,181 @@ class WorkbenchReadService:
                 SELECT wr.id, wr.status, wr.revision_number, wr.markdown_path,
                        wr.content_sha256, wr.generator, wr.created_at, wr.updated_at,
                        wp.id AS page_id, wp.title, wp.needs_revalidation,
-                       d.classification
+                       wp.source_document_id, wr.processing_run_id,
+                       source_document.classification
+                           AS source_document_classification
                 FROM wiki_revisions wr
                 JOIN wiki_pages wp ON wp.id = wr.page_id
-                JOIN documents d ON d.id = wp.source_document_id
-                JOIN processing_runs pr
-                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
+                LEFT JOIN documents source_document
+                  ON source_document.id = wp.source_document_id
                 WHERE wr.id = ?
-                  AND d.current_version_id = pr.document_version_id
                 """,
                 (revision_id,),
             ).fetchone()
             if not row:
-                raise KnowledgeWorkbenchError(f"当前 Wiki 修订不存在：{revision_id}")
-            if row["classification"] == "restricted":
-                raise PermissionError("restricted Wiki 修订不能通过 Web 查看内容")
+                raise KnowledgeWorkbenchError(f"Wiki 修订不存在：{revision_id}")
+            expected_evidence_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM revision_evidence
+                WHERE revision_id = ?
+                """,
+                (revision_id,),
+            ).fetchone()[0]
+            if row["source_document_id"] is not None:
+                source_is_current = connection.execute(
+                    """
+                    SELECT 1
+                    FROM processing_runs pr
+                    JOIN document_versions dv ON dv.id = pr.document_version_id
+                    JOIN documents d ON d.id = dv.document_id
+                    WHERE pr.id = ? AND pr.is_current = 1
+                      AND d.current_version_id = dv.id
+                      AND d.id = ?
+                    """,
+                    (row["processing_run_id"], row["source_document_id"]),
+                ).fetchone()
+                if not source_is_current:
+                    raise KnowledgeWorkbenchError(
+                        f"当前 Wiki 修订不存在：{revision_id}"
+                    )
             evidence_rows = connection.execute(
                 """
-                SELECT e.status, COUNT(*) AS count
+                SELECT e.id, e.status, d.id AS document_id, d.original_name,
+                       d.classification, etv.status AS validation_status,
+                       pr.status AS run_status, pr.is_current AS run_is_current,
+                       e.processing_run_id AS evidence_processing_run_id,
+                       (pr.document_version_id = e.document_version_id)
+                           AS run_version_matches,
+                       (d.current_version_id = dv.id) AS version_is_current,
+                       dg.purpose, dg.scope_status, dg.authority_status
                 FROM revision_evidence re
                 JOIN evidence e ON e.id = re.evidence_id
+                LEFT JOIN evidence_technical_validation etv
+                  ON etv.evidence_id = e.id
+                JOIN document_versions dv ON dv.id = e.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                LEFT JOIN processing_runs pr ON pr.id = e.processing_run_id
+                LEFT JOIN document_governance dg ON dg.document_id = d.id
                 WHERE re.revision_id = ?
-                GROUP BY e.status
+                ORDER BY d.original_name, e.run_ordinal, e.id
                 """,
                 (revision_id,),
             ).fetchall()
-        content = _read_revision_content(
-            self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
+        classifications = [item["classification"] for item in evidence_rows]
+        if row["source_document_classification"] is not None:
+            classifications.append(row["source_document_classification"])
+        classification = _most_restrictive_classification(classifications)
+        if classification == "restricted":
+            raise PermissionError("restricted Wiki 修订不能通过 Web 查看内容")
+        source_names = list(
+            dict.fromkeys(item["original_name"] for item in evidence_rows)
         )
-        preview = content[:MAX_WIKI_PREVIEW_CHARACTERS]
-        evidence_by_status = {
-            evidence_row["status"]: evidence_row["count"]
-            for evidence_row in evidence_rows
+        source_document_ids = {
+            item["document_id"] for item in evidence_rows
         }
-        content_truncated = len(preview) < len(content)
+        source_blockers: list[str] = []
+        if row["source_document_id"] is None:
+            if len(evidence_rows) != expected_evidence_count:
+                source_blockers.append("主题页来源记录不完整")
+            if len(source_document_ids) < 2:
+                source_blockers.append("主题页至少需要两份不同资料")
+            invalid_source_count = sum(
+                1
+                for item in evidence_rows
+                if item["status"] != "verified"
+                or item["validation_status"] != "passed"
+                or item["run_status"] != "completed"
+                or not item["run_is_current"]
+                or not item["run_version_matches"]
+                or not item["version_is_current"]
+                or item["purpose"] != "production"
+                or item["scope_status"] != "in_scope"
+                or item["authority_status"]
+                not in {"reference", "authoritative"}
+            )
+            if invalid_source_count:
+                source_blockers.append(
+                    f"{invalid_source_count} 条来源依据当前不可用"
+                )
+        else:
+            if len(evidence_rows) != expected_evidence_count or not evidence_rows:
+                source_blockers.append("单资料页面来源记录不完整")
+            invalid_source_count = sum(
+                1
+                for item in evidence_rows
+                if item["document_id"] != row["source_document_id"]
+                or item["evidence_processing_run_id"] != row["processing_run_id"]
+                or item["status"] != "verified"
+                or item["validation_status"] != "passed"
+                or item["run_status"] != "completed"
+                or not item["run_is_current"]
+                or not item["run_version_matches"]
+                or not item["version_is_current"]
+                or item["purpose"] != "production"
+                or item["scope_status"] != "in_scope"
+                or item["authority_status"]
+                not in {"reference", "authoritative"}
+            )
+            if invalid_source_count:
+                source_blockers.append(
+                    f"{invalid_source_count} 条来源依据未完成准入或已失效"
+                )
+        if source_blockers:
+            content = ""
+            content_integrity = "source_blocked"
+        else:
+            content = _read_revision_content(
+                self.paths,
+                row["markdown_path"],
+                expected_sha256=row["content_sha256"],
+            )
+            content_integrity = "verified"
+        page_kind = "topic" if row["source_document_id"] is None else "document"
+        readable_content = _human_readable_revision_content(
+            content,
+            page_kind=page_kind,
+        )
+        preview = readable_content[:MAX_WIKI_PREVIEW_CHARACTERS]
+        evidence_by_status: dict[str, int] = {}
+        for evidence_row in evidence_rows:
+            status = evidence_row["status"]
+            evidence_by_status[status] = evidence_by_status.get(status, 0) + 1
+        content_truncated = len(preview) < len(readable_content)
         publish_blockers = _revision_publish_blockers(
             status=row["status"],
             evidence_by_status=evidence_by_status,
             content_truncated=content_truncated,
         )
+        publish_blockers.extend(source_blockers)
         return {
             "revision_id": row["id"],
             "page_id": row["page_id"],
             "page_title": row["title"],
+            "page_kind": page_kind,
             "status": row["status"],
             "revision_number": row["revision_number"],
-            "classification": row["classification"],
+            "classification": classification,
             "generator": row["generator"],
+            "generator_label": _human_generator_label(
+                row["generator"],
+                page_kind=page_kind,
+            ),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "needs_revalidation": bool(row["needs_revalidation"]),
+            "source_document_count": len(source_document_ids),
+            "source_document_names": source_names,
             "evidence_count": sum(evidence_by_status.values()),
             "evidence_by_status": evidence_by_status,
             "content_preview": preview,
-            "content_length": len(content),
+            "content_preview_format": "plain_text",
+            "content_length": len(readable_content),
             "content_truncated": content_truncated,
-            "content_integrity": "verified",
-            "can_submit_review": row["status"] == "draft",
+            "content_integrity": content_integrity,
+            "can_submit_review": (
+                row["status"] == "draft" and not source_blockers
+            ),
             "can_publish": not publish_blockers,
             "publish_blockers": publish_blockers,
             "publish_confirmation_phrase": _publish_confirmation_phrase(revision_id),
@@ -1153,6 +1571,13 @@ class WorkbenchReadService:
             "evidence_count": row["evidence_count"],
             "reviewing_evidence_count": row["reviewing_evidence_count"],
             "verified_evidence_count": row["verified_evidence_count"],
+            "technically_validated_evidence_count": (
+                row["technically_validated_evidence_count"]
+            ),
+            "purpose": row["purpose"],
+            "scope_status": row["scope_status"],
+            "authority_status": row["authority_status"],
+            "knowledge_domain": row["knowledge_domain"],
             "wiki_status": row["wiki_status"],
             "needs_revalidation": bool(row["needs_revalidation"]),
             "updated_at": row["updated_at"],
@@ -1231,9 +1656,161 @@ class WorkbenchActionService:
         }
     )
 
-    def __init__(self, database: Database, paths: WorkspacePaths | None = None):
+    def __init__(
+        self,
+        database: Database,
+        paths: WorkspacePaths | None = None,
+        *,
+        deepseek_gateway_factory: Callable[[], AuditedModelGateway] | None = None,
+        file_opener: Callable[[Path], None] | None = None,
+    ):
         self.database = database
         self.paths = paths or WorkspacePaths(database.path.parent)
+        self.file_opener = file_opener or _open_with_default_application
+        self.deepseek_gateway_factory = (
+            deepseek_gateway_factory
+            or (lambda: AuditedModelGateway(
+                self.database,
+                DeepSeekChatModel.from_environment(),
+            ))
+        )
+
+    @property
+    def deepseek_configured(self) -> bool:
+        return DeepSeekChatModel.is_configured()
+
+    def open_document(self, document_id: str, *, actor: str) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT d.id, d.original_name, d.classification,
+                       dv.id AS version_id, dv.stored_path
+                FROM documents d
+                JOIN document_versions dv ON dv.id = d.current_version_id
+                WHERE d.id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+        if row is None:
+            raise KnowledgeWorkbenchError(
+                "资料不存在或没有当前版本"
+            )
+        if row["classification"] == "restricted":
+            raise PermissionError("受限资料不能从 Web 打开")
+
+        raw_root = self.paths.raw.resolve()
+        candidate = (self.paths.root / row["stored_path"]).resolve()
+        try:
+            candidate.relative_to(raw_root)
+        except ValueError as exc:
+            raise KnowledgeWorkbenchError(
+                "资料不在受控只读资料目录中"
+            ) from exc
+        if not candidate.is_file():
+            raise KnowledgeWorkbenchError("只读资料副本不存在")
+
+        self.file_opener(candidate)
+        with self.database.transaction() as connection:
+            record_event(
+                connection,
+                "document_opened_locally",
+                "document",
+                row["id"],
+                actor=actor,
+                details={"version_id": row["version_id"]},
+            )
+        return {
+            "document_id": row["id"],
+            "display_name": row["original_name"],
+            "opened": True,
+        }
+
+    def ask_knowledge_question(
+        self,
+        question: str,
+        *,
+        actor: str,
+        history: list[dict[str, object]] | None = None,
+        limit: int = 5,
+        allow_deepseek_once: bool = False,
+    ) -> dict[str, Any]:
+        model_gateway = None
+        unavailable_reason = None
+        if allow_deepseek_once:
+            try:
+                model_gateway = self.deepseek_gateway_factory()
+            except KnowledgeWorkbenchError:
+                unavailable_reason = "not_configured"
+        return answer_knowledge_question(
+            self.database,
+            question,
+            actor=actor,
+            history=history,
+            limit=limit,
+            paths=self.paths,
+            model_gateway=model_gateway,
+            cloud_model_requested=allow_deepseek_once,
+            allow_internal_cloud_once=allow_deepseek_once,
+            cloud_model_unavailable_reason=unavailable_reason,
+        )
+
+    def scan_corpus(
+        self,
+        root: str,
+        *,
+        actor: str,
+        project_name: str | None = None,
+        allow_legacy_word_conversion: bool = False,
+    ) -> dict[str, Any]:
+        actor = _required_actor(actor)
+        root = root.strip()
+        if not root:
+            raise ValueError("请选择或填写要读取的资料目录")
+        return scan_corpus_source(
+            self.database,
+            Path(root),
+            actor=actor,
+            project_name=project_name,
+            allow_legacy_word_conversion=allow_legacy_word_conversion,
+        )
+
+    def decide_corpus_file(
+        self,
+        file_id: str,
+        *,
+        scope_status: str,
+        authority_status: str,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        return decide_corpus_file(
+            self.database,
+            file_id,
+            scope_status=scope_status,
+            authority_status=authority_status,
+            actor=_required_actor(actor),
+            reason=reason,
+        )
+
+    def import_corpus_file(
+        self,
+        file_id: str,
+        *,
+        classification: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        try:
+            selected = Classification(classification)
+        except ValueError as exc:
+            raise KnowledgeWorkbenchError("请选择有效的资料密级") from exc
+        return import_corpus_file(
+            self.database,
+            self.paths,
+            file_id,
+            classification=selected,
+            actor=actor,
+        )
 
     def transition_evidence(
         self, evidence_id: str, target: str, *, actor: str
@@ -1570,7 +2147,12 @@ class WorkbenchActionService:
         _read_revision_content(
             self.paths, row["markdown_path"], expected_sha256=row["content_sha256"]
         )
-        request_revision_review(self.database, revision_id, actor=actor)
+        request_revision_review(
+            self.database,
+            revision_id,
+            actor=actor,
+            paths=self.paths,
+        )
         return {
             "entity_type": "wiki_revision",
             "entity_id": revision_id,
@@ -1658,20 +2240,53 @@ class WorkbenchActionService:
             row = connection.execute(
                 """
                 SELECT wr.status, wr.markdown_path, wr.content_sha256,
-                       d.classification
+                       wr.processing_run_id, wp.source_document_id
                 FROM wiki_revisions wr
                 JOIN wiki_pages wp ON wp.id = wr.page_id
-                JOIN documents d ON d.id = wp.source_document_id
-                JOIN processing_runs pr
-                  ON pr.id = wr.processing_run_id AND pr.is_current = 1
                 WHERE wr.id = ?
-                  AND d.current_version_id = pr.document_version_id
                 """,
                 (revision_id,),
             ).fetchone()
-        if not row:
+            if not row:
+                raise KnowledgeWorkbenchError(
+                    f"当前 Wiki 修订不存在：{revision_id}"
+                )
+            result = dict(row)
+            if row["source_document_id"] is not None:
+                source = connection.execute(
+                    """
+                    SELECT d.classification
+                    FROM processing_runs pr
+                    JOIN document_versions dv ON dv.id = pr.document_version_id
+                    JOIN documents d ON d.id = dv.document_id
+                    WHERE pr.id = ? AND pr.is_current = 1
+                      AND d.current_version_id = dv.id
+                      AND d.id = ?
+                    """,
+                    (row["processing_run_id"], row["source_document_id"]),
+                ).fetchone()
+                classifications = (
+                    [source["classification"]] if source is not None else []
+                )
+            else:
+                sources = connection.execute(
+                    """
+                    SELECT d.classification
+                    FROM revision_evidence re
+                    JOIN evidence e ON e.id = re.evidence_id
+                    JOIN document_versions dv ON dv.id = e.document_version_id
+                    JOIN documents d ON d.id = dv.document_id
+                    WHERE re.revision_id = ?
+                    """,
+                    (revision_id,),
+                ).fetchall()
+                classifications = [item["classification"] for item in sources]
+        if not classifications:
             raise KnowledgeWorkbenchError(f"当前 Wiki 修订不存在：{revision_id}")
-        return row
+        result["classification"] = _most_restrictive_classification(
+            classifications
+        )
+        return result
 
     def _current_evidence_classification(self, evidence_id: str) -> str:
         with self.database.connect() as connection:
@@ -1864,6 +2479,160 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+_MARKDOWN_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+_INTERNAL_OBJECT_ID = re.compile(
+    r"^(?:doc|ev|page|rev|run|ver)_[A-Za-z0-9_-]+$",
+    re.IGNORECASE,
+)
+_MARKDOWN_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]+\)")
+_MARKDOWN_CODE = re.compile(r"`([^`]*)`")
+_DOCUMENT_LOCATOR = re.compile(
+    r"^定位(?:（\d+\s*处）)?[：:]\s*`?(.+?)`?\s*$"
+)
+
+
+def _human_readable_revision_content(content: str, *, page_kind: str) -> str:
+    """Convert stored Markdown into a plain-language Web review preview.
+
+    The immutable Markdown file retains frontmatter and evidence markers for
+    traceability. The Web preview deliberately omits those internal details so
+    reviewers see the document meaning rather than database identifiers.
+    """
+
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[0].lstrip("\ufeff").strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                lines = lines[index + 1 :]
+                break
+    body = _MARKDOWN_HTML_COMMENT.sub("", "\n".join(lines))
+    output: list[str] = []
+    extract_number = 0
+    for raw_line in body.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if output and output[-1]:
+                output.append("")
+            continue
+
+        heading = _MARKDOWN_HEADING.match(line)
+        if heading:
+            label = _plain_markdown_text(heading.group(1))
+            if _INTERNAL_OBJECT_ID.fullmatch(label):
+                extract_number += 1
+                label = f"原文摘录 {extract_number}"
+            _append_plain_block(output, label)
+            continue
+
+        if page_kind == "document" and re.match(
+            r"^-\s*(?:SHA-256|文件版本)\s*[：:]",
+            line,
+            re.IGNORECASE,
+        ):
+            continue
+
+        locator = _DOCUMENT_LOCATOR.match(line)
+        if page_kind == "document" and locator:
+            _append_plain_block(
+                output,
+                _human_locator_summary(locator.group(1)),
+            )
+            continue
+
+        while line.startswith(">"):
+            line = line[1:].lstrip()
+        checkbox = re.match(r"^-\s*\[[ xX]\]\s*(.*)$", line)
+        if checkbox:
+            line = f"待确认：{checkbox.group(1)}"
+        elif line.startswith("- "):
+            line = f"• {line[2:].strip()}"
+        line = _plain_markdown_text(line)
+        if line and not _INTERNAL_OBJECT_ID.fullmatch(line):
+            output.append(line)
+
+    while output and not output[-1]:
+        output.pop()
+    return "\n".join(output)
+
+
+def _append_plain_block(output: list[str], value: str) -> None:
+    if output and output[-1]:
+        output.append("")
+    if value:
+        output.append(value)
+        output.append("")
+
+
+def _plain_markdown_text(value: str) -> str:
+    value = _MARKDOWN_LINK.sub(r"\1", value)
+    value = _MARKDOWN_CODE.sub(r"\1", value)
+    value = value.replace("**", "").replace("__", "")
+    return value.strip()
+
+
+def _human_locator_summary(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return "位置：请在原始资料中核对对应段落"
+    locators = parsed if isinstance(parsed, list) else [parsed]
+    labels = [
+        label
+        for item in locators
+        if isinstance(item, dict)
+        for label in [_human_locator_label(item)]
+        if label
+    ]
+    if not labels:
+        return "位置：请在原始资料中核对对应段落"
+    return "位置：" + "；".join(labels)
+
+
+def _human_locator_label(locator: dict[str, Any]) -> str:
+    labels: list[str] = []
+    page = locator.get("page")
+    if isinstance(page, int):
+        labels.append(f"第 {page} 页")
+    slide = locator.get("slide")
+    if isinstance(slide, int):
+        labels.append(f"第 {slide} 张幻灯片")
+    sheet = locator.get("sheet")
+    if isinstance(sheet, str) and sheet.strip():
+        labels.append(f"工作表“{sheet.strip()}”")
+    cell_range = locator.get("cell_range")
+    if isinstance(cell_range, str) and cell_range.strip():
+        labels.append(f"单元格 {cell_range.strip()}")
+    paragraph = locator.get("paragraph")
+    if isinstance(paragraph, int):
+        labels.append(f"第 {paragraph} 段")
+    line_start = locator.get("line_start")
+    line_end = locator.get("line_end")
+    if isinstance(line_start, int):
+        if isinstance(line_end, int) and line_end != line_start:
+            labels.append(f"第 {line_start}—{line_end} 行")
+        else:
+            labels.append(f"第 {line_start} 行")
+    heading_path = locator.get("heading_path")
+    if isinstance(heading_path, list):
+        headings = [
+            str(item).strip()
+            for item in heading_path
+            if isinstance(item, str) and item.strip()
+        ]
+        if headings:
+            labels.append("章节“" + " / ".join(headings) + "”")
+    return "，".join(labels)
+
+
+def _human_generator_label(generator: str, *, page_kind: str) -> str:
+    if page_kind == "topic":
+        return "系统按主题整理"
+    if "faithful" in generator.lower():
+        return "系统按原文整理"
+    return "系统整理"
+
+
 def _read_revision_content(
     paths: WorkspacePaths, relative_path: str, *, expected_sha256: str
 ) -> str:
@@ -2007,6 +2776,16 @@ def _required_publish_confirmation(value: str, revision_id: str) -> str:
     if confirmation != expected:
         raise ValueError(f"正式发布前必须完整输入确认短语：{expected}")
     return confirmation
+
+
+def _most_restrictive_classification(values: list[str]) -> str:
+    order = {
+        "public": 1,
+        "internal": 2,
+        "confidential": 3,
+        "restricted": 4,
+    }
+    return max(values or ["internal"], key=lambda item: order.get(item, 4))
 
 
 def _revision_publish_blockers(

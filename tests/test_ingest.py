@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from knowledge_workbench.config import WorkspacePaths
-from knowledge_workbench.ingest import ingest_file
+from knowledge_workbench.ingest import _cleanup_generated_files, ingest_file
 from knowledge_workbench.models import (
     Classification,
     EvidenceStatus,
@@ -17,6 +17,23 @@ from knowledge_workbench.search import search_evidence
 
 
 class IngestTests(unittest.TestCase):
+    @staticmethod
+    def _admit_document(database, document_id: str) -> None:
+        with database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE document_governance
+                SET purpose = 'production',
+                    scope_status = 'in_scope',
+                    authority_status = 'reference',
+                    reviewed_by = 'scope-reviewer',
+                    reviewed_at = updated_at,
+                    decision_reason = '测试中明确准入'
+                WHERE document_id = ?
+                """,
+                (document_id,),
+            )
+
     def test_duplicate_excerpt_uses_one_evidence_id_with_multiple_locations(self):
         from knowledge_workbench.database import Database
         from knowledge_workbench.web_service import WorkbenchReadService
@@ -90,6 +107,7 @@ class IngestTests(unittest.TestCase):
             source.write_text("当前生效规则。", encoding="utf-8")
             first = ingest_file(source, paths, Classification.INTERNAL)
             database = Database(paths.database)
+            self._admit_document(database, first.document_id)
             with database.connect() as connection:
                 evidence_id = connection.execute(
                     "SELECT id FROM evidence WHERE document_version_id = ?",
@@ -132,6 +150,89 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(page["needs_revalidation"], 1)
             self.assertEqual(new_revision_status, "draft")
             self.assertEqual(audit_count, 1)
+
+    def test_new_version_marks_published_aggregate_page_that_uses_old_evidence(self):
+        from knowledge_workbench.database import Database
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "policy.md"
+            paths = WorkspacePaths(root / "workspace")
+            source.write_text("当前课程每班不超过30人。", encoding="utf-8")
+            first = ingest_file(source, paths, Classification.INTERNAL)
+            database = Database(paths.database)
+            with database.transaction() as connection:
+                evidence_id = connection.execute(
+                    "SELECT id FROM evidence WHERE document_version_id = ?",
+                    (first.version_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO wiki_pages(
+                        id, source_document_id, slug, title, status,
+                        current_verified_revision_id, needs_revalidation,
+                        created_at, updated_at
+                    ) VALUES (
+                        'page_topic_capacity', NULL, 'topic-capacity', '班级容量',
+                        'verified', NULL, 0,
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO wiki_revisions(
+                        id, page_id, revision_number, status, markdown_path,
+                        content_sha256, generator, created_at, updated_at,
+                        processing_run_id
+                    ) VALUES (
+                        'rev_topic_capacity', 'page_topic_capacity', 1, 'verified',
+                        'wiki/published/topic-capacity.md',
+                        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                        'topic-extractive-v1',
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO revision_evidence(revision_id, evidence_id)
+                    VALUES ('rev_topic_capacity', ?)
+                    """,
+                    (evidence_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE wiki_pages
+                    SET current_verified_revision_id = 'rev_topic_capacity'
+                    WHERE id = 'page_topic_capacity'
+                    """
+                )
+
+            source.write_text("更新后的课程每班不超过25人。", encoding="utf-8")
+            ingest_file(source, paths, Classification.INTERNAL)
+
+            with database.connect() as connection:
+                source_page = connection.execute(
+                    "SELECT needs_revalidation FROM wiki_pages WHERE id = ?",
+                    (first.page_id,),
+                ).fetchone()[0]
+                aggregate_page = connection.execute(
+                    """
+                    SELECT needs_revalidation
+                    FROM wiki_pages WHERE id = 'page_topic_capacity'
+                    """
+                ).fetchone()[0]
+                aggregate_audit = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_log
+                    WHERE event_type = 'wiki_revalidation_required'
+                      AND entity_id = 'page_topic_capacity'
+                    """
+                ).fetchone()[0]
+            self.assertEqual(source_page, 0)
+            self.assertEqual(aggregate_page, 1)
+            self.assertEqual(aggregate_audit, 1)
 
     def test_new_document_version_hides_historical_evidence_from_search_and_review(self):
         from knowledge_workbench.database import Database
@@ -314,6 +415,67 @@ class IngestTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(active_run, second.processing_run_id)
 
+    def test_cleanup_continues_after_one_generated_file_cannot_be_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blocked = root / "blocked.txt"
+            removable = root / "removable.txt"
+            blocked.write_text("blocked", encoding="utf-8")
+            removable.write_text("removable", encoding="utf-8")
+            original_unlink = Path.unlink
+
+            def selective_unlink(path: Path, *, missing_ok: bool = False):
+                if path == blocked:
+                    raise PermissionError("simulated lock")
+                return original_unlink(path, missing_ok=missing_ok)
+
+            with patch.object(Path, "unlink", selective_unlink):
+                failures = _cleanup_generated_files((blocked, removable, None))
+
+            self.assertTrue(blocked.exists())
+            self.assertFalse(removable.exists())
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0][0], blocked)
+            self.assertIsInstance(failures[0][1], PermissionError)
+
+    def test_ingest_failure_rolls_back_database_and_generated_files(self):
+        from knowledge_workbench.database import Database
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.md"
+            source.write_text("必须保留可追溯的原始证据。", encoding="utf-8")
+            paths = WorkspacePaths(root / "workspace")
+
+            with patch(
+                "knowledge_workbench.ingest.record_event",
+                side_effect=RuntimeError("simulated audit failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated audit failure"):
+                    ingest_file(source, paths, Classification.INTERNAL)
+
+            database = Database(paths.database)
+            with database.connect() as connection:
+                for table in (
+                    "documents",
+                    "document_versions",
+                    "processing_runs",
+                    "evidence",
+                    "wiki_revisions",
+                ):
+                    count = connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    self.assertEqual(count, 0, table)
+
+            for directory in (
+                paths.raw,
+                paths.wiki_drafts,
+                paths.evidence,
+                paths.analysis,
+            ):
+                self.assertFalse(any(path.is_file() for path in directory.rglob("*")))
+
     def test_review_and_publish_full_revision(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -326,6 +488,7 @@ class IngestTests(unittest.TestCase):
             from knowledge_workbench.review import publish_revision, request_revision_review
 
             database = Database(paths.database)
+            self._admit_document(database, result.document_id)
             with database.connect() as connection:
                 evidence_id = connection.execute("SELECT id FROM evidence").fetchone()[0]
             transition_evidence(

@@ -66,6 +66,7 @@ class QualityClosureStatusTests(unittest.TestCase):
             )
 
             self.assertEqual(report["kind"], "quality-closure-status")
+            self.assertEqual(report["schema_version"], "3.0")
             self.assertFalse(report["summary"]["complete"])
             self.assertTrue(report["summary"]["human_action_required"])
             gates = {
@@ -73,8 +74,7 @@ class QualityClosureStatusTests(unittest.TestCase):
             }
             for gate_id in (
                 "workspace_integrity",
-                "gold_baseline",
-                "gold_expansion",
+                "development_regression_baseline",
                 "conflict_labeling_plan",
                 "graph_pilot_snapshot",
             ):
@@ -82,12 +82,31 @@ class QualityClosureStatusTests(unittest.TestCase):
             for gate_id in (
                 "conflict_annotation",
                 "conflict_review",
+                "business_corpus_scope",
                 "graph_evidence_review",
                 "graph_entity_mentions",
                 "graph_business_relationship",
                 "graph_gold_evaluation",
             ):
                 self.assertEqual(gates[gate_id]["status"], "pending")
+            self.assertEqual(report["summary"]["gate_count"], 11)
+            self.assertEqual(
+                report["metrics"]["gold"]["quality_role"],
+                "development_regression_only",
+            )
+            self.assertFalse(
+                report["metrics"]["gold"][
+                    "counts_as_enterprise_business_baseline"
+                ]
+            )
+            self.assertEqual(report["summary"]["advisory_count"], 1)
+            advisory = report["advisories"][0]
+            self.assertEqual(
+                advisory["advisory_id"],
+                "gold_coverage_recommendation",
+            )
+            self.assertEqual(advisory["status"], "met")
+            self.assertFalse(advisory["blocks_quality_closure"])
             conflict_review = gates["conflict_review"]["actual"]
             self.assertEqual(
                 conflict_review["human_attested_approved_count"], 0
@@ -116,7 +135,19 @@ class QualityClosureStatusTests(unittest.TestCase):
                 ],
                 1,
             )
-            expansion = gates["gold_expansion"]["actual"]
+            material_flow = report["metrics"]["material_flow"]
+            self.assertTrue(
+                material_flow["nas_discovered"]["available"]
+            )
+            self.assertEqual(
+                material_flow["nas_discovered"]["count"],
+                0,
+            )
+            self.assertTrue(material_flow["nas_admitted"]["available"])
+            self.assertEqual(material_flow["nas_admitted"]["count"], 0)
+            self.assertEqual(material_flow["imported"]["count"], 11)
+            self.assertEqual(material_flow["gold_sample"]["count"], 10)
+            expansion = advisory["actual"]
             self.assertEqual(
                 expansion["unapproved_current_document_ids"],
                 [extra_result.document_id],
@@ -130,11 +161,14 @@ class QualityClosureStatusTests(unittest.TestCase):
                 target_gold_documents=20,
             )
             target_expansion = {
-                item["gate_id"]: item
-                for item in target_twenty["gates"]
-            }["gold_expansion"]["actual"]
+                item["advisory_id"]: item
+                for item in target_twenty["advisories"]
+            }["gold_coverage_recommendation"]["actual"]
             self.assertEqual(
-                target_expansion["remaining_document_count"], 10
+                target_expansion[
+                    "remaining_recommended_document_count"
+                ],
+                10,
             )
             self.assertEqual(
                 target_expansion["minimum_new_document_import_count"], 9
@@ -145,6 +179,29 @@ class QualityClosureStatusTests(unittest.TestCase):
             )
             self.assertGreater(
                 report["metrics"]["conflict"]["candidate_count"], 0
+            )
+            sampling = report["metrics"]["conflict"]["sampling"]
+            self.assertEqual(
+                sampling["effective_sample_size"],
+                min(
+                    100,
+                    report["metrics"]["conflict"]["candidate_count"],
+                ),
+            )
+            self.assertEqual(
+                sum(
+                    item["sample_quota"]
+                    for item in sampling["strata"].values()
+                ),
+                sampling["effective_sample_size"],
+            )
+            self.assertEqual(sampling["sample_labeled_count"], 0)
+            self.assertEqual(
+                sampling["remaining_sample_label_count"],
+                sampling["effective_sample_size"],
+            )
+            self.assertEqual(
+                sampling["remaining_known_conflict_label_count"], 5
             )
             self.assertEqual(
                 report["metrics"]["graph"]["candidate_count"], 10
@@ -208,6 +265,23 @@ class QualityClosureStatusTests(unittest.TestCase):
                     database,
                     paths,
                     target_gold_documents=9,
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "冲突分层样本"
+            ):
+                build_quality_closure_status(
+                    database,
+                    paths,
+                    conflict_sample_size=9,
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "已知真冲突"
+            ):
+                build_quality_closure_status(
+                    database,
+                    paths,
+                    conflict_sample_size=10,
+                    minimum_known_conflicts=11,
                 )
             outside = root / "outside.json"
             with self.assertRaisesRegex(

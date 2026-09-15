@@ -166,6 +166,10 @@ def update_cross_document_candidate_label(
         if submission or drifted:
             raise KnowledgeWorkbenchError("候选标签已提交，不能继续修改")
         candidate = _candidate_by_id(pack, candidate_id)
+        if candidate["review"]["decision"] is not None:
+            raise KnowledgeWorkbenchError(
+                "候选标签已经批次复核，不能继续修改"
+            )
         candidate["label"] = {
             "expected_conflict": expected_conflict,
             "expected_type": expected_type,
@@ -221,6 +225,11 @@ def apply_cross_document_candidate_label_batch(
             raise KnowledgeWorkbenchError("候选标签已提交，不能继续修改")
         for item in normalized:
             candidate = _candidate_by_id(pack, item["candidate_id"])
+            if candidate["review"]["decision"] is not None:
+                raise KnowledgeWorkbenchError(
+                    f"候选 {item['candidate_id']} 已经批次复核，"
+                    "不能继续修改标签"
+                )
             candidate["label"] = {
                 "expected_conflict": item["expected_conflict"],
                 "expected_type": item["expected_type"],
@@ -237,6 +246,14 @@ def apply_cross_document_candidate_label_batch(
                 "work_pack_path": work_pack_path,
                 "work_pack_sha256": work_pack_sha256,
                 "candidate_count": len(normalized),
+                "annotation_sha256": sha256_text(
+                    json.dumps(
+                        normalized,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ),
                 "conflict_count": sum(
                     item["expected_conflict"] for item in normalized
                 ),
@@ -358,13 +375,28 @@ def apply_cross_document_candidate_review_batch(
     normalized = _normalized_candidate_reviews(decisions)
 
     def mutate(pack: dict[str, Any]) -> dict[str, Any]:
-        submission, drifted = _candidate_submission_state(database, pack)
+        submission, drifted = _candidate_submission_state(
+            database, pack
+        )
+        if submission is None:
+            submission = _candidate_batch_annotation_state(
+                database,
+                pack,
+                plan_id=plan_id,
+                batch_id=batch_id,
+                candidate_ids=[
+                    item["candidate_id"] for item in normalized
+                ],
+            )
+            drifted = False
         if drifted:
             raise KnowledgeWorkbenchError(
                 "候选包标签在提交审计后发生变化"
             )
         if not submission:
-            raise KnowledgeWorkbenchError("候选标签尚未提交，不能复核")
+            raise KnowledgeWorkbenchError(
+                "当前批次标签尚未通过受控工作包提交，不能复核"
+            )
         validate_review_actor_policy(
             submitter=submission["actor"],
             reviewer=actor,
@@ -686,6 +718,116 @@ def _candidate_submission_state(
     if not submission:
         return None, False
     return submission, submission["annotation_sha256"] != _annotation_sha256(pack)
+
+
+def _candidate_batch_annotation_state(
+    database: Database,
+    pack: dict[str, Any],
+    *,
+    plan_id: str,
+    batch_id: str,
+    candidate_ids: list[str],
+) -> dict[str, str] | None:
+    expected_ids = set(candidate_ids)
+    if not expected_ids or len(expected_ids) != len(candidate_ids):
+        return None
+    candidates = {
+        item["candidate_id"]: item for item in pack["candidates"]
+    }
+    if not expected_ids.issubset(candidates):
+        return None
+    if any(
+        candidates[candidate_id]["label"]["expected_conflict"] is None
+        for candidate_id in expected_ids
+    ):
+        return None
+    with database.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, actor, event_type, details_json
+            FROM audit_log
+            WHERE entity_type = 'conflict_candidate_pack'
+              AND entity_id = ?
+              AND event_type IN (
+                'conflict_candidate_label_updated',
+                'conflict_candidate_label_batch_applied'
+              )
+            ORDER BY id DESC
+            """,
+            (pack["pack_id"],),
+        ).fetchall()
+    latest_mutation_by_candidate: dict[str, int] = {}
+    matching_batch = None
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        touched_ids = (
+            details.get("candidate_ids")
+            if row["event_type"]
+            == "conflict_candidate_label_batch_applied"
+            else [details.get("candidate_id")]
+        )
+        if not isinstance(touched_ids, list):
+            continue
+        touched = {
+            candidate_id
+            for candidate_id in touched_ids
+            if isinstance(candidate_id, str)
+            and candidate_id in expected_ids
+        }
+        for candidate_id in touched:
+            latest_mutation_by_candidate.setdefault(
+                candidate_id, row["id"]
+            )
+        if (
+            row["event_type"]
+            == "conflict_candidate_label_batch_applied"
+            and details.get("plan_id") == plan_id
+            and details.get("batch_id") == batch_id
+            and set(touched_ids) == expected_ids
+            and matching_batch is None
+        ):
+            current_labels = [
+                {
+                    "candidate_id": candidate_id,
+                    **candidates[candidate_id]["label"],
+                }
+                for candidate_id in touched_ids
+            ]
+            audited_annotation_sha256 = details.get(
+                "annotation_sha256"
+            )
+            if (
+                isinstance(audited_annotation_sha256, str)
+                and audited_annotation_sha256
+                != sha256_text(
+                    json.dumps(
+                        current_labels,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            ):
+                continue
+            matching_batch = {
+                "id": row["id"],
+                "actor": row["actor"],
+            }
+    if matching_batch is None:
+        return None
+    if any(
+        latest_mutation_by_candidate.get(candidate_id)
+        != matching_batch["id"]
+        for candidate_id in expected_ids
+    ):
+        return None
+    return {
+        "actor": matching_batch["actor"],
+        "submission_kind": "audited_batch_work_pack",
+    }
 
 
 def _latest_annotation_submission(

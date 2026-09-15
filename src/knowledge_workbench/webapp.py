@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import socket
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -76,6 +77,12 @@ class WorkbenchWebApplication:
                 payload = self.read_service.bootstrap()
                 payload["web"] = {
                     "csrf_token": self.csrf_token,
+                    "providers": {
+                        "deepseek": {
+                            "configured": self.action_service.deepseek_configured,
+                            "model": "deepseek-chat",
+                        }
+                    },
                     "write_capabilities": [
                         "evidence-transition",
                         "conflict-transition",
@@ -91,11 +98,30 @@ class WorkbenchWebApplication:
                         "entity-merge-review",
                         "entity-relationship-create",
                         "entity-relationship-retract",
+                        "corpus-map-scan",
+                        "corpus-file-scope-decision",
+                        "corpus-file-import",
+                        "document-open-local",
+                        "knowledge-question-answer",
                     ],
                 }
                 return self._json(200, payload)
             if parsed.path == "/api/v1/summary":
                 return self._json(200, self.read_service.summary())
+            if parsed.path == "/api/v1/corpus-map":
+                return self._json(
+                    200,
+                    self.read_service.corpus_map(
+                        limit=_integer_query(query, "limit", 100),
+                        offset=_integer_query(query, "offset", 0),
+                        folder=_string_query(query, "folder"),
+                        scope_status=_string_query(query, "scope"),
+                        query=_string_query(query, "q"),
+                        view=_string_query(query, "view") or "all",
+                    ),
+                )
+            if parsed.path == "/api/v1/knowledge-setup":
+                return self._json(200, self.read_service.knowledge_setup())
             if parsed.path == "/api/v1/documents":
                 return self._json(
                     200,
@@ -245,6 +271,13 @@ class WorkbenchWebApplication:
                 return self._json(
                     200, self.read_service.revision_detail(revision_id)
                 )
+            corpus_file_id = _route_entity_id(
+                parsed.path, entity="corpus-files", action="detail"
+            )
+            if corpus_file_id is not None:
+                return self._json(
+                    200, self.read_service.corpus_file_card(corpus_file_id)
+                )
         except PermissionError as exc:
             return self._json(403, {"error": str(exc)})
         except KnowledgeWorkbenchError as exc:
@@ -296,6 +329,17 @@ class WorkbenchWebApplication:
         entity_relationship_retract_id = _route_entity_id(
             path, entity="entity-relationships", action="retract"
         )
+        knowledge_question = path == "/api/v1/qa/ask"
+        corpus_scan = path == "/api/v1/corpus-map/scan"
+        corpus_file_decision_id = _route_entity_id(
+            path, entity="corpus-files", action="decide"
+        )
+        corpus_file_import_id = _route_entity_id(
+            path, entity="corpus-files", action="import"
+        )
+        document_open_id = _route_entity_id(
+            path, entity="documents", action="open"
+        )
         if (
             evidence_id is None
             and conflict_id is None
@@ -311,6 +355,11 @@ class WorkbenchWebApplication:
             and entity_merge_review_id is None
             and not entity_relationship_create
             and entity_relationship_retract_id is None
+            and not knowledge_question
+            and not corpus_scan
+            and corpus_file_decision_id is None
+            and corpus_file_import_id is None
+            and document_open_id is None
         ):
             return self._json(405, {"error": "该资源不支持 Web 写操作"})
         normalized_headers = {key.lower(): value for key, value in headers.items()}
@@ -333,7 +382,73 @@ class WorkbenchWebApplication:
                 raise ValueError("actor 必须是字符串")
             actor = actor_value
             target = str(payload.get("target", ""))
-            if evidence_id is not None:
+            if knowledge_question:
+                question = payload.get("question", "")
+                if not isinstance(question, str):
+                    raise ValueError("question 必须是字符串")
+                history = payload.get("history", [])
+                if not isinstance(history, list):
+                    raise ValueError("history 必须是数组")
+                limit_value = payload.get("limit", 5)
+                if not isinstance(limit_value, int) or isinstance(limit_value, bool):
+                    raise ValueError("limit 必须是整数")
+                allow_deepseek_once = payload.get(
+                    "allow_deepseek_once",
+                    False,
+                )
+                if not isinstance(allow_deepseek_once, bool):
+                    raise ValueError("allow_deepseek_once 必须是布尔值")
+                result = self.action_service.ask_knowledge_question(
+                    question,
+                    actor=actor,
+                    history=history,
+                    limit=limit_value,
+                    allow_deepseek_once=allow_deepseek_once,
+                )
+            elif corpus_scan:
+                root = payload.get("root", "")
+                if not isinstance(root, str):
+                    raise ValueError("root 必须是字符串")
+                project_name = payload.get("project_name")
+                if project_name is not None and not isinstance(project_name, str):
+                    raise ValueError("project_name 必须是字符串")
+                allow_legacy = payload.get(
+                    "allow_legacy_word_conversion", False
+                )
+                if not isinstance(allow_legacy, bool):
+                    raise ValueError(
+                        "allow_legacy_word_conversion 必须是布尔值"
+                    )
+                result = self.action_service.scan_corpus(
+                    root,
+                    actor=actor,
+                    project_name=project_name,
+                    allow_legacy_word_conversion=allow_legacy,
+                )
+            elif corpus_file_decision_id is not None:
+                result = self.action_service.decide_corpus_file(
+                    corpus_file_decision_id,
+                    scope_status=str(payload.get("scope_status", "")),
+                    authority_status=str(
+                        payload.get("authority_status", "unknown")
+                    ),
+                    actor=actor,
+                    reason=str(payload.get("reason", "")),
+                )
+            elif corpus_file_import_id is not None:
+                result = self.action_service.import_corpus_file(
+                    corpus_file_import_id,
+                    classification=str(
+                        payload.get("classification", "internal")
+                    ),
+                    actor=actor,
+                )
+            elif document_open_id is not None:
+                result = self.action_service.open_document(
+                    document_open_id,
+                    actor=actor,
+                )
+            elif evidence_id is not None:
                 result = self.action_service.transition_evidence(
                     evidence_id, target, actor=actor
                 )
@@ -532,10 +647,20 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = False
 
     def __init__(self, server_address, application: WorkbenchWebApplication):
         super().__init__(server_address, WorkbenchRequestHandler)
         self.application = application
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+                1,
+            )
+        super().server_bind()
 
 
 def build_web_server(
@@ -597,6 +722,12 @@ def _route_entity_id(path: str, *, entity: str, action: str) -> str | None:
     parts = path.split("/")
     if action == "detail":
         if len(parts) == 5 and parts[1:4] == ["api", "v1", entity]:
+            return unquote(parts[4]) or None
+        if (
+            len(parts) == 6
+            and parts[1:4] == ["api", "v1", entity]
+            and parts[5] == "detail"
+        ):
             return unquote(parts[4]) or None
         return None
     if (

@@ -1,5 +1,6 @@
 import json
 import http.client
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -7,6 +8,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from knowledge_workbench.audit import record_event
 from knowledge_workbench.config import WorkspacePaths
 from knowledge_workbench.conflict_candidates import (
     create_cross_document_candidate_pack,
@@ -36,18 +38,297 @@ from knowledge_workbench.webapp import (
 
 
 class WorkbenchWebTests(unittest.TestCase):
+    def test_latest_request_guard_rejects_stale_and_invalidated_requests(self):
+        javascript = (
+            Path(__file__).parents[1]
+            / "src"
+            / "knowledge_workbench"
+            / "web_assets"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+        start_marker = "// latest-request-guard:start"
+        end_marker = "// latest-request-guard:end"
+        self.assertIn(start_marker, javascript)
+        self.assertIn(end_marker, javascript)
+        guard_source = javascript.split(start_marker, 1)[1].split(
+            end_marker, 1
+        )[0]
+        contract = f"""
+        "use strict";
+        {guard_source}
+        const guard = createLatestRequestGuard();
+        const first = guard.begin();
+        const second = guard.begin();
+        if (guard.isLatest(first)) throw new Error("stale request accepted");
+        if (!guard.isLatest(second)) throw new Error("latest request rejected");
+        guard.invalidate();
+        if (guard.isLatest(second)) throw new Error("closed request accepted");
+        const explicitOpen = guard.begin();
+        if (!guard.isLatest(explicitOpen)) {{
+          throw new Error("new explicit request rejected after close");
+        }}
+        """
+        completed = subprocess.run(
+            ["node", "-e", contract],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("corpusMapRequestGuard", javascript)
+        self.assertIn("corpusCardRequestGuard", javascript)
+
+    def test_knowledge_setup_endpoint_returns_human_readable_topics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = WorkspacePaths(Path(temporary) / "workspace")
+            database = Database(paths.database)
+            database.initialize("t1")
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+
+            response = application.handle("GET", "/api/v1/knowledge-setup")
+            payload = json.loads(response.body.decode("utf-8"))
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["authority_confirmations"], [])
+            self.assertEqual(len(payload["topic_candidates"]), 9)
+            self.assertIn(
+                "组织、角色、权限与准入",
+                {
+                    item["title"]
+                    for item in payload["topic_candidates"]
+                },
+            )
+
+    def test_corpus_map_web_flow_uses_plain_language_and_does_not_import_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "待整理资料"
+            source.mkdir()
+            (source / "项目制度-v1.md").write_text(
+                "# 适用范围\n本制度适用于项目甲。\n\n## 生效时间\n2026年8月生效。",
+                encoding="utf-8",
+            )
+            paths = WorkspacePaths(root / "workspace")
+            database = Database(paths.database)
+            database.initialize("t1")
+            read_service = WorkbenchReadService(database, paths)
+            application = WorkbenchWebApplication(
+                read_service,
+                WorkbenchActionService(database, paths),
+                csrf_token="csrf",
+            )
+
+            scan = application.handle(
+                "POST",
+                "/api/v1/corpus-map/scan",
+                body=json.dumps(
+                    {
+                        "actor": "mapper-01",
+                        "root": str(source),
+                        "project_name": "项目甲",
+                        "allow_legacy_word_conversion": False,
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                    "Origin": "http://127.0.0.1:8765",
+                    "Host": "127.0.0.1:8765",
+                },
+            )
+            self.assertEqual(scan.status, 200)
+            listing = application.handle("GET", "/api/v1/corpus-map")
+            payload = json.loads(listing.body.decode("utf-8"))
+            self.assertEqual(payload["scan"]["project_name"], "项目甲")
+            self.assertIn("系统读取了", payload["items"][0]["plain_summary"])
+            file_id = payload["items"][0]["file_id"]
+
+            filtered = application.handle(
+                "GET", "/api/v1/corpus-map?view=readable"
+            )
+            self.assertEqual(filtered.status, 200)
+            self.assertEqual(
+                json.loads(filtered.body.decode("utf-8"))["view"],
+                "readable",
+            )
+            invalid = application.handle(
+                "GET", "/api/v1/corpus-map?view=not-supported"
+            )
+            self.assertEqual(invalid.status, 404)
+
+            detail_response = application.handle(
+                "GET",
+                f"/api/v1/corpus-files/{file_id}",
+            )
+            self.assertEqual(detail_response.status, 200)
+            detail = json.loads(detail_response.body.decode("utf-8"))
+            self.assertEqual(detail["file_id"], file_id)
+            self.assertEqual(
+                detail["display_title"],
+                payload["items"][0]["display_title"],
+            )
+
+            compatibility_response = application.handle(
+                "GET",
+                f"/api/v1/corpus-files/{file_id}/detail",
+            )
+            self.assertEqual(compatibility_response.status, 200)
+            self.assertEqual(
+                json.loads(compatibility_response.body.decode("utf-8"))["file_id"],
+                file_id,
+            )
+
+            decision = application.handle(
+                "POST",
+                f"/api/v1/corpus-files/{file_id}/decide",
+                body=json.dumps(
+                    {
+                        "actor": "owner-01",
+                        "scope_status": "in_scope",
+                        "authority_status": "authoritative",
+                        "reason": "这是项目负责人确认的现行制度",
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                    "Origin": "http://127.0.0.1:8765",
+                    "Host": "127.0.0.1:8765",
+                },
+            )
+            self.assertEqual(decision.status, 200)
+            decided = json.loads(decision.body.decode("utf-8"))["result"]
+            self.assertEqual(decided["scope_status"], "in_scope")
+            self.assertEqual(decided["authority_status"], "authoritative")
+            with database.connect() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
+                    0,
+                )
+
+            imported_response = application.handle(
+                "POST",
+                f"/api/v1/corpus-files/{file_id}/import",
+                body=json.dumps(
+                    {
+                        "actor": "importer-01",
+                        "classification": "internal",
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                    "Origin": "http://127.0.0.1:8765",
+                    "Host": "127.0.0.1:8765",
+                },
+            )
+            self.assertEqual(imported_response.status, 200)
+            imported = json.loads(
+                imported_response.body.decode("utf-8")
+            )["result"]
+            self.assertGreater(imported["evidence_count"], 0)
+            self.assertEqual(
+                imported["technically_validated_evidence_count"],
+                imported["evidence_count"],
+            )
+            self.assertEqual(imported["next_action"], "review_wiki")
+            with database.connect() as connection:
+                governance = connection.execute(
+                    """
+                    SELECT purpose, scope_status, authority_status
+                    FROM document_governance
+                    WHERE document_id = ?
+                    """,
+                    (imported["document_id"],),
+                ).fetchone()
+                evidence_statuses = {
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT status FROM evidence
+                        WHERE processing_run_id = ?
+                        """,
+                        (imported["processing_run_id"],),
+                    ).fetchall()
+                }
+            self.assertEqual(
+                tuple(governance),
+                ("production", "in_scope", "authoritative"),
+            )
+            self.assertEqual(evidence_statuses, {"verified"})
+
+            static_page = application.handle("GET", "/")
+            html = static_page.body.decode("utf-8")
+            javascript = application.handle(
+                "GET", "/assets/app.js"
+            ).body.decode("utf-8")
+            self.assertIn(
+                'id="qa-use-deepseek" type="checkbox" checked disabled',
+                html,
+            )
+            self.assertIn("已绑定；默认用于每次提问", javascript)
+            self.assertIn("async function openDocument(documentId)", javascript)
+            self.assertIn("document-open", javascript)
+            self.assertIn(
+                "deepseek.checked = qaState.deepseekConfigured",
+                javascript,
+            )
+            self.assertIn("先看懂资料，再形成可信知识", html)
+            self.assertIn("普通证据由系统技术校验", html)
+            self.assertIn("知识问答助手", html)
+            self.assertIn("确认导入并生成知识", html)
+            self.assertIn('id="corpus-dialog-preview"', html)
+            self.assertIn("data-corpus-view", javascript)
+            self.assertIn("selectCorpusView", javascript)
+            self.assertIn("查看对方说明", javascript)
+            self.assertIn("代表性正文节选", javascript)
+            self.assertIn("范围表示这份资料是否属于当前知识库", html)
+            self.assertNotIn("Evidence-first", html)
+            bootstrap = json.loads(
+                application.handle("GET", "/api/v1/bootstrap").body.decode("utf-8")
+            )
+            self.assertIn(
+                "corpus-file-import",
+                bootstrap["web"]["write_capabilities"],
+            )
+
     def test_read_service_uses_current_runs_and_redacts_restricted_names(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = WorkspacePaths(root / "workspace")
             internal = root / "内部说明.md"
             restricted = root / "绝密项目.md"
+            development = root / "开发数据" / "数据库设计.md"
+            development.parent.mkdir()
             internal.write_text("内部证据一。\n\n内部证据二。", encoding="utf-8")
             restricted.write_text("受限证据。", encoding="utf-8")
+            development.write_text("开发背景资料。", encoding="utf-8")
             ingest_file(internal, paths, Classification.INTERNAL)
             ingest_file(restricted, paths, Classification.RESTRICTED)
+            development_result = ingest_file(
+                development,
+                paths,
+                Classification.INTERNAL,
+            )
             database = Database(paths.database)
-            with database.connect() as connection:
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'development_fixture',
+                        scope_status = 'out_of_scope'
+                    WHERE document_id = ?
+                    """,
+                    (development_result.document_id,),
+                )
                 restricted_evidence_id = connection.execute(
                     """
                     SELECT e.id FROM evidence e
@@ -71,6 +352,10 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(summary["document_count"], 2)
             self.assertEqual(summary["current_evidence_count"], 3)
             self.assertEqual(documents["total"], 2)
+            self.assertNotIn(
+                "数据库设计",
+                json.dumps(documents, ensure_ascii=False),
+            )
             restricted_item = next(
                 item
                 for item in documents["items"]
@@ -183,15 +468,15 @@ class WorkbenchWebTests(unittest.TestCase):
             )
             self.assertEqual(invalid_conflict_status.status, 400)
 
-    def test_review_queue_pages_cover_conflicts_and_current_wiki_revisions(self):
+    def test_review_queue_hides_document_drafts_but_keeps_conflicts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = WorkspacePaths(root / "workspace")
             source = root / "审核策略.md"
             source.write_text("系统允许用户提交申请。", encoding="utf-8")
-            ingest_file(source, paths, Classification.INTERNAL)
+            result = ingest_file(source, paths, Classification.INTERNAL)
             database = Database(paths.database)
-            with database.connect() as connection:
+            with database.transaction() as connection:
                 revision_id = connection.execute(
                     """
                     SELECT wr.id
@@ -201,20 +486,39 @@ class WorkbenchWebTests(unittest.TestCase):
                     LIMIT 1
                     """
                 ).fetchone()[0]
+                connection.execute(
+                    """
+                    UPDATE evidence SET status = 'verified'
+                    WHERE processing_run_id = ?
+                    """,
+                    (result.processing_run_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference'
+                    WHERE document_id = ?
+                    """,
+                    (result.document_id,),
+                )
             service = WorkbenchReadService(database, paths)
             draft_revisions = service.review_queue_page(
                 kind="wiki_revisions", query="审核策略", status="draft"
             )
-            self.assertEqual(draft_revisions["total"], 1)
+            self.assertEqual(draft_revisions["total"], 0)
+            self.assertEqual(
+                service.revision_detail(revision_id)["page_kind"],
+                "document",
+            )
             request_revision_review(database, revision_id, actor="reviewer-01")
 
             revisions = service.review_queue_page(
                 kind="wiki_revisions", query="审核策略", status="reviewing"
             )
 
-            self.assertEqual(revisions["total"], 1)
-            self.assertEqual(revisions["items"][0]["revision_id"], revision_id)
-            self.assertEqual(revisions["items"][0]["status"], "reviewing")
+            self.assertEqual(revisions["total"], 0)
 
             source.write_text("系统禁止用户提交申请。", encoding="utf-8")
             ingest_file(source, paths, Classification.INTERNAL)
@@ -226,6 +530,103 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertEqual(conflicts["items"][0]["status"], "pending")
             self.assertEqual(conflicts["items"][0]["document_name"], "审核策略.md")
 
+    def test_revision_detail_blocks_single_document_source_mismatch_before_reading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            source_page = root / "source-page.md"
+            other_source = root / "other-source.md"
+            source_page.write_text(
+                "RESTRICTED-CONTENT-SENTINEL",
+                encoding="utf-8",
+            )
+            other_source.write_text("普通内部依据。", encoding="utf-8")
+            source_result = ingest_file(
+                source_page,
+                paths,
+                Classification.INTERNAL,
+            )
+            other_result = ingest_file(
+                other_source,
+                paths,
+                Classification.INTERNAL,
+            )
+            database = Database(paths.database)
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference'
+                    """
+                )
+                connection.execute("UPDATE evidence SET status = 'verified'")
+                other_evidence_id = connection.execute(
+                    """
+                    SELECT id FROM evidence
+                    WHERE processing_run_id = ?
+                    """,
+                    (other_result.processing_run_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    "DELETE FROM revision_evidence WHERE revision_id = ?",
+                    (source_result.revision_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO revision_evidence(revision_id, evidence_id)
+                    VALUES (?, ?)
+                    """,
+                    (source_result.revision_id, other_evidence_id),
+                )
+
+            service = WorkbenchReadService(database, paths)
+            blocked = service.revision_detail(source_result.revision_id)
+            self.assertEqual(blocked["content_integrity"], "source_blocked")
+            self.assertEqual(blocked["content_preview"], "")
+            self.assertFalse(blocked["can_submit_review"])
+
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET classification = 'restricted'
+                    WHERE id = ?
+                    """,
+                    (source_result.document_id,),
+                )
+            with self.assertRaises(PermissionError):
+                service.revision_detail(source_result.revision_id)
+
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE wiki_revisions
+                    SET status = 'rejected'
+                    WHERE id = ?
+                    """,
+                    (source_result.revision_id,),
+                )
+                record_event(
+                    connection,
+                    "wiki_revision_rejected",
+                    "wiki_revision",
+                    source_result.revision_id,
+                    actor="reviewer-01",
+                    details={"note": "SECRET NOTE"},
+                )
+            history = service.rejected_revision_history()
+            leaked_item = next(
+                item
+                for item in history["items"]
+                if item["revision_id"] == source_result.revision_id
+            )
+            self.assertEqual(leaked_item["classification"], "restricted")
+            self.assertEqual(leaked_item["page_title"], "[受限知识页]")
+            self.assertIsNone(leaked_item["review_note"])
+            self.assertFalse(leaked_item["source_is_current"])
+
     def test_rejected_revision_history_is_read_only_searchable_and_redacted(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -236,9 +637,27 @@ class WorkbenchWebTests(unittest.TestCase):
             restricted.write_text("需要人工修订的受限知识。", encoding="utf-8")
             internal_result = ingest_file(internal, paths, Classification.INTERNAL)
             restricted_result = ingest_file(
-                restricted, paths, Classification.RESTRICTED
+                restricted, paths, Classification.INTERNAL
             )
             database = Database(paths.database)
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE evidence SET status = 'verified'
+                    WHERE document_version_id IN (?, ?)
+                    """,
+                    (internal_result.version_id, restricted_result.version_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference'
+                    WHERE document_id IN (?, ?)
+                    """,
+                    (internal_result.document_id, restricted_result.document_id),
+                )
             request_revision_review(
                 database, internal_result.revision_id, actor="author-01"
             )
@@ -257,6 +676,14 @@ class WorkbenchWebTests(unittest.TestCase):
                 actor="reviewer-02",
                 note="绝密修改建议不得在 Web 暴露。",
             )
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE documents SET classification = 'restricted'
+                    WHERE id = ?
+                    """,
+                    (restricted_result.document_id,),
+                )
             service = WorkbenchReadService(database, paths)
 
             first_page = service.rejected_revision_history(limit=1, offset=0)
@@ -324,6 +751,24 @@ class WorkbenchWebTests(unittest.TestCase):
                 restricted, paths, Classification.RESTRICTED
             )
             database = Database(paths.database)
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE evidence SET status = 'verified'
+                    WHERE document_version_id = ?
+                    """,
+                    (internal_result.version_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference'
+                    WHERE document_id = ?
+                    """,
+                    (internal_result.document_id,),
+                )
             application = WorkbenchWebApplication(
                 WorkbenchReadService(database, paths),
                 WorkbenchActionService(database, paths),
@@ -339,7 +784,18 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertTrue(detail_payload["can_submit_review"])
             self.assertEqual(detail_payload["content_integrity"], "verified")
             self.assertEqual(detail_payload["evidence_count"], 1)
+            self.assertEqual(
+                detail_payload["content_preview_format"],
+                "plain_text",
+            )
             self.assertIn("可进入复核的知识证据", detail_payload["content_preview"])
+            self.assertNotIn("---", detail_payload["content_preview"])
+            self.assertNotIn(
+                internal_result.revision_id,
+                detail_payload["content_preview"],
+            )
+            self.assertNotIn("SHA-256", detail_payload["content_preview"])
+            self.assertNotIn("faithful-draft", detail_payload["content_preview"])
             serialized = json.dumps(detail_payload, ensure_ascii=False)
             self.assertNotIn("markdown_path", serialized)
             self.assertNotIn("source_path", serialized)
@@ -489,7 +945,7 @@ class WorkbenchWebTests(unittest.TestCase):
             self.assertIsNotNone(internal_result.revision_id)
             self.assertIsNotNone(restricted_result.revision_id)
             database = Database(paths.database)
-            with database.connect() as connection:
+            with database.transaction() as connection:
                 internal_evidence_id = connection.execute(
                     "SELECT id FROM evidence WHERE processing_run_id = ?",
                     (internal_result.processing_run_id,),
@@ -498,12 +954,16 @@ class WorkbenchWebTests(unittest.TestCase):
                     "SELECT id FROM evidence WHERE processing_run_id = ?",
                     (restricted_result.processing_run_id,),
                 ).fetchone()[0]
-            request_revision_review(
-                database, internal_result.revision_id, actor="author-01"
-            )
-            request_revision_review(
-                database, restricted_result.revision_id, actor="author-01"
-            )
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference'
+                    WHERE document_id = ?
+                    """,
+                    (internal_result.document_id,),
+                )
             application = WorkbenchWebApplication(
                 WorkbenchReadService(database, paths),
                 WorkbenchActionService(database, paths),
@@ -556,6 +1016,9 @@ class WorkbenchWebTests(unittest.TestCase):
                 internal_evidence_id,
                 EvidenceStatus.VERIFIED,
                 actor="reviewer-01",
+            )
+            request_revision_review(
+                database, internal_result.revision_id, actor="author-01"
             )
             ready_detail = application.handle(
                 "GET", f"/api/v1/wiki-revisions/{internal_result.revision_id}"
@@ -702,6 +1165,17 @@ class WorkbenchWebTests(unittest.TestCase):
                 )
                 transition_evidence(
                     database, evidence_id, EvidenceStatus.VERIFIED, actor="reviewer-01"
+                )
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference'
+                    WHERE document_id = ?
+                    """,
+                    (result.document_id,),
                 )
             request_revision_review(database, result.revision_id, actor="author-01")
             application = WorkbenchWebApplication(
@@ -1752,6 +2226,190 @@ class WorkbenchWebTests(unittest.TestCase):
             )
             self.assertEqual(history["items"][0]["status"], "retracted")
 
+    def test_open_document_uses_current_raw_copy_and_blocks_unsafe_documents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            internal_source = root / "内部资料.md"
+            internal_source.write_text("内部正文。", encoding="utf-8")
+            imported = ingest_file(
+                internal_source,
+                paths,
+                Classification.INTERNAL,
+            )
+            database = Database(paths.database)
+            opened: list[Path] = []
+            actions = WorkbenchActionService(
+                database,
+                paths,
+                file_opener=opened.append,
+            )
+
+            result = actions.open_document(
+                imported.document_id,
+                actor="reader-01",
+            )
+
+            self.assertEqual(
+                result,
+                {
+                    "document_id": imported.document_id,
+                    "display_name": "内部资料.md",
+                    "opened": True,
+                },
+            )
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(opened[0].is_relative_to(paths.raw.resolve()))
+            self.assertNotEqual(opened[0], internal_source.resolve())
+            with database.connect() as connection:
+                event = connection.execute(
+                    """
+                    SELECT event_type, entity_type, entity_id, actor, details_json
+                    FROM audit_log
+                    WHERE event_type = 'document_opened_locally'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            self.assertIsNotNone(event)
+            self.assertEqual(event["event_type"], "document_opened_locally")
+            self.assertEqual(event["entity_type"], "document")
+            self.assertEqual(event["entity_id"], imported.document_id)
+            self.assertEqual(event["actor"], "reader-01")
+            self.assertEqual(
+                json.loads(event["details_json"]),
+                {"version_id": imported.version_id},
+            )
+            self.assertNotIn(str(paths.root), event["details_json"])
+            self.assertNotIn("stored_path", event["details_json"])
+
+            restricted_source = root / "受限资料.md"
+            restricted_source.write_text("受限正文。", encoding="utf-8")
+            restricted = ingest_file(
+                restricted_source,
+                paths,
+                Classification.RESTRICTED,
+            )
+            with self.assertRaisesRegex(PermissionError, "受限资料"):
+                actions.open_document(
+                    restricted.document_id,
+                    actor="reader-01",
+                )
+            self.assertEqual(len(opened), 1)
+
+            tampered_source = root / "越界资料.md"
+            tampered_source.write_text("普通正文。", encoding="utf-8")
+            tampered = ingest_file(
+                tampered_source,
+                paths,
+                Classification.INTERNAL,
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE document_versions
+                    SET stored_path = '../outside.md'
+                    WHERE id = ?
+                    """,
+                    (tampered.version_id,),
+                )
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError,
+                "只读资料目录",
+            ):
+                actions.open_document(
+                    tampered.document_id,
+                    actor="reader-01",
+                )
+            self.assertEqual(len(opened), 1)
+
+    def test_document_open_route_is_post_only_and_uses_write_protections(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            source = root / "本机打开资料.md"
+            source.write_text("仅供本机阅读。", encoding="utf-8")
+            imported = ingest_file(
+                source,
+                paths,
+                Classification.INTERNAL,
+            )
+            database = Database(paths.database)
+            opened: list[Path] = []
+            application = WorkbenchWebApplication(
+                WorkbenchReadService(database, paths),
+                WorkbenchActionService(
+                    database,
+                    paths,
+                    file_opener=opened.append,
+                ),
+                csrf_token="csrf",
+            )
+            route = f"/api/v1/documents/{imported.document_id}/open"
+            body = json.dumps({"actor": "reader-01"}).encode("utf-8")
+
+            bootstrap = json.loads(
+                application.handle("GET", "/api/v1/bootstrap").body
+            )
+            self.assertIn(
+                "document-open-local",
+                bootstrap["web"]["write_capabilities"],
+            )
+            get_response = application.handle("GET", route)
+            self.assertEqual(get_response.status, 404)
+            self.assertEqual(opened, [])
+
+            missing_csrf = application.handle(
+                "POST",
+                route,
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": "http://127.0.0.1:8765",
+                    "Host": "127.0.0.1:8765",
+                },
+            )
+            self.assertEqual(missing_csrf.status, 403)
+            self.assertEqual(opened, [])
+
+            wrong_origin = application.handle(
+                "POST",
+                route,
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                    "Origin": "http://attacker.invalid",
+                    "Host": "127.0.0.1:8765",
+                },
+            )
+            self.assertEqual(wrong_origin.status, 403)
+            self.assertEqual(opened, [])
+
+            opened_response = application.handle(
+                "POST",
+                route,
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Workbench-CSRF": "csrf",
+                    "Origin": "http://127.0.0.1:8765",
+                    "Host": "127.0.0.1:8765",
+                },
+            )
+            self.assertEqual(opened_response.status, 200)
+            payload = json.loads(opened_response.body.decode("utf-8"))
+            self.assertTrue(payload["result"]["opened"])
+            self.assertEqual(
+                set(payload["result"]),
+                {"document_id", "display_name", "opened"},
+            )
+            serialized = opened_response.body.decode("utf-8")
+            self.assertNotIn(str(paths.root), serialized)
+            self.assertNotIn("stored_path", serialized)
+            self.assertNotIn("仅供本机阅读", serialized)
+            self.assertEqual(len(opened), 1)
+
     def test_http_server_sets_security_headers_and_binds_loopback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1764,6 +2422,12 @@ class WorkbenchWebTests(unittest.TestCase):
                 build_web_server(database, paths, host="0.0.0.0", port=0)
 
             server = build_web_server(database, paths, port=0)
+            with self.assertRaises(OSError):
+                build_web_server(
+                    database,
+                    paths,
+                    port=server.server_address[1],
+                )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:

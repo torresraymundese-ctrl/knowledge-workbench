@@ -40,10 +40,20 @@ def create_conflict_labeling_plan(
     actor: str,
     batch_size: int = 60,
     seed: str = DEFAULT_CONFLICT_LABELING_PLAN_SEED,
+    focus_predicted_type: str | None = None,
+    focus_limit: int | None = None,
 ) -> dict[str, Any]:
     actor = _required_actor(actor)
     batch_size = _validated_batch_size(batch_size)
     seed = _validated_seed(seed)
+    focus_predicted_type = _validated_focus_predicted_type(
+        focus_predicted_type
+    )
+    focus_limit = _validated_focus_limit(
+        focus_limit,
+        batch_size=batch_size,
+        focus_enabled=focus_predicted_type is not None,
+    )
     output = _validated_output(paths, output)
     source_pack = _read_candidate_pack(paths, source_pack_path)
     _validate_pack_identity(source_pack)
@@ -55,11 +65,21 @@ def create_conflict_labeling_plan(
     if not source_pack["candidates"]:
         raise KnowledgeWorkbenchError("冲突候选包没有可分配的候选")
 
-    batches = _partition_candidates(
-        source_pack["candidates"],
-        batch_size=batch_size,
-        seed=seed,
-    )
+    focus_candidate_ids: list[str] = []
+    if focus_predicted_type is None:
+        batches = _partition_candidates(
+            source_pack["candidates"],
+            batch_size=batch_size,
+            seed=seed,
+        )
+    else:
+        batches, focus_candidate_ids = _partition_focused_candidates(
+            source_pack["candidates"],
+            batch_size=batch_size,
+            seed=seed,
+            predicted_type=focus_predicted_type,
+            focus_limit=focus_limit,
+        )
     plan = {
         "schema_version": "1.0",
         "kind": "cross-document-conflict-labeling-plan",
@@ -83,6 +103,15 @@ def create_conflict_labeling_plan(
         },
         "batches": batches,
     }
+    if focus_predicted_type is not None:
+        plan["focus"] = {
+            "predicted_type": focus_predicted_type,
+            "requested_limit": focus_limit,
+            "candidate_count": len(focus_candidate_ids),
+            "selection_method": (
+                "unlabeled_similarity_desc_then_seeded_sha256"
+            ),
+        }
     plan["plan_id"] = _plan_id(plan)
     validate_conflict_labeling_plan(plan)
     content = json.dumps(
@@ -110,6 +139,21 @@ def create_conflict_labeling_plan(
                     "batch_count": len(batches),
                     "batch_size": batch_size,
                     "seed_sha256": sha256_text(seed),
+                    "focus_predicted_type": focus_predicted_type,
+                    "focus_requested_limit": focus_limit,
+                    "focus_candidate_count": len(
+                        focus_candidate_ids
+                    ),
+                    "focus_candidate_ids_sha256": (
+                        sha256_text(
+                            json.dumps(
+                                focus_candidate_ids,
+                                separators=(",", ":"),
+                            )
+                        )
+                        if focus_candidate_ids
+                        else None
+                    ),
                 },
             )
     except Exception:
@@ -157,12 +201,21 @@ def inspect_conflict_labeling_plan(
 
     items = []
     totals = Counter()
+    stratum_totals: dict[str, Counter[str]] = defaultdict(Counter)
     for batch in plan["batches"]:
         counts = Counter()
         for candidate_id in batch["candidate_ids"]:
             candidate = candidates[candidate_id]
+            stratum = _candidate_stratum(candidate)
+            stratum_totals[stratum]["candidate_count"] += 1
             if candidate["label"]["expected_conflict"] is not None:
                 counts["labeled"] += 1
+                stratum_totals[stratum]["labeled_count"] += 1
+                if candidate["label"]["expected_conflict"]:
+                    counts["known_conflict_labeled"] += 1
+                    stratum_totals[stratum][
+                        "known_conflict_labeled_count"
+                    ] += 1
             decision = candidate["review"]["decision"]
             if decision is not None:
                 counts["reviewed"] += 1
@@ -176,6 +229,22 @@ def inspect_conflict_labeling_plan(
                     else "unattributed"
                 )
                 counts[f"{assurance}_approved"] += 1
+                stratum_totals[stratum]["approved_count"] += 1
+                stratum_totals[stratum][
+                    f"{assurance}_approved_count"
+                ] += 1
+                if (
+                    assurance
+                    in {
+                        INDEPENDENT_REVIEW_MODE,
+                        SOLO_ATTESTED_REVIEW_MODE,
+                    }
+                    and candidate["label"]["expected_conflict"] is True
+                ):
+                    counts["human_attested_known_conflict"] += 1
+                    stratum_totals[stratum][
+                        "human_attested_known_conflict_count"
+                    ] += 1
         counts["total"] = len(batch["candidate_ids"])
         totals.update(counts)
         items.append(
@@ -238,6 +307,12 @@ def inspect_conflict_labeling_plan(
             ],
             "unlabeled_count": candidate_count - totals["labeled"],
             "unreviewed_count": candidate_count - totals["reviewed"],
+            "known_conflict_labeled_count": totals[
+                "known_conflict_labeled"
+            ],
+            "human_attested_known_conflict_count": totals[
+                "human_attested_known_conflict"
+            ],
             "annotation_complete": totals["labeled"] == candidate_count,
             "review_complete": totals["approved"] == candidate_count,
             "human_attested_review_complete": (
@@ -252,6 +327,33 @@ def inspect_conflict_labeling_plan(
                 totals["independent_approved"] == candidate_count
             ),
             "review_audit_current": review_audit_current,
+            "stratum_status": {
+                stratum: {
+                    "candidate_count": counts["candidate_count"],
+                    "labeled_count": counts["labeled_count"],
+                    "approved_count": counts["approved_count"],
+                    "human_attested_approved_count": (
+                        counts["independent_approved_count"]
+                        + counts["solo_attested_approved_count"]
+                    ),
+                    "independent_approved_count": counts[
+                        "independent_approved_count"
+                    ],
+                    "solo_attested_approved_count": counts[
+                        "solo_attested_approved_count"
+                    ],
+                    "unattributed_approved_count": counts[
+                        "unattributed_approved_count"
+                    ],
+                    "known_conflict_labeled_count": counts[
+                        "known_conflict_labeled_count"
+                    ],
+                    "human_attested_known_conflict_count": counts[
+                        "human_attested_known_conflict_count"
+                    ],
+                }
+                for stratum, counts in sorted(stratum_totals.items())
+            },
         },
         "items": items,
     }
@@ -271,6 +373,8 @@ def _review_assurance_by_candidate(
             WHERE entity_type = 'conflict_candidate_pack'
               AND entity_id = ?
               AND event_type IN (
+                'conflict_candidate_label_updated',
+                'conflict_candidate_label_batch_applied',
                 'conflict_candidate_review_updated',
                 'conflict_candidate_review_batch_applied'
               )
@@ -280,29 +384,49 @@ def _review_assurance_by_candidate(
         ).fetchall()
     if not rows:
         return {}, True
-    try:
-        latest_details = json.loads(rows[0]["details_json"])
-    except (TypeError, json.JSONDecodeError):
-        return {}, False
-    if (
-        latest_details.get("content_sha256_after")
-        != current_content_sha256
-    ):
-        return {}, False
+
     assurance: dict[str, tuple[str, str | None]] = {}
-    for row in rows:
+    resolved_candidates: set[str] = set()
+    expected_after_sha256 = current_content_sha256
+    for index, row in enumerate(rows):
         try:
             details = json.loads(row["details_json"])
         except (TypeError, json.JSONDecodeError):
-            continue
+            return {}, False
+        if not isinstance(details.get("content_sha256_before"), str):
+            return {}, False
+        if details.get("content_sha256_after") != expected_after_sha256:
+            if index == 0:
+                return {}, False
+            break
+        expected_after_sha256 = details["content_sha256_before"]
+
+        is_batch = row["event_type"] in {
+            "conflict_candidate_label_batch_applied",
+            "conflict_candidate_review_batch_applied",
+        }
         candidate_ids = (
             details.get("candidate_ids")
-            if row["event_type"]
-            == "conflict_candidate_review_batch_applied"
+            if is_batch
             else [details.get("candidate_id")]
         )
         if not isinstance(candidate_ids, list):
+            return {}, False
+        candidate_ids = [
+            candidate_id
+            for candidate_id in candidate_ids
+            if isinstance(candidate_id, str)
+        ]
+        if not candidate_ids:
+            return {}, False
+
+        if row["event_type"] in {
+            "conflict_candidate_label_updated",
+            "conflict_candidate_label_batch_applied",
+        }:
+            resolved_candidates.update(candidate_ids)
             continue
+
         annotator = details.get("annotator")
         mode = details.get("review_mode")
         if mode not in {
@@ -327,7 +451,7 @@ def _review_assurance_by_candidate(
         if not isinstance(decision_by_candidate, dict):
             decision_by_candidate = {}
         uniform_batch_decision = None
-        if row["event_type"] == "conflict_candidate_review_batch_applied":
+        if is_batch:
             candidate_count = details.get("candidate_count")
             if (
                 isinstance(candidate_count, int)
@@ -340,19 +464,16 @@ def _review_assurance_by_candidate(
             ):
                 uniform_batch_decision = "rejected"
         for candidate_id in candidate_ids:
-            if (
-                isinstance(candidate_id, str)
-                and candidate_id not in assurance
-            ):
+            if candidate_id not in resolved_candidates:
                 decision = (
                     decision_by_candidate.get(candidate_id)
-                    if row["event_type"]
-                    == "conflict_candidate_review_batch_applied"
+                    if is_batch
                     else details.get("decision")
                 )
                 if decision not in {"approved", "rejected"}:
                     decision = uniform_batch_decision
                 assurance[candidate_id] = (mode, decision)
+                resolved_candidates.add(candidate_id)
     return assurance, True
 
 
@@ -512,6 +633,110 @@ def _partition_candidates(
             }
         )
     return batches
+
+
+def _partition_focused_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    seed: str,
+    predicted_type: str,
+    focus_limit: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    eligible = [
+        candidate
+        for candidate in candidates
+        if candidate["predicted_type"] == predicted_type
+        and candidate["label"]["expected_conflict"] is None
+    ]
+    if not eligible:
+        raise KnowledgeWorkbenchError(
+            "没有符合聚焦类型且尚未标注的冲突候选"
+        )
+    selected = sorted(
+        eligible,
+        key=lambda candidate: (
+            -float(candidate["similarity"]),
+            sha256_text(f"{seed}:focus:{candidate['candidate_id']}"),
+            candidate["candidate_id"],
+        ),
+    )[:focus_limit]
+    focus_candidate_ids = [
+        candidate["candidate_id"] for candidate in selected
+    ]
+    focus_id_set = set(focus_candidate_ids)
+    remaining = [
+        candidate
+        for candidate in candidates
+        if candidate["candidate_id"] not in focus_id_set
+    ]
+    tail = (
+        _partition_candidates(
+            remaining,
+            batch_size=batch_size,
+            seed=seed,
+        )
+        if remaining
+        else []
+    )
+    grouped_ids = [
+        focus_candidate_ids,
+        *(batch["candidate_ids"] for batch in tail),
+    ]
+    by_id = {
+        candidate["candidate_id"]: candidate
+        for candidate in candidates
+    }
+    width = max(3, len(str(len(grouped_ids))))
+    batches = []
+    for ordinal, candidate_ids in enumerate(grouped_ids, start=1):
+        counts = Counter(
+            _candidate_stratum(by_id[candidate_id])
+            for candidate_id in candidate_ids
+        )
+        batches.append(
+            {
+                "batch_id": f"batch_{ordinal:0{width}d}",
+                "ordinal": ordinal,
+                "candidate_ids": candidate_ids,
+                "stratum_counts": dict(sorted(counts.items())),
+            }
+        )
+    return batches, focus_candidate_ids
+
+
+def _validated_focus_predicted_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if normalized not in {"value_change", "polarity_change"}:
+        raise KnowledgeWorkbenchError(
+            "聚焦预测类型必须是 value_change 或 polarity_change"
+        )
+    return normalized
+
+
+def _validated_focus_limit(
+    value: int | None,
+    *,
+    batch_size: int,
+    focus_enabled: bool,
+) -> int | None:
+    if not focus_enabled:
+        if value is not None:
+            raise KnowledgeWorkbenchError(
+                "focus_limit 只能与 focus_predicted_type 一起使用"
+            )
+        return None
+    if value is None:
+        return batch_size
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise KnowledgeWorkbenchError("focus_limit 必须是整数")
+    if value < 1 or value > batch_size:
+        raise KnowledgeWorkbenchError(
+            "focus_limit 必须介于 1 与 batch_size 之间"
+        )
+    return value
 
 
 def _candidate_stratum(candidate: dict[str, Any]) -> str:

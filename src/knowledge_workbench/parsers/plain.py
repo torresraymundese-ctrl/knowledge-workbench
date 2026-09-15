@@ -20,7 +20,7 @@ def _read_text(path: Path) -> str:
 class PlainTextParser:
     name = "plain-text"
     version = "1"
-    extensions = frozenset({".txt", ".md", ".markdown"})
+    extensions = frozenset({".txt", ".md", ".markdown", ".sql"})
 
     def parse(self, path: Path) -> ParseResult:
         text = _read_text(path)
@@ -106,4 +106,3 @@ def _column_name(number: int) -> str:
         number, remainder = divmod(number - 1, 26)
         result = chr(65 + remainder) + result
     return result or "A"
-

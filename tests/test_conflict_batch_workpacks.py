@@ -36,6 +36,194 @@ from knowledge_workbench.utils import sha256_file, sha256_text
 
 
 class ConflictBatchWorkPackTests(unittest.TestCase):
+    def test_one_sample_batch_can_be_reviewed_before_candidate_universe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            self._ingest_sources(root, paths)
+            database = Database(paths.database)
+            candidate_path = paths.evaluations / "sample-candidates.json"
+            candidate_pack = create_cross_document_candidate_pack(
+                database,
+                paths,
+                candidate_path,
+                actor="pack-builder",
+                limit=100,
+                minimum_similarity=0.5,
+            )
+            plan_path = paths.evaluations / "sample-plan.json"
+            plan = create_conflict_labeling_plan(
+                database,
+                paths,
+                candidate_path,
+                plan_path,
+                actor="coordinator-01",
+                batch_size=10,
+                seed="sample-review-v1",
+            )
+            self.assertGreater(len(plan["batches"]), 1)
+            batch = plan["batches"][0]
+
+            annotation_path = (
+                paths.evaluations / "sample-batch-annotation.md"
+            )
+            export_conflict_batch_annotation_pack(
+                database,
+                paths,
+                plan["plan_id"],
+                batch["batch_id"],
+                annotation_path,
+                actor="annotator-01",
+            )
+            annotation_path.write_text(
+                self._fill_annotation_pack(
+                    annotation_path.read_text(encoding="utf-8"),
+                    candidate_pack,
+                    batch["candidate_ids"],
+                ),
+                encoding="utf-8",
+            )
+            apply_conflict_batch_annotation_pack(
+                database,
+                paths,
+                annotation_path,
+                actor="annotator-01",
+            )
+
+            status_after_one_batch = inspect_conflict_labeling_plan(
+                database, paths, plan_path
+            )
+            self.assertFalse(
+                status_after_one_batch["summary"][
+                    "annotation_complete"
+                ]
+            )
+            original_candidate_content = candidate_path.read_text(
+                encoding="utf-8"
+            )
+            tampered_pack = json.loads(original_candidate_content)
+            tampered_candidate = next(
+                candidate
+                for candidate in tampered_pack["candidates"]
+                if candidate["candidate_id"]
+                == batch["candidate_ids"][0]
+            )
+            tampered_candidate["label"]["note"] = "绕过工作包修改"
+            candidate_path.write_text(
+                json.dumps(
+                    tampered_pack,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                InvalidTransitionError, "受控标注工作包"
+            ):
+                export_conflict_batch_review_pack(
+                    database,
+                    paths,
+                    plan["plan_id"],
+                    batch["batch_id"],
+                    paths.evaluations / "tampered-review.md",
+                    actor="reviewer-01",
+                )
+            candidate_path.write_text(
+                original_candidate_content,
+                encoding="utf-8",
+            )
+            review_path = paths.evaluations / "sample-batch-review.md"
+            export_conflict_batch_review_pack(
+                database,
+                paths,
+                plan["plan_id"],
+                batch["batch_id"],
+                review_path,
+                actor="reviewer-01",
+            )
+            blank_review = inspect_conflict_batch_work_pack(
+                database, paths, review_path
+            )
+            self.assertEqual(
+                blank_review["source_phase"], "batch_reviewing"
+            )
+            self.assertTrue(blank_review["source_phase_valid"])
+            review_path.write_text(
+                self._approve_review_pack(
+                    review_path.read_text(encoding="utf-8"),
+                    batch["candidate_ids"],
+                ),
+                encoding="utf-8",
+            )
+            apply_conflict_batch_review_pack(
+                database,
+                paths,
+                review_path,
+                actor="reviewer-01",
+            )
+
+            reviewed_status = inspect_conflict_labeling_plan(
+                database, paths, plan_path
+            )
+            self.assertEqual(
+                reviewed_status["summary"][
+                    "human_attested_approved_count"
+                ],
+                len(batch["candidate_ids"]),
+            )
+            self.assertLess(
+                reviewed_status["summary"][
+                    "human_attested_approved_count"
+                ],
+                reviewed_status["summary"]["candidate_count"],
+            )
+
+            next_batch = plan["batches"][1]
+            next_annotation_path = (
+                paths.evaluations / "sample-next-batch-annotation.md"
+            )
+            export_conflict_batch_annotation_pack(
+                database,
+                paths,
+                plan["plan_id"],
+                next_batch["batch_id"],
+                next_annotation_path,
+                actor="annotator-01",
+            )
+            next_annotation_path.write_text(
+                self._fill_annotation_pack(
+                    next_annotation_path.read_text(encoding="utf-8"),
+                    candidate_pack,
+                    next_batch["candidate_ids"],
+                ),
+                encoding="utf-8",
+            )
+            apply_conflict_batch_annotation_pack(
+                database,
+                paths,
+                next_annotation_path,
+                actor="annotator-01",
+            )
+
+            status_after_unrelated_batch = (
+                inspect_conflict_labeling_plan(
+                    database, paths, plan_path
+                )
+            )
+            self.assertTrue(
+                status_after_unrelated_batch["summary"][
+                    "review_audit_current"
+                ]
+            )
+            self.assertEqual(
+                status_after_unrelated_batch["summary"][
+                    "human_attested_approved_count"
+                ],
+                len(batch["candidate_ids"]),
+            )
+
     def test_solo_review_is_attested_but_never_counted_as_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

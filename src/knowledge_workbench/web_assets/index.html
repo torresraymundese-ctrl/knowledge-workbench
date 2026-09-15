@@ -11,71 +11,223 @@
 <body>
   <div class="shell">
     <aside class="sidebar" aria-label="主导航">
-      <a class="brand" href="/" aria-label="知识工作台首页">
+      <a class="brand" href="#qa" data-view-link="qa" aria-label="知识工作台首页">
         <span class="brand-mark">知</span>
-        <span><strong>知识工作台</strong><small>Evidence-first</small></span>
+        <span><strong>知识工作台</strong><small>知识 · 连接 · 行动</small></span>
       </a>
-      <nav>
-        <a class="nav-item active" href="#overview"><span>总览</span><kbd>1</kbd></a>
-        <a class="nav-item" href="#documents"><span>资料</span><kbd>2</kbd></a>
-        <a class="nav-item" href="#reviews"><span>审核队列</span><kbd>3</kbd></a>
-        <a class="nav-item" href="#graph-pilot"><span>图谱试点</span><kbd>4</kbd></a>
-        <a class="nav-item" href="#entity-candidates"><span>实体候选</span><kbd>5</kbd></a>
-        <a class="nav-item" href="#entity-merges"><span>实体合并</span><kbd>6</kbd></a>
-        <a class="nav-item" href="#entity-relationships"><span>业务关系</span><kbd>7</kbd></a>
-        <a class="nav-item" href="#conflict-labeling"><span>冲突标注</span><kbd>8</kbd></a>
-        <a class="nav-item" href="#quality"><span>质量评测</span><kbd>9</kbd></a>
-        <a class="nav-item" href="#activity"><span>审计动态</span><kbd>10</kbd></a>
+      <nav class="primary-navigation">
+        <a class="nav-item" href="#overview"><span class="nav-icon icon-home" aria-hidden="true"></span><span>知识首页</span></a>
+        <a class="nav-item" href="#documents"><span class="nav-icon icon-folder" aria-hidden="true"></span><span>资料库</span></a>
+        <a class="nav-item" href="#topics"><span class="nav-icon icon-book" aria-hidden="true"></span><span>知识主题</span></a>
+        <a class="nav-item active" href="#qa"><span class="nav-icon icon-chat" aria-hidden="true"></span><span>知识问答</span></a>
       </nav>
-      <div class="local-lock">
-        <span class="status-dot" aria-hidden="true"></span>
-        <div><strong>本机受控</strong><small>状态机 + 审计日志</small></div>
-      </div>
+      <details class="management-menu">
+        <summary>
+          <span class="nav-icon icon-settings" aria-hidden="true"></span>
+          <span>管理与维护</span>
+          <span class="management-chevron nav-icon" aria-hidden="true"></span>
+        </summary>
+        <div class="management-panel">
+          <nav class="management-navigation" aria-label="管理功能">
+            <a class="nav-item" href="#corpus-map">资料整理与导入</a>
+            <a class="nav-item" href="#reviews">业务复核</a>
+            <a class="nav-item" href="#graph-pilot">图谱试点</a>
+            <a class="nav-item" href="#entity-candidates">实体候选</a>
+            <a class="nav-item" href="#entity-merges">实体合并</a>
+            <a class="nav-item" href="#entity-relationships">业务关系</a>
+            <a class="nav-item" href="#conflict-labeling">冲突标注</a>
+            <a class="nav-item" href="#quality">质量评测</a>
+            <a class="nav-item" href="#activity">审计动态</a>
+          </nav>
+          <label class="actor-control">
+            <span>当前操作者</span>
+            <input id="actor" type="text" maxlength="80" placeholder="例如：ZZ" autocomplete="off">
+          </label>
+          <div class="management-service-state">
+            <span id="sync-state" class="sync-state"><span></span>正在读取</span>
+            <button id="refresh" type="button">刷新数据</button>
+          </div>
+        </div>
+      </details>
     </aside>
 
     <main>
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">LOCAL KNOWLEDGE OPERATIONS</p>
-          <h1>证据、审核与知识质量，一处掌握</h1>
-        </div>
-        <div class="top-actions">
-          <label class="actor-control">
-            <span>操作者</span>
-            <input id="actor" type="text" maxlength="80" placeholder="reviewer-01" autocomplete="off">
-          </label>
-          <span id="sync-state" class="sync-state"><span></span>正在读取</span>
-          <button id="refresh" type="button">刷新数据</button>
-        </div>
-      </header>
-
-      <section id="overview" aria-labelledby="overview-title">
+      <section id="corpus-map" class="corpus-map-section app-view" aria-labelledby="corpus-map-title">
         <div class="section-heading">
-          <div><p class="eyebrow">OVERVIEW</p><h2 id="overview-title">工作区总览</h2></div>
-          <p id="overview-note" class="muted">读取 SQLite 当前版本与当前处理运行</p>
+          <div>
+            <p class="eyebrow">READ-ONLY CORPUS MAP</p>
+            <h2 id="corpus-map-title">全库资料地图</h2>
+          </div>
+          <span id="corpus-scan-time" class="count-pill">尚未扫描</span>
         </div>
-        <div id="metrics" class="metric-grid" aria-live="polite"></div>
-        <div class="insight-grid">
-          <article class="panel status-panel">
-            <div class="panel-heading"><h3>证据状态分布</h3><span>当前证据</span></div>
-            <div id="evidence-status" class="status-list"></div>
+        <form id="corpus-scan-form" class="panel corpus-scan-form">
+          <label>
+            <span>资料所在目录</span>
+            <input id="corpus-root" type="text" maxlength="1000" required placeholder="例如：D:\企业资料 或 \\NAS\共享资料">
+          </label>
+          <label>
+            <span>项目名称（可选）</span>
+            <input id="corpus-project" type="text" maxlength="200" placeholder="例如：项目A">
+          </label>
+          <label class="corpus-checkbox">
+            <input id="corpus-legacy-word" type="checkbox">
+            <span>允许本机 Word 预读旧版 .doc</span>
+          </label>
+          <button id="corpus-scan-submit" class="primary-filter" type="submit">只读生成资料地图</button>
+        </form>
+        <p class="corpus-boundary">系统只在本机读取您明确指定的目录，用于生成文件位置、内容说明、重复文件和版本候选；不会复制文件、不会导入知识、不会调用云模型。</p>
+        <div id="corpus-summary" class="corpus-summary" aria-live="polite"></div>
+        <div id="knowledge-setup" class="knowledge-setup-grid management-knowledge-setup" aria-live="polite">
+          <article class="panel knowledge-setup-panel">
+            <header class="knowledge-setup-heading">
+              <div>
+                <p class="eyebrow">AUTHORITY CHECK</p>
+                <h3>优先确认的基准资料</h3>
+              </div>
+              <span id="authority-confirmation-count" class="count-pill">正在读取</span>
+            </header>
+            <p class="knowledge-setup-intro">系统只建议优先检查可能影响多个业务主题的资料，不代表已经判定其权威性。请由熟悉业务的人确认是否为当前适用版本。</p>
+            <div id="authority-confirmations" class="knowledge-setup-list">
+              <div class="knowledge-setup-empty">正在整理需要优先确认的资料…</div>
+            </div>
           </article>
-          <article class="panel attention-panel">
-            <div class="panel-heading"><h3>需要关注</h3><span>实时汇总</span></div>
-            <div id="attention" class="attention-list"></div>
-          </article>
+        </div>
+        <form id="corpus-filters" class="review-toolbar corpus-filters" role="search">
+          <label>
+            <span>目录</span>
+            <select id="corpus-folder"><option value="">全部目录</option></select>
+          </label>
+          <label>
+            <span>范围确认</span>
+            <select id="corpus-scope">
+              <option value="">全部状态</option>
+              <option value="unreviewed">尚未确认</option>
+              <option value="in_scope">纳入范围</option>
+              <option value="out_of_scope">不纳入</option>
+            </select>
+          </label>
+          <label>
+            <span>查找资料</span>
+            <input id="corpus-query" type="search" maxlength="120" placeholder="输入资料标题、目录或内容关键词">
+          </label>
+          <div class="review-toolbar-actions">
+            <button class="primary-filter" type="submit">筛选</button>
+            <button id="clear-corpus-filters" type="button">清除</button>
+          </div>
+        </form>
+        <div id="corpus-files" class="corpus-card-grid"></div>
+        <div id="corpus-pagination" class="candidate-pagination panel"></div>
+      </section>
+
+      <section id="topics" class="topic-library-section app-view" aria-labelledby="topics-title">
+        <header class="library-heading">
+          <div>
+            <h1 id="topics-title">知识主题</h1>
+            <p>按业务问题阅读已经整理的知识，不必先知道资料名称。</p>
+          </div>
+          <span id="topic-candidate-count" class="library-count">正在读取</span>
+        </header>
+        <div id="topic-candidates" class="topic-library-list" aria-live="polite">
+          <div class="knowledge-setup-empty">正在整理业务知识主题…</div>
         </div>
       </section>
 
-      <section id="documents" aria-labelledby="documents-title">
-        <div class="section-heading">
-          <div><p class="eyebrow">DOCUMENTS</p><h2 id="documents-title">当前资料</h2></div>
-          <span id="document-count" class="count-pill">—</span>
+      <section id="qa" class="qa-section app-view view-active" aria-labelledby="qa-title">
+        <div class="qa-layout">
+          <article class="qa-console">
+            <header class="qa-hero">
+              <p class="qa-eyebrow">知识问答助手</p>
+              <h1 id="qa-title">今天想从资料中了解什么？</h1>
+              <p>用自然语言提问，知识助手会先读知识主题，再回到原始资料核对来源。</p>
+              <form id="qa-form" class="qa-composer">
+                <label for="qa-question" class="sr-only">输入知识问题</label>
+                <div class="qa-input-shell">
+                  <textarea id="qa-question" rows="3" maxlength="500" required placeholder="请描述你想了解的问题，例如：如何提升研学平台的受众覆盖？"></textarea>
+                  <button id="qa-submit" class="qa-send-button" type="submit" aria-label="发送问题">
+                    <span class="nav-icon icon-send" aria-hidden="true"></span>
+                  </button>
+                </div>
+                <div class="qa-consent-row">
+                  <label class="qa-cloud-consent" for="qa-use-deepseek">
+                    <input id="qa-use-deepseek" type="checkbox" checked disabled>
+                    <span>
+                      <strong>本次允许 DeepSeek 综合</strong>
+                      <small id="qa-deepseek-status">正在检查是否已绑定…</small>
+                    </span>
+                  </label>
+                  <span><span id="qa-character-count">0</span>/500 · Enter 发送</span>
+                </div>
+              </form>
+            </header>
+            <div id="qa-messages" class="qa-messages" role="log" aria-live="polite">
+              <div class="qa-empty-conversation">
+                <span class="empty-chat-icon nav-icon icon-chat" aria-hidden="true"></span>
+                <strong>不需要记住文件名</strong>
+                <p>直接描述业务问题即可。答案出现后，所用知识主题和原始资料会显示在右侧。</p>
+              </div>
+            </div>
+            <footer class="qa-follow-up-area">
+              <div>
+                <strong>你可能还想问</strong>
+                <button id="qa-refresh-suggestions" class="quiet-button" type="button">换一换</button>
+              </div>
+              <div id="qa-follow-ups" class="qa-follow-up-list"></div>
+            </footer>
+          </article>
+          <aside class="qa-boundary qa-sources-pane" aria-label="本次回答的来源">
+            <header>
+              <div>
+                <h2>本次回答的来源</h2>
+                <p>按与问题的相关性展示</p>
+              </div>
+              <button id="qa-clear" class="source-close-button" type="button" aria-label="清空当前对话">
+                <span class="nav-icon icon-close" aria-hidden="true"></span>
+              </button>
+            </header>
+            <div id="qa-source-list" class="qa-source-list">
+              <div class="qa-source-empty">
+                <span class="nav-icon icon-document" aria-hidden="true"></span>
+                <strong>来源会显示在这里</strong>
+                <p>提交问题后，可以从这里打开知识主题或核对原始资料。</p>
+              </div>
+            </div>
+          </aside>
         </div>
-        <div class="panel table-panel">
+      </section>
+
+      <section id="overview" class="knowledge-home-section app-view" aria-labelledby="overview-title">
+        <header class="knowledge-home-hero">
+          <span class="brand-mark">知</span>
+          <p class="eyebrow">先看懂资料，再形成可信知识</p>
+          <h1 id="overview-title">从资料出发，找到可信答案</h1>
+          <p>浏览资料、阅读主题，或者直接向知识助手描述你想了解的问题。</p>
+          <a class="home-primary-action" href="#qa" data-view-link="qa">开始提问</a>
+        </header>
+        <div class="knowledge-home-links">
+          <a href="#documents" data-view-link="documents"><span class="nav-icon icon-folder" aria-hidden="true"></span><strong>浏览资料库</strong><small>查看当前纳入知识范围的资料</small></a>
+          <a href="#topics" data-view-link="topics"><span class="nav-icon icon-book" aria-hidden="true"></span><strong>阅读知识主题</strong><small>按业务问题理解相关资料</small></a>
+          <a href="#qa" data-view-link="qa"><span class="nav-icon icon-chat" aria-hidden="true"></span><strong>询问知识助手</strong><small>不需要记住文件名或章节位置</small></a>
+        </div>
+        <div class="legacy-overview-data" hidden>
+          <p id="overview-note"></p>
+          <div id="metrics"></div>
+          <div id="evidence-status"></div>
+          <div id="attention"></div>
+        </div>
+      </section>
+
+      <section id="documents" class="document-library-section app-view" aria-labelledby="documents-title">
+        <div class="library-heading">
+          <div>
+            <h1 id="documents-title">资料库</h1>
+            <p>这里展示已经纳入当前知识范围、可以被知识助手使用的资料。</p>
+          </div>
+          <span id="document-count" class="library-count">—</span>
+        </div>
+        <div class="table-panel document-library-table">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>资料</th><th>密级</th><th>解析器</th><th>证据</th><th>审核</th><th>Wiki</th></tr></thead>
+              <thead><tr><th>资料名称</th><th>资料类型</th><th>业务范围</th><th>技术提取</th><th>资料作用</th><th>知识状态</th></tr></thead>
               <tbody id="documents-body"></tbody>
             </table>
           </div>
@@ -84,13 +236,13 @@
 
       <section id="reviews" aria-labelledby="reviews-title">
         <div class="section-heading">
-          <div><p class="eyebrow">REVIEW QUEUE</p><h2 id="reviews-title">审核队列</h2></div>
-          <p class="muted">所有操作复用现有状态机并记录 actor</p>
+          <div><p class="eyebrow">BUSINESS REVIEW</p><h2 id="reviews-title">业务复核</h2></div>
+          <p class="muted">普通证据由系统技术校验；人工只处理冲突和 Wiki 业务结论</p>
         </div>
         <form id="review-filters" class="review-toolbar" role="search">
           <label>
             <span>搜索</span>
-            <input id="review-query" type="search" maxlength="120" placeholder="资料名、Wiki 标题、证据 ID 或冲突类型">
+            <input id="review-query" type="search" maxlength="120" placeholder="资料名、Wiki 标题或冲突类型">
           </label>
           <label>
             <span>密级</span>
@@ -103,16 +255,7 @@
             </select>
           </label>
           <fieldset class="review-status-filters">
-            <legend>各队列状态</legend>
-            <label>
-              <span>证据</span>
-              <select id="evidence-review-status">
-                <option value="">全部</option>
-                <option value="draft">草稿</option>
-                <option value="reviewing">审核中</option>
-                <option value="conflicted">有冲突</option>
-              </select>
-            </label>
+            <legend>需要人工判断的内容</legend>
             <label>
               <span>冲突</span>
               <select id="conflict-review-status">
@@ -162,7 +305,7 @@
               <option value="all">全部状态</option>
               <option value="draft">草稿</option>
               <option value="reviewing">审核中</option>
-              <option value="verified">已验证</option>
+              <option value="verified">技术校验通过</option>
               <option value="conflicted">有冲突</option>
               <option value="deprecated">已弃用</option>
               <option value="archived">已归档</option>
@@ -269,7 +412,7 @@
           </label>
           <div class="relationship-evidence-field">
             <div>
-              <strong>共同 verified 证据</strong>
+              <strong>共同的技术校验通过证据</strong>
               <small id="entity-relationship-evidence-summary">选择两个实体后读取候选</small>
             </div>
             <div id="entity-relationship-evidence" class="relationship-evidence-list"></div>
@@ -301,7 +444,7 @@
             <button id="clear-entity-relationship-filter" type="button">清除</button>
           </div>
         </form>
-        <p class="entity-candidate-boundary">关系类型仍由 CLI 管理。Web 仅显示可见实体和当前 verified 非受限共同证据，不批量返回证据原文；登记与撤销均需输入绑定稳定 ID 的确认短语。</p>
+        <p class="entity-candidate-boundary">关系类型仍由 CLI 管理。Web 仅显示可见实体和当前技术校验通过的非受限共同证据，不批量返回证据原文；登记与撤销均需输入绑定稳定 ID 的确认短语。</p>
         <div id="entity-relationship-list" class="entity-candidate-list" aria-live="polite"></div>
         <div id="entity-relationship-pagination" class="candidate-pagination panel"></div>
       </section>
@@ -374,10 +517,68 @@
       <footer>知识工作台 · 本机受控审核里程碑 · SQLite 为状态唯一真相</footer>
     </main>
   </div>
+  <dialog id="corpus-dialog" aria-labelledby="corpus-dialog-title">
+    <div class="dialog-shell corpus-dialog-shell">
+      <header>
+        <div><p class="eyebrow">DOCUMENT CARD</p><h2 id="corpus-dialog-title">文档说明卡</h2></div>
+        <button id="close-corpus-dialog" class="quiet-button" type="button" aria-label="关闭文档说明卡">关闭</button>
+      </header>
+      <div id="corpus-dialog-meta" class="dialog-meta"></div>
+      <p id="corpus-dialog-summary" class="corpus-dialog-summary"></p>
+      <section id="corpus-dialog-preview" class="corpus-dialog-section"></section>
+      <div id="corpus-dialog-outline" class="corpus-dialog-section"></div>
+      <div id="corpus-dialog-signals" class="corpus-dialog-section"></div>
+      <div id="corpus-dialog-relations" class="corpus-dialog-section"></div>
+      <form id="corpus-decision-form" class="corpus-decision-form">
+        <input id="corpus-decision-file-id" type="hidden">
+        <p class="corpus-decision-guidance">
+          范围表示这份资料是否属于当前知识库；权威性表示它能否作为现行主要依据，两者需要分别判断。
+        </p>
+        <label>
+          <span>是否纳入知识范围</span>
+          <select id="corpus-decision-scope" required>
+            <option value="in_scope">纳入范围</option>
+            <option value="out_of_scope">不纳入</option>
+          </select>
+        </label>
+        <label>
+          <span>资料权威性</span>
+          <select id="corpus-decision-authority" required>
+            <option value="unknown">暂不确定</option>
+            <option value="reference">参考资料</option>
+            <option value="authoritative">现行权威资料</option>
+            <option value="superseded">已被新版本替代</option>
+          </select>
+        </label>
+        <label class="corpus-decision-reason">
+          <span>判断依据</span>
+          <textarea id="corpus-decision-reason" rows="2" maxlength="1000" required placeholder="例如：这是项目负责人确认的现行版本"></textarea>
+        </label>
+        <button class="primary-filter" type="submit">保存范围判断</button>
+      </form>
+      <form id="corpus-import-form" class="corpus-import-panel" hidden>
+        <input id="corpus-import-file-id" type="hidden">
+        <div>
+          <h3>下一步：明确导入这份资料</h3>
+          <p id="corpus-import-note">只有完成范围和权威性判断后，才会复制只读原件并生成知识。</p>
+        </div>
+        <label id="corpus-import-classification-field">
+          <span>资料密级</span>
+          <select id="corpus-import-classification" required>
+            <option value="internal">公司内部</option>
+            <option value="public">可以公开</option>
+            <option value="confidential">机密资料</option>
+            <option value="restricted">严格受限</option>
+          </select>
+        </label>
+        <button id="corpus-import-submit" class="primary-filter" type="submit">确认导入并生成知识</button>
+      </form>
+    </div>
+  </dialog>
   <dialog id="evidence-dialog" aria-labelledby="evidence-dialog-title">
     <div class="dialog-shell">
       <header>
-        <div><p class="eyebrow">EVIDENCE REVIEW</p><h2 id="evidence-dialog-title">审核原子证据</h2></div>
+        <div><p class="eyebrow">SOURCE EVIDENCE</p><h2 id="evidence-dialog-title">查看原文证据与定位</h2></div>
         <button id="close-evidence-dialog" class="quiet-button" type="button" aria-label="关闭">关闭</button>
       </header>
       <div id="evidence-dialog-meta" class="dialog-meta"></div>

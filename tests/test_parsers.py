@@ -70,6 +70,26 @@ class DocumentParserTests(unittest.TestCase):
             self.assertEqual(result.units[0].locator["conversion_tool_version"], "1.2.3")
             self.assertEqual(len(result.units[0].locator["converted_sha256"]), 64)
 
+    def test_sql_is_read_as_traceable_plain_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "01-course.sql"
+            path.write_text(
+                "-- 课程主表\n"
+                "CREATE TABLE study_course (\n"
+                "  id BIGINT PRIMARY KEY,\n"
+                "  title VARCHAR(200) NOT NULL\n"
+                ");\n",
+                encoding="utf-8",
+            )
+
+            result = parse_document(path)
+
+            self.assertIn(".sql", supported_extensions())
+            self.assertEqual(result.parser_name, "plain-text")
+            self.assertEqual(result.units[0].locator["line_start"], 1)
+            self.assertEqual(result.units[0].locator["line_end"], 5)
+            self.assertIn("CREATE TABLE study_course", result.units[0].text)
+
     def test_pdf_page_locator(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "sample.pdf"

@@ -215,6 +215,91 @@ class ConflictLabelingPlanTests(unittest.TestCase):
             self.assertNotIn("quality-v1", json.dumps(details))
             self.assertEqual(details["candidate_count"], len(expected))
 
+    def test_focuses_unlabeled_predicted_type_in_first_batch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = WorkspacePaths(root / "workspace")
+            self._ingest_sources(root, paths)
+            database = Database(paths.database)
+            pack_path = paths.evaluations / "focused-candidates.json"
+            pack = create_cross_document_candidate_pack(
+                database,
+                paths,
+                pack_path,
+                actor="pack-builder",
+                limit=100,
+                minimum_similarity=0.5,
+            )
+            eligible = [
+                candidate
+                for candidate in pack["candidates"]
+                if candidate["predicted_type"] == "value_change"
+            ]
+            self.assertGreaterEqual(len(eligible), 2)
+            focus_limit = min(3, len(eligible))
+            plan = create_conflict_labeling_plan(
+                database,
+                paths,
+                pack_path,
+                paths.evaluations / "focused-plan.json",
+                actor="coordinator-01",
+                batch_size=10,
+                seed="focused-quality-v1",
+                focus_predicted_type="value_change",
+                focus_limit=focus_limit,
+            )
+            self.assertEqual(
+                plan["focus"]["candidate_count"], focus_limit
+            )
+            first_ids = plan["batches"][0]["candidate_ids"]
+            self.assertEqual(len(first_ids), focus_limit)
+            by_id = {
+                candidate["candidate_id"]: candidate
+                for candidate in pack["candidates"]
+            }
+            self.assertTrue(
+                all(
+                    by_id[candidate_id]["predicted_type"]
+                    == "value_change"
+                    for candidate_id in first_ids
+                )
+            )
+            assigned = [
+                candidate_id
+                for batch in plan["batches"]
+                for candidate_id in batch["candidate_ids"]
+            ]
+            self.assertCountEqual(
+                assigned,
+                [
+                    candidate["candidate_id"]
+                    for candidate in pack["candidates"]
+                ],
+            )
+            self.assertEqual(len(assigned), len(set(assigned)))
+            inspected = inspect_conflict_labeling_plan(
+                database,
+                paths,
+                paths.evaluations / "focused-plan.json",
+            )
+            self.assertEqual(
+                inspected["items"][0]["candidate_count"],
+                focus_limit,
+            )
+
+            with self.assertRaisesRegex(
+                KnowledgeWorkbenchError, "focus_limit"
+            ):
+                create_conflict_labeling_plan(
+                    database,
+                    paths,
+                    pack_path,
+                    paths.evaluations / "invalid-focus.json",
+                    actor="coordinator-01",
+                    batch_size=10,
+                    focus_limit=2,
+                )
+
     def test_rejects_truncated_tampered_copied_and_stale_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

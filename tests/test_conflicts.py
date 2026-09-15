@@ -72,6 +72,20 @@ class ConflictQueueTests(unittest.TestCase):
             from knowledge_workbench.database import Database
 
             database = Database(paths.database)
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE document_governance
+                    SET purpose = 'production',
+                        scope_status = 'in_scope',
+                        authority_status = 'reference',
+                        reviewed_by = 'scope-reviewer',
+                        reviewed_at = updated_at,
+                        decision_reason = '测试中明确准入'
+                    WHERE document_id = ?
+                    """,
+                    (first.document_id,),
+                )
             with database.connect() as connection:
                 old_evidence_id = connection.execute(
                     "SELECT id FROM evidence WHERE document_version_id = ?",

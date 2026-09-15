@@ -12,6 +12,7 @@ from .config import WorkspacePaths
 from .conflicts import detect_version_conflicts
 from .database import Database
 from .errors import KnowledgeWorkbenchError
+from .governance import infer_knowledge_domain
 from .models import Classification, EvidenceCandidate, IngestResult
 from .parsers import parse_document
 from .pipeline import faithful_analysis, faithful_wiki_generation
@@ -38,14 +39,24 @@ def ingest_file(
     actor: str = "cli",
     reprocess: bool = False,
     allow_legacy_word_conversion: bool = False,
+    expected_sha256: str | None = None,
 ) -> IngestResult:
     source = source.expanduser().resolve()
     if not source.is_file():
         raise KnowledgeWorkbenchError(f"文件不存在：{source}")
+    from .nas_admission import detect_content_credential_risk
+
+    if detect_content_credential_risk(source):
+        raise KnowledgeWorkbenchError("文件正文存在高置信凭据风险，禁止导入知识库")
 
     database = initialize_workspace(paths)
     digest = sha256_file(source)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise KnowledgeWorkbenchError(
+            "来源文件的 SHA-256 与准入记录不一致，已中止导入"
+        )
     normalized_source = os.path.normcase(str(source))
+    knowledge_domain = infer_knowledge_domain(source)
 
     with database.connect() as connection:
         duplicate = connection.execute(
@@ -170,6 +181,25 @@ def ingest_file(
                         now,
                     ),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO document_governance(
+                        document_id, purpose, scope_status, authority_status,
+                        reviewed_by, reviewed_at, decision_reason,
+                        knowledge_domain, created_at, updated_at
+                    ) VALUES (?, 'candidate', 'unreviewed', 'unknown',
+                              NULL, NULL, NULL, ?, ?, ?)
+                    """,
+                    (document_id, knowledge_domain, now, now),
+                )
+            connection.execute(
+                """
+                UPDATE document_governance
+                SET knowledge_domain = ?, updated_at = ?
+                WHERE document_id = ?
+                """,
+                (knowledge_domain, now, document_id),
+            )
 
             raw_directory = paths.raw / document_id
             raw_directory.mkdir(parents=True, exist_ok=True)
@@ -249,6 +279,29 @@ def ingest_file(
                     (candidate.excerpt, evidence_id),
                 )
                 _insert_evidence_locations(connection, evidence_id, candidate)
+                connection.execute(
+                    """
+                    INSERT INTO evidence_technical_validation(
+                        evidence_id, status, validator, checks_json,
+                        validated_at, created_at, updated_at
+                    ) VALUES (?, 'passed', 'faithful-ingest-v1', ?, ?, ?, ?)
+                    """,
+                    (
+                        evidence_id,
+                        json.dumps(
+                            {
+                                "excerpt_nonempty": True,
+                                "source_sha256_bound": True,
+                                "locator_preserved": True,
+                                "processing_run_bound": True,
+                            },
+                            sort_keys=True,
+                        ),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
 
             conflict_ids = detect_version_conflicts(
                 connection,
@@ -395,17 +448,24 @@ def ingest_file(
                 actor=actor,
                 details={"page_id": page_id, "revision": revision_number},
             )
-    except Exception:
-        for generated in (
-            draft_path,
-            mirror_path,
-            analysis_path,
-            generation_path,
-            copied_path,
-        ):
-            if generated and generated.exists():
-                generated.chmod(stat.S_IWRITE | stat.S_IREAD)
-                generated.unlink()
+    except Exception as exc:
+        cleanup_failures = _cleanup_generated_files(
+            (
+                draft_path,
+                mirror_path,
+                analysis_path,
+                generation_path,
+                copied_path,
+            )
+        )
+        if cleanup_failures:
+            exc.add_note(
+                "导入事务已回滚，但以下运行期文件无法清理："
+                + ", ".join(
+                    f"{path.name} ({type(error).__name__})"
+                    for path, error in cleanup_failures
+                )
+            )
         raise
 
     return IngestResult(
@@ -419,6 +479,28 @@ def ingest_file(
         conflict_count=len(conflict_ids),
         processing_run_id=processing_run_id,
     )
+
+
+def _cleanup_generated_files(
+    generated_paths: tuple[Path | None, ...],
+) -> list[tuple[Path, OSError]]:
+    """Best-effort cleanup that preserves the original ingest failure."""
+    failures: list[tuple[Path, OSError]] = []
+    for generated in generated_paths:
+        if generated is None:
+            continue
+        try:
+            generated.chmod(stat.S_IWRITE | stat.S_IREAD)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Unlink may still succeed on platforms where chmod failed.
+            pass
+        try:
+            generated.unlink(missing_ok=True)
+        except OSError as error:
+            failures.append((generated, error))
+    return failures
 
 
 def _reprocess_existing(
@@ -599,6 +681,29 @@ def _reprocess_existing(
                     (candidate.excerpt, evidence_id),
                 )
                 _insert_evidence_locations(connection, evidence_id, candidate)
+                connection.execute(
+                    """
+                    INSERT INTO evidence_technical_validation(
+                        evidence_id, status, validator, checks_json,
+                        validated_at, created_at, updated_at
+                    ) VALUES (?, 'passed', 'faithful-reprocess-v1', ?, ?, ?, ?)
+                    """,
+                    (
+                        evidence_id,
+                        json.dumps(
+                            {
+                                "excerpt_nonempty": True,
+                                "source_sha256_bound": True,
+                                "locator_preserved": True,
+                                "processing_run_bound": True,
+                            },
+                            sort_keys=True,
+                        ),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
 
             page = connection.execute(
                 "SELECT * FROM wiki_pages WHERE source_document_id = ?",
@@ -812,29 +917,61 @@ def _mark_revalidation_required(
     now: str,
 ) -> None:
     page = connection.execute(
-        "SELECT current_verified_revision_id FROM wiki_pages WHERE id = ?",
-        (page_id,),
-    ).fetchone()
-    if not page or page["current_verified_revision_id"] is None:
-        return
-
-    downstream = connection.execute(
         """
-        SELECT DISTINCT source_page.id
-        FROM wiki_links wl
-        JOIN wiki_revisions source_revision ON source_revision.id = wl.source_revision_id
-        JOIN wiki_pages source_page ON source_page.id = source_revision.page_id
-        WHERE wl.target_page_id = ?
-          AND source_page.current_verified_revision_id = source_revision.id
+        SELECT source_document_id, current_verified_revision_id
+        FROM wiki_pages WHERE id = ?
         """,
         (page_id,),
-    ).fetchall()
-    affected_page_ids = [page_id, *(row["id"] for row in downstream)]
+    ).fetchone()
+    if not page:
+        return
+
+    affected_page_ids: set[str] = set()
+    if page["current_verified_revision_id"] is not None:
+        affected_page_ids.add(page_id)
+        downstream = connection.execute(
+            """
+            SELECT DISTINCT source_page.id
+            FROM wiki_links wl
+            JOIN wiki_revisions source_revision
+              ON source_revision.id = wl.source_revision_id
+            JOIN wiki_pages source_page ON source_page.id = source_revision.page_id
+            WHERE wl.target_page_id = ?
+              AND source_page.current_verified_revision_id = source_revision.id
+            """,
+            (page_id,),
+        ).fetchall()
+        affected_page_ids.update(row["id"] for row in downstream)
+
+    if page["source_document_id"] is not None:
+        aggregate_pages = connection.execute(
+            """
+            SELECT DISTINCT aggregate_page.id
+            FROM wiki_pages aggregate_page
+            JOIN wiki_revisions aggregate_revision
+              ON aggregate_revision.id =
+                 aggregate_page.current_verified_revision_id
+            JOIN revision_evidence re
+              ON re.revision_id = aggregate_revision.id
+            JOIN evidence e ON e.id = re.evidence_id
+            JOIN document_versions dv ON dv.id = e.document_version_id
+            WHERE aggregate_page.source_document_id IS NULL
+              AND aggregate_page.status = 'verified'
+              AND aggregate_revision.status = 'verified'
+              AND dv.document_id = ?
+            """,
+            (page["source_document_id"],),
+        ).fetchall()
+        affected_page_ids.update(row["id"] for row in aggregate_pages)
+
+    if not affected_page_ids:
+        return
+    ordered_page_ids = sorted(affected_page_ids)
     connection.executemany(
         "UPDATE wiki_pages SET needs_revalidation = 1, updated_at = ? WHERE id = ?",
-        ((now, affected_page_id) for affected_page_id in affected_page_ids),
+        ((now, affected_page_id) for affected_page_id in ordered_page_ids),
     )
-    for affected_page_id in affected_page_ids:
+    for affected_page_id in ordered_page_ids:
         record_event(
             connection,
             "wiki_revalidation_required",
